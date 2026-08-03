@@ -1,6 +1,6 @@
 [package]
 name = "skaner-dokumentow"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2024"
 description = "Prosty skaner dokumentow dla IRIScan Visualizer 7"
 
@@ -16,8 +16,10 @@ rfd = "0.15.4"
 ron = "0.12.2"
 serde = { version = "1.0.229", features = ["derive"] }
 
+[build-dependencies]
+winresource = { version = "0.1.31", default-features = false }
+
 [profile.release]
 lto = "thin"
 opt-level = "s"
 strip = true
-
