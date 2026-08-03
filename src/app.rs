@@ -832,8 +832,7 @@ impl DocumentScannerApp {
                                             Vec2::new(96.0, 112.0),
                                         );
                                         ui.add(
-                                            egui::Image::new(&data.texture)
-                                                .fit_to_exact_size(size),
+                                            egui::Image::new(&data.texture).fit_to_exact_size(size),
                                         );
                                         ui.label(format!("{}", index + 1));
                                     }
@@ -845,9 +844,7 @@ impl DocumentScannerApp {
                                     PageSlot::Failed { .. } => {
                                         ui.add_space(34.0);
                                         ui.label(
-                                            RichText::new("⚠")
-                                                .size(30.0)
-                                                .color(Color32::DARK_RED),
+                                            RichText::new("⚠").size(30.0).color(Color32::DARK_RED),
                                         );
                                         ui.label(RichText::new("Błąd").color(Color32::DARK_RED));
                                     }
