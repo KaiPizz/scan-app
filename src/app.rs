@@ -1173,14 +1173,15 @@ impl DocumentScannerApp {
                                         ui.spinner();
                                         ui.label(format!("{}", index + 1));
                                     }
-                                    PageSlot::Failed { .. } => {
+                                    PageSlot::Failed { error, .. } => {
                                         ui.add_space(34.0);
                                         ui.label(
                                             RichText::new("⚠")
                                                 .size(30.0)
                                                 .color(Color32::DARK_RED),
                                         );
-                                        ui.label(RichText::new("Błąd").color(Color32::DARK_RED));
+                                        ui.label(RichText::new("Błąd").color(Color32::DARK_RED))
+                                            .on_hover_text(error);
                                     }
                                 });
                             });

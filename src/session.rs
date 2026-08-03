@@ -27,6 +27,7 @@ impl SessionStore {
         })
     }
 
+    #[cfg(test)]
     pub fn at(dir: PathBuf) -> Self {
         Self { dir }
     }

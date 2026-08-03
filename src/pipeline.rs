@@ -74,9 +74,9 @@ impl ProcessingPipeline {
     }
 
     pub fn submit_reprocess(&self, id: u64, frame: Arc<RgbImage>, corners: [CropPoint; 4]) -> bool {
-        self.jobs.as_ref().is_some_and(|jobs| {
-            jobs.try_send(Job::Reprocess { id, frame, corners }).is_ok()
-        })
+        self.jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.try_send(Job::Reprocess { id, frame, corners }).is_ok())
     }
 
     pub fn try_event(&self) -> Option<PipelineEvent> {
@@ -140,10 +140,7 @@ fn process_job(job: &Job) -> PipelineEvent {
                 page,
                 corners: *corners,
             },
-            Err(error) => PipelineEvent::ReprocessFailed {
-                id: *id,
-                error,
-            },
+            Err(error) => PipelineEvent::ReprocessFailed { id: *id, error },
         },
     }
 }
