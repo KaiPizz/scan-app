@@ -4,6 +4,7 @@ mod app;
 mod autocapture;
 mod camera;
 mod document;
+mod overlay;
 mod pipeline;
 mod storage;
 

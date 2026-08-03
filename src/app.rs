@@ -1,6 +1,7 @@
 use crate::autocapture::{AutoCapture, FeedResult};
 use crate::camera::{CameraController, CameraEvent};
 use crate::document::{CropPoint, ScannedPage, rotate_page_clockwise, save_pdf};
+use crate::overlay::OverlayDetector;
 use crate::pipeline::{PipelineEvent, ProcessingPipeline};
 use crate::storage::{
     FolderInfo, PdfInfo, Settings, create_folder, default_library_root, ensure_library,
@@ -71,6 +72,7 @@ pub struct DocumentScannerApp {
     next_page_id: u64,
     pending_jobs: usize,
     pipeline: Option<ProcessingPipeline>,
+    overlay: Option<OverlayDetector>,
     autocapture: AutoCapture,
     pending_preview: Option<RgbImage>,
     filename: String,
@@ -115,6 +117,7 @@ impl DocumentScannerApp {
             next_page_id: 0,
             pending_jobs: 0,
             pipeline: None,
+            overlay: None,
             autocapture: AutoCapture::new(),
             pending_preview: None,
             filename: String::new(),
@@ -195,6 +198,7 @@ impl DocumentScannerApp {
         self.pending_jobs = 0;
         self.filename.clear();
         self.pipeline = Some(ProcessingPipeline::start());
+        self.overlay = Some(OverlayDetector::start());
         self.autocapture = AutoCapture::new();
         self.start_camera();
     }
@@ -233,6 +237,9 @@ impl DocumentScannerApp {
                 }
                 CameraEvent::Preview(image) => {
                     self.update_preview_texture(context, &image);
+                    if let Some(overlay) = &self.overlay {
+                        overlay.submit(image.clone());
+                    }
                     self.pending_preview = Some(image);
                 }
                 CameraEvent::Error(error) => {
@@ -454,6 +461,7 @@ impl DocumentScannerApp {
     fn abandon_scan(&mut self) {
         self.stop_camera();
         self.pipeline = None;
+        self.overlay = None;
         self.slots.clear();
         self.selected_slot = None;
         self.pending_jobs = 0;
@@ -819,12 +827,28 @@ impl DocumentScannerApp {
                         Vec2::new(self.preview_size[0] as f32, self.preview_size[1] as f32),
                         image_bounds.size(),
                     );
+                    let draw_rect = Rect::from_center_size(image_bounds.center(), size);
                     painter.image(
                         texture.id(),
-                        Rect::from_center_size(image_bounds.center(), size),
+                        draw_rect,
                         Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                         Color32::WHITE,
                     );
+                    if let Some(corners) = self.overlay.as_ref().and_then(OverlayDetector::latest)
+                    {
+                        let points = corners.map(|corner| {
+                            Pos2::new(
+                                draw_rect.left() + corner.x * draw_rect.width(),
+                                draw_rect.top() + corner.y * draw_rect.height(),
+                            )
+                        });
+                        for edge in 0..4 {
+                            painter.line_segment(
+                                [points[edge], points[(edge + 1) % 4]],
+                                Stroke::new(3.0, Color32::from_rgb(70, 165, 255)),
+                            );
+                        }
+                    }
                 } else {
                     painter.text(
                         preview_rect.center(),
