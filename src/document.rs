@@ -270,7 +270,7 @@ pub fn rotate_page_clockwise(page: &ScannedPage) -> Result<ScannedPage, String> 
     page_from_image(imageops::rotate90(&image))
 }
 
-pub fn save_pdf(path: &Path, pages: &[ScannedPage]) -> Result<(), String> {
+pub fn save_pdf(path: &Path, pages: &[&ScannedPage]) -> Result<(), String> {
     if pages.is_empty() {
         return Err("Dokument nie zawiera żadnych stron.".to_owned());
     }
@@ -473,7 +473,7 @@ mod tests {
         let page = page_from_image(image).expect("strona testowa");
         let path =
             std::env::temp_dir().join(format!("skaner-dokumentow-test-{}.pdf", std::process::id()));
-        save_pdf(&path, &[page]).expect("zapis PDF");
+        save_pdf(&path, &[&page]).expect("zapis PDF");
         let bytes = std::fs::read(&path).expect("odczyt PDF");
         assert!(bytes.starts_with(b"%PDF-"));
         std::fs::remove_file(path).expect("usunięcie testowego PDF");

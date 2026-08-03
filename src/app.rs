@@ -1,18 +1,17 @@
 use crate::camera::{CameraController, CameraEvent};
-use crate::document::{
-    CropPoint, ScannedPage, detect_document_corners, process_page, rotate_page_clockwise, save_pdf,
-};
+use crate::document::{CropPoint, ScannedPage, rotate_page_clockwise, save_pdf};
+use crate::pipeline::{PipelineEvent, ProcessingPipeline};
 use crate::storage::{
     FolderInfo, PdfInfo, Settings, create_folder, default_library_root, ensure_library,
     list_folders, list_pdfs, load_settings, rename_folder, save_settings, unique_pdf_path,
 };
 use eframe::egui::{
-    self, Align, Button, Color32, ColorImage, CornerRadius, FontId, Frame, Id, Layout, Margin,
-    Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, UiBuilder, Vec2,
+    self, Align, Button, Color32, ColorImage, CornerRadius, FontId, Frame, Layout, Margin, Pos2,
+    Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, UiBuilder, Vec2,
 };
 use image::RgbImage;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BLUE: Color32 = Color32::from_rgb(38, 101, 180);
 const BLUE_DARK: Color32 = Color32::from_rgb(24, 72, 130);
@@ -23,9 +22,33 @@ const BACKGROUND: Color32 = Color32::from_rgb(246, 248, 251);
 enum Screen {
     Library,
     Folder,
-    Scan,
-    Crop,
-    Review,
+    ScanHub,
+}
+
+struct PageData {
+    page: ScannedPage,
+    original_jpeg: Vec<u8>,
+    corners: [CropPoint; 4],
+    texture: TextureHandle,
+}
+
+enum PageSlot {
+    Processing,
+    Ready(Box<PageData>),
+    Failed {
+        original_jpeg: Vec<u8>,
+        error: String,
+    },
+}
+
+struct SlotEntry {
+    id: u64,
+    slot: PageSlot,
+}
+
+struct Toast {
+    text: String,
+    shown_at: Instant,
 }
 
 pub struct DocumentScannerApp {
@@ -42,16 +65,13 @@ pub struct DocumentScannerApp {
     preview_texture: Option<TextureHandle>,
     preview_size: [usize; 2],
 
-    crop_image: Option<RgbImage>,
-    crop_texture: Option<TextureHandle>,
-    crop_points: [CropPoint; 4],
-    crop_busy: bool,
-
-    pages: Vec<ScannedPage>,
-    page_textures: Vec<TextureHandle>,
-    selected_page: usize,
+    slots: Vec<SlotEntry>,
+    selected_slot: Option<usize>,
+    next_page_id: u64,
+    pending_jobs: usize,
+    pipeline: Option<ProcessingPipeline>,
     filename: String,
-    saved_path: Option<PathBuf>,
+    toast: Option<Toast>,
 
     show_new_folder: bool,
     new_folder_name: String,
@@ -59,7 +79,7 @@ pub struct DocumentScannerApp {
     rename_folder_name: String,
     show_settings: bool,
     show_save: bool,
-    show_saved: bool,
+    show_cancel_confirm: bool,
     show_delete_confirm: bool,
     show_exit_confirm: bool,
     allow_exit: bool,
@@ -86,27 +106,20 @@ impl DocumentScannerApp {
             camera_ready: false,
             preview_texture: None,
             preview_size: [0, 0],
-            crop_image: None,
-            crop_texture: None,
-            crop_points: [
-                CropPoint::new(0.06, 0.06),
-                CropPoint::new(0.94, 0.06),
-                CropPoint::new(0.94, 0.94),
-                CropPoint::new(0.06, 0.94),
-            ],
-            crop_busy: false,
-            pages: Vec::new(),
-            page_textures: Vec::new(),
-            selected_page: 0,
+            slots: Vec::new(),
+            selected_slot: None,
+            next_page_id: 0,
+            pending_jobs: 0,
+            pipeline: None,
             filename: String::new(),
-            saved_path: None,
+            toast: None,
             show_new_folder: false,
             new_folder_name: String::new(),
             show_rename_folder: false,
             rename_folder_name: String::new(),
             show_settings: false,
             show_save: false,
-            show_saved: false,
+            show_cancel_confirm: false,
             show_delete_confirm: false,
             show_exit_confirm: false,
             allow_exit: false,
@@ -170,11 +183,11 @@ impl DocumentScannerApp {
     }
 
     fn begin_scan(&mut self) {
-        self.pages.clear();
-        self.page_textures.clear();
-        self.selected_page = 0;
+        self.slots.clear();
+        self.selected_slot = None;
+        self.pending_jobs = 0;
         self.filename.clear();
-        self.saved_path = None;
+        self.pipeline = Some(ProcessingPipeline::start());
         self.start_camera();
     }
 
@@ -184,7 +197,7 @@ impl DocumentScannerApp {
         self.camera_ready = false;
         self.preview_texture = None;
         self.camera = Some(CameraController::start());
-        self.screen = Screen::Scan;
+        self.screen = Screen::ScanHub;
     }
 
     fn stop_camera(&mut self) {
@@ -218,7 +231,7 @@ impl DocumentScannerApp {
                 }
             }
         }
-        if self.screen == Screen::Scan {
+        if self.screen == Screen::ScanHub {
             context.request_repaint_after(Duration::from_millis(35));
         }
     }
@@ -234,8 +247,8 @@ impl DocumentScannerApp {
         }
     }
 
-    fn capture(&mut self, context: &egui::Context) {
-        let Some(image) = self
+    fn capture(&mut self) {
+        let Some(frame) = self
             .camera
             .as_ref()
             .and_then(CameraController::latest_full_image)
@@ -243,98 +256,130 @@ impl DocumentScannerApp {
             self.message = Some("Poczekaj, aż pojawi się obraz z kamery.".to_owned());
             return;
         };
-        self.stop_camera();
-        let image = image.as_ref().clone();
-        self.crop_points = detect_document_corners(&image);
-        self.crop_texture = Some(context.load_texture(
-            "kadrowanie",
-            rgb_to_color_image(&image),
-            TextureOptions::LINEAR,
-        ));
-        self.crop_image = Some(image);
-        self.screen = Screen::Crop;
-    }
-
-    fn rotate_crop_source(&mut self, context: &egui::Context) {
-        let Some(image) = self.crop_image.take() else {
+        let Some(pipeline) = &self.pipeline else {
             return;
         };
-        let rotated = image::imageops::rotate90(&image);
-        self.crop_points = detect_document_corners(&rotated);
-        self.crop_texture = Some(context.load_texture(
-            "kadrowanie-obrocone",
-            rgb_to_color_image(&rotated),
-            TextureOptions::LINEAR,
-        ));
-        self.crop_image = Some(rotated);
-    }
-
-    fn accept_crop(&mut self, context: &egui::Context) {
-        let Some(image) = &self.crop_image else {
-            return;
-        };
-        self.crop_busy = true;
-        match process_page(image, self.crop_points) {
-            Ok(page) => {
-                let texture = context.load_texture(
-                    format!("strona-{}", self.pages.len()),
-                    rgb_to_color_image(&page.review_image),
-                    TextureOptions::LINEAR,
-                );
-                self.pages.push(page);
-                self.page_textures.push(texture);
-                self.selected_page = self.pages.len() - 1;
-                self.crop_image = None;
-                self.crop_texture = None;
-                self.screen = Screen::Review;
-            }
-            Err(error) => self.message = Some(error),
+        let id = self.next_page_id;
+        if pipeline.try_submit(id, frame) {
+            self.next_page_id += 1;
+            self.slots.push(SlotEntry {
+                id,
+                slot: PageSlot::Processing,
+            });
+            self.pending_jobs += 1;
+        } else {
+            self.message = Some("Poczekaj — przetwarzanie poprzednich stron…".to_owned());
         }
-        self.crop_busy = false;
+    }
+
+    fn poll_pipeline(&mut self, context: &egui::Context) {
+        let mut events = Vec::new();
+        if let Some(pipeline) = &self.pipeline {
+            while let Some(event) = pipeline.try_event() {
+                events.push(event);
+            }
+        }
+        for event in events {
+            self.pending_jobs = self.pending_jobs.saturating_sub(1);
+            match event {
+                PipelineEvent::PageReady {
+                    id,
+                    page,
+                    original_jpeg,
+                    corners,
+                } => {
+                    let texture = context.load_texture(
+                        format!("strona-{id}"),
+                        rgb_to_color_image(&page.review_image),
+                        TextureOptions::LINEAR,
+                    );
+                    if let Some(entry) = self.slots.iter_mut().find(|entry| entry.id == id) {
+                        entry.slot = PageSlot::Ready(Box::new(PageData {
+                            page,
+                            original_jpeg,
+                            corners,
+                            texture,
+                        }));
+                    }
+                }
+                PipelineEvent::PageFailed {
+                    id,
+                    original_jpeg,
+                    error,
+                } => {
+                    if let Some(entry) = self.slots.iter_mut().find(|entry| entry.id == id) {
+                        entry.slot = PageSlot::Failed {
+                            original_jpeg,
+                            error,
+                        };
+                    }
+                }
+            }
+        }
+        if self.pending_jobs > 0 {
+            context.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    fn can_save(&self) -> bool {
+        !self.slots.is_empty()
+            && self.pending_jobs == 0
+            && self
+                .slots
+                .iter()
+                .all(|entry| matches!(entry.slot, PageSlot::Ready(_)))
     }
 
     fn rotate_selected_page(&mut self, context: &egui::Context) {
-        let Some(page) = self.pages.get(self.selected_page).cloned() else {
+        let Some(index) = self.selected_slot else {
             return;
         };
-        match rotate_page_clockwise(&page) {
+        let Some(entry) = self.slots.get_mut(index) else {
+            return;
+        };
+        let PageSlot::Ready(data) = &mut entry.slot else {
+            return;
+        };
+        match rotate_page_clockwise(&data.page) {
             Ok(rotated) => {
-                self.page_textures[self.selected_page] = context.load_texture(
-                    format!("strona-{}-obrot", self.selected_page),
+                data.texture = context.load_texture(
+                    format!("strona-{}-obrot-{}", entry.id, rotated.width),
                     rgb_to_color_image(&rotated.review_image),
                     TextureOptions::LINEAR,
                 );
-                self.pages[self.selected_page] = rotated;
+                data.page = rotated;
             }
             Err(error) => self.message = Some(error),
         }
     }
 
     fn delete_selected_page(&mut self) {
-        if self.pages.is_empty() {
+        let Some(index) = self.selected_slot else {
+            return;
+        };
+        if index >= self.slots.len() {
+            self.selected_slot = None;
             return;
         }
-        self.pages.remove(self.selected_page);
-        let _ = self.page_textures.remove(self.selected_page);
-        if self.pages.is_empty() {
-            self.start_camera();
+        self.slots.remove(index);
+        self.selected_slot = if self.slots.is_empty() {
+            None
         } else {
-            self.selected_page = self.selected_page.min(self.pages.len() - 1);
-        }
+            Some(index.min(self.slots.len() - 1))
+        };
     }
 
     fn move_selected_page(&mut self, direction: isize) {
-        if self.pages.is_empty() {
+        let Some(index) = self.selected_slot else {
             return;
-        }
-        let target = self.selected_page as isize + direction;
-        if !(0..self.pages.len() as isize).contains(&target) {
+        };
+        let target = index as isize + direction;
+        if !(0..self.slots.len() as isize).contains(&target) {
             return;
         }
         let target = target as usize;
-        self.pages.swap(self.selected_page, target);
-        self.page_textures.swap(self.selected_page, target);
-        self.selected_page = target;
+        self.slots.swap(index, target);
+        self.selected_slot = Some(target);
     }
 
     fn save_current_document(&mut self) {
@@ -342,18 +387,38 @@ impl DocumentScannerApp {
             self.message = Some("Najpierw wybierz folder docelowy.".to_owned());
             return;
         };
-        let path = match unique_pdf_path(&folder.path, &self.filename) {
+        let folder_path = folder.path.clone();
+        let mut pages = Vec::with_capacity(self.slots.len());
+        for entry in &self.slots {
+            match &entry.slot {
+                PageSlot::Ready(data) => pages.push(&data.page),
+                _ => {
+                    self.message = Some("Usuń strony z błędem (⚠) przed zapisem.".to_owned());
+                    return;
+                }
+            }
+        }
+        let path = match unique_pdf_path(&folder_path, &self.filename) {
             Ok(path) => path,
             Err(error) => {
                 self.message = Some(error);
                 return;
             }
         };
-        match save_pdf(&path, &self.pages) {
+        match save_pdf(&path, &pages) {
             Ok(()) => {
-                self.saved_path = Some(path);
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.toast = Some(Toast {
+                    text: format!("Zapisano: {name}"),
+                    shown_at: Instant::now(),
+                });
                 self.show_save = false;
-                self.show_saved = true;
+                self.slots.clear();
+                self.selected_slot = None;
+                self.filename.clear();
                 self.refresh_pdfs();
                 self.refresh_folders();
             }
@@ -361,12 +426,20 @@ impl DocumentScannerApp {
         }
     }
 
-    fn cancel_scan(&mut self) {
+    fn request_cancel_scan(&mut self) {
+        if self.slots.is_empty() {
+            self.abandon_scan();
+        } else {
+            self.show_cancel_confirm = true;
+        }
+    }
+
+    fn abandon_scan(&mut self) {
         self.stop_camera();
-        self.crop_image = None;
-        self.crop_texture = None;
-        self.pages.clear();
-        self.page_textures.clear();
+        self.pipeline = None;
+        self.slots.clear();
+        self.selected_slot = None;
+        self.pending_jobs = 0;
         self.screen = Screen::Folder;
         self.refresh_pdfs();
     }
@@ -545,23 +618,29 @@ impl DocumentScannerApp {
         });
     }
 
-    fn scan_ui(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+    fn scan_hub_ui(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         self.poll_camera(context);
+        self.poll_pipeline(context);
         page_container(ui, |ui| {
-            let page_number = self.pages.len() + 1;
             let camera_ready = self.camera_ready;
             let camera_status = self.camera_status.clone();
-            let (cancel, ()) = two_sided(
+            let page_count_text = polish_page_count(self.slots.len());
+            let slots_empty = self.slots.is_empty();
+            let ((cancel, back), ()) = two_sided(
                 ui,
                 48.0,
                 |ui| {
                     let mut cancel = false;
+                    let mut back = false;
                     ui.horizontal(|ui| {
-                        cancel = ui.button("Anuluj skanowanie").clicked();
+                        cancel = ui.button("Anuluj dokument").clicked();
+                        back = ui
+                            .add_enabled(slots_empty, Button::new("Wróć do folderu"))
+                            .clicked();
                         ui.add_space(10.0);
-                        ui.heading(format!("Skanowanie · strona {page_number}"));
+                        ui.heading(format!("Skanowanie · {page_count_text}"));
                     });
-                    cancel
+                    (cancel, back)
                 },
                 |ui| {
                     let color = if camera_ready {
@@ -573,41 +652,111 @@ impl DocumentScannerApp {
                 },
             );
             if cancel {
-                self.cancel_scan();
+                self.request_cancel_scan();
                 return;
             }
-            ui.add_space(14.0);
+            if back {
+                self.abandon_scan();
+                return;
+            }
+            ui.add_space(10.0);
+
             let controls_min = ui.available_rect_before_wrap().min;
             let controls_width = (ui.clip_rect().right() - controls_min.x).max(0.0);
             let (controls_rect, _) =
                 ui.allocate_exact_size(Vec2::new(controls_width, 54.0), Sense::hover());
             let mut controls_ui = ui.new_child(
                 UiBuilder::new()
-                    .id_salt("scan-controls")
+                    .id_salt("scanhub-controls")
                     .max_rect(controls_rect)
                     .layout(Layout::left_to_right(Align::Center).with_main_align(Align::Center)),
             );
-            let capture = controls_ui.add_enabled(
-                self.camera_ready && self.preview_texture.is_some(),
-                Button::new(
-                    RichText::new("Zrób zdjęcie")
-                        .size(20.0)
-                        .strong()
-                        .color(Color32::WHITE),
+            let capture_clicked = controls_ui
+                .add_enabled(
+                    self.camera_ready && self.preview_texture.is_some(),
+                    Button::new(
+                        RichText::new("Zrób zdjęcie (Spacja)")
+                            .size(20.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(BLUE)
+                    .corner_radius(12.0)
+                    .min_size(Vec2::new(260.0, 54.0)),
                 )
-                .fill(BLUE)
-                .corner_radius(12.0)
-                .min_size(Vec2::new(240.0, 54.0)),
-            );
-            if capture.clicked() {
-                self.capture(context);
+                .clicked();
+            if capture_clicked {
+                self.capture();
+            }
+            let save_label = if self.pending_jobs > 0 {
+                format!("Przetwarzanie {} stron…", self.pending_jobs)
+            } else {
+                "Zapisz dokument (Enter)".to_owned()
+            };
+            if controls_ui
+                .add_enabled(
+                    self.can_save(),
+                    Button::new(RichText::new(save_label).strong().color(Color32::WHITE))
+                        .fill(BLUE_DARK)
+                        .corner_radius(12.0)
+                        .min_size(Vec2::new(240.0, 54.0)),
+                )
+                .clicked()
+            {
+                self.show_save = true;
             }
             if !self.camera_ready && controls_ui.button("Spróbuj ponownie").clicked() {
                 self.start_camera();
             }
-            ui.add_space(12.0);
+            ui.add_space(8.0);
+
+            if let Some(index) = self.selected_slot {
+                if index >= self.slots.len() {
+                    self.selected_slot = None;
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("Strona {} z {}", index + 1, self.slots.len()))
+                                .strong(),
+                        );
+                        let can_left = index > 0;
+                        let can_right = index + 1 < self.slots.len();
+                        if ui.add_enabled(can_left, Button::new("← W lewo")).clicked() {
+                            self.move_selected_page(-1);
+                        }
+                        if ui
+                            .add_enabled(can_right, Button::new("W prawo →"))
+                            .clicked()
+                        {
+                            self.move_selected_page(1);
+                        }
+                        let rotatable = matches!(
+                            self.slots.get(index).map(|entry| &entry.slot),
+                            Some(PageSlot::Ready(_))
+                        );
+                        if ui.add_enabled(rotatable, Button::new("Obróć")).clicked() {
+                            self.rotate_selected_page(context);
+                        }
+                        if ui
+                            .button(RichText::new("Usuń stronę").color(Color32::DARK_RED))
+                            .clicked()
+                        {
+                            self.show_delete_confirm = true;
+                        }
+                        if ui.button("Odznacz").clicked() {
+                            self.selected_slot = None;
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+            }
+
+            const STRIP_HEIGHT: f32 = 160.0;
             let preview_min = ui.available_rect_before_wrap().min;
-            let preview_max = Pos2::new(ui.clip_rect().right(), ui.clip_rect().bottom());
+            let preview_max = Pos2::new(
+                ui.clip_rect().right(),
+                (ui.clip_rect().bottom() - STRIP_HEIGHT - 10.0).max(preview_min.y + 80.0),
+            );
             if preview_max.x > preview_min.x && preview_max.y > preview_min.y {
                 let preview_rect = Rect::from_min_max(preview_min, preview_max);
                 ui.allocate_rect(preview_rect, Sense::hover());
@@ -635,297 +784,82 @@ impl DocumentScannerApp {
                     );
                 }
             }
-        });
-    }
 
-    fn crop_ui(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
-        page_container(ui, |ui| {
-            two_sided(
-                ui,
-                42.0,
-                |ui| {
-                    ui.heading("Dopasuj obszar dokumentu");
-                },
-                |ui| {
-                    ui.label("Przeciągnij niebieskie punkty do narożników kartki.");
-                },
-            );
-            ui.add_space(12.0);
-            let available = Vec2::new(
-                ui.available_width(),
-                (ui.available_height() - 100.0).max(320.0),
-            );
-            let (response, painter) = ui.allocate_painter(available, Sense::hover());
-            painter.rect_filled(response.rect, 12.0, Color32::from_gray(28));
-            if let (Some(texture), Some(image)) = (&self.crop_texture, &self.crop_image) {
-                let image_size = fit_size(
-                    Vec2::new(image.width() as f32, image.height() as f32),
-                    available - Vec2::splat(12.0),
+            let strip_min = Pos2::new(preview_min.x, preview_max.y + 10.0);
+            let strip_max = Pos2::new(ui.clip_rect().right(), ui.clip_rect().bottom());
+            if strip_max.x > strip_min.x && strip_max.y > strip_min.y {
+                let strip_rect = Rect::from_min_max(strip_min, strip_max);
+                ui.allocate_rect(strip_rect, Sense::hover());
+                let mut strip_ui = ui.new_child(
+                    UiBuilder::new()
+                        .id_salt("film-strip")
+                        .max_rect(strip_rect)
+                        .layout(Layout::left_to_right(Align::Center)),
                 );
-                let image_rect = Rect::from_center_size(response.rect.center(), image_size);
-                painter.image(
-                    texture.id(),
-                    image_rect,
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-                let positions = self.crop_points.map(|point| {
-                    Pos2::new(
-                        image_rect.left() + point.x * image_rect.width(),
-                        image_rect.top() + point.y * image_rect.height(),
-                    )
-                });
-                for edge in 0..4 {
-                    painter.line_segment(
-                        [positions[edge], positions[(edge + 1) % 4]],
-                        Stroke::new(3.0, Color32::from_rgb(70, 165, 255)),
-                    );
-                }
-                for (index, position) in positions.iter().enumerate() {
-                    let handle_rect = Rect::from_center_size(*position, Vec2::splat(44.0));
-                    let drag =
-                        ui.interact(handle_rect, Id::new(("crop-handle", index)), Sense::drag());
-                    if drag.dragged() {
-                        let pointer = drag.interact_pointer_pos().unwrap_or(*position);
-                        let normalized = CropPoint::new(
-                            ((pointer.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0),
-                            ((pointer.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0),
-                        );
-                        self.crop_points[index] = constrain_corner(index, normalized);
-                    }
-                    painter.circle_filled(*position, 11.0, Color32::WHITE);
-                    painter.circle_filled(*position, 7.0, BLUE);
-                }
-            }
-            ui.add_space(12.0);
-            let ((retake, rotate, redetect), accept) = two_sided(
-                ui,
-                48.0,
-                |ui| {
-                    let mut retake = false;
-                    let mut rotate = false;
-                    let mut redetect = false;
-                    ui.horizontal(|ui| {
-                        retake = ui.button("Powtórz zdjęcie").clicked();
-                        rotate = ui.button("Obróć").clicked();
-                        redetect = ui.button("Wykryj ponownie").clicked();
-                    });
-                    (retake, rotate, redetect)
-                },
-                |ui| {
-                    ui.add_enabled(
-                        !self.crop_busy,
-                        Button::new(
-                            RichText::new("Użyj tej strony")
-                                .strong()
-                                .color(Color32::WHITE),
-                        )
-                        .fill(BLUE)
-                        .corner_radius(10.0)
-                        .min_size(Vec2::new(180.0, 44.0)),
-                    )
-                    .clicked()
-                },
-            );
-            if retake {
-                self.crop_image = None;
-                self.crop_texture = None;
-                self.start_camera();
-                return;
-            }
-            if rotate {
-                self.rotate_crop_source(context);
-            }
-            if redetect && let Some(image) = &self.crop_image {
-                self.crop_points = detect_document_corners(image);
-            }
-            if accept {
-                self.accept_crop(context);
+                self.film_strip_ui(&mut strip_ui);
             }
         });
     }
 
-    fn review_ui(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
-        page_container(ui, |ui| {
-            let page_count = self.pages.len();
-            let page_count_text = polish_page_count(page_count);
-            let (cancel, (finish, add_page)) = two_sided(
-                ui,
-                48.0,
-                |ui| {
-                    let mut cancel = false;
-                    ui.horizontal(|ui| {
-                        cancel = ui.button("Anuluj dokument").clicked();
-                        ui.add_space(10.0);
-                        ui.heading(format!("Dokument · {page_count_text}"));
-                    });
-                    cancel
-                },
-                |ui| {
-                    let finish = primary_button(ui, "Zakończ skanowanie").clicked();
-                    let add_page = ui.button("Dodaj stronę").clicked();
-                    (finish, add_page)
-                },
-            );
-            if cancel {
-                self.cancel_scan();
-                return;
-            }
-            if finish {
-                self.show_save = true;
-            }
-            if add_page {
-                self.start_camera();
-                return;
-            }
-            ui.add_space(15.0);
-            let content_min = ui.available_rect_before_wrap().min;
-            let content_max = Pos2::new(ui.clip_rect().right(), ui.clip_rect().bottom());
-            if content_max.x <= content_min.x || content_max.y <= content_min.y {
-                return;
-            }
-            let content_rect = Rect::from_min_max(content_min, content_max);
-            ui.allocate_rect(content_rect, Sense::hover());
-
-            let sidebar_width = 210.0_f32.min(content_rect.width() * 0.3);
-            let gap = 14.0;
-            let sidebar_rect = Rect::from_min_size(
-                content_rect.min,
-                Vec2::new(sidebar_width, content_rect.height()),
-            );
-            let main_rect = Rect::from_min_max(
-                Pos2::new(sidebar_rect.right() + gap, content_rect.top()),
-                content_rect.max,
-            );
-
-            let sidebar_painter = ui.painter_at(sidebar_rect);
-            sidebar_painter.rect_filled(sidebar_rect, 12.0, Color32::WHITE);
-            sidebar_painter.rect_stroke(
-                sidebar_rect,
-                12.0,
-                Stroke::new(1.0, Color32::from_gray(218)),
-                egui::StrokeKind::Inside,
-            );
-            let sidebar_inner = sidebar_rect.shrink(12.0);
-            let mut sidebar_ui = ui.new_child(
-                UiBuilder::new()
-                    .id_salt("review-pages")
-                    .max_rect(sidebar_inner)
-                    .layout(Layout::top_down(Align::Min)),
-            );
-            sidebar_ui.heading(format!("Strony ({page_count})"));
-            sidebar_ui.add_space(6.0);
-            let mut clicked_page = None;
-            egui::ScrollArea::vertical()
-                .max_height((sidebar_inner.height() - 44.0).max(0.0))
-                .show(&mut sidebar_ui, |ui| {
-                    for (index, texture) in self.page_textures.iter().enumerate() {
-                        let selected = index == self.selected_page;
-                        Frame::new()
-                            .fill(if selected { PALE_BLUE } else { Color32::WHITE })
-                            .stroke(Stroke::new(
-                                if selected { 2.0 } else { 1.0 },
-                                if selected {
-                                    BLUE
-                                } else {
-                                    Color32::from_gray(220)
-                                },
-                            ))
+    fn film_strip_ui(&mut self, ui: &mut egui::Ui) {
+        let mut clicked = None;
+        egui::ScrollArea::horizontal()
+            .id_salt("film-strip-scroll")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (index, entry) in self.slots.iter().enumerate() {
+                        let selected = self.selected_slot == Some(index);
+                        let stroke = if selected {
+                            Stroke::new(3.0, BLUE)
+                        } else {
+                            Stroke::new(1.0, Color32::from_gray(210))
+                        };
+                        let frame_response = Frame::new()
+                            .fill(Color32::WHITE)
+                            .stroke(stroke)
                             .corner_radius(8.0)
-                            .inner_margin(8)
+                            .inner_margin(6)
                             .show(ui, |ui| {
-                                ui.vertical_centered(|ui| {
-                                    let image_size = fit_size(
-                                        texture.size_vec2(),
-                                        Vec2::new((sidebar_inner.width() - 32.0).max(40.0), 150.0),
-                                    );
-                                    if ui
-                                        .add(
-                                            egui::Image::new(texture)
-                                                .fit_to_exact_size(image_size)
-                                                .sense(Sense::click()),
-                                        )
-                                        .clicked()
-                                    {
-                                        clicked_page = Some(index);
+                                ui.set_width(104.0);
+                                ui.set_height(140.0);
+                                ui.vertical_centered(|ui| match &entry.slot {
+                                    PageSlot::Ready(data) => {
+                                        let size = fit_size(
+                                            data.texture.size_vec2(),
+                                            Vec2::new(96.0, 112.0),
+                                        );
+                                        ui.add(
+                                            egui::Image::new(&data.texture)
+                                                .fit_to_exact_size(size),
+                                        );
+                                        ui.label(format!("{}", index + 1));
                                     }
-                                    if ui
-                                        .selectable_label(selected, format!("Strona {}", index + 1))
-                                        .clicked()
-                                    {
-                                        clicked_page = Some(index);
+                                    PageSlot::Processing => {
+                                        ui.add_space(40.0);
+                                        ui.spinner();
+                                        ui.label(format!("{}", index + 1));
+                                    }
+                                    PageSlot::Failed { .. } => {
+                                        ui.add_space(34.0);
+                                        ui.label(
+                                            RichText::new("⚠")
+                                                .size(30.0)
+                                                .color(Color32::DARK_RED),
+                                        );
+                                        ui.label(RichText::new("Błąd").color(Color32::DARK_RED));
                                     }
                                 });
                             });
-                        ui.add_space(8.0);
+                        if frame_response.response.interact(Sense::click()).clicked() {
+                            clicked = Some(index);
+                        }
+                        ui.add_space(6.0);
                     }
                 });
-            if let Some(index) = clicked_page {
-                self.selected_page = index;
-            }
-
-            let controls_height = 58.0;
-            let preview_rect = Rect::from_min_max(
-                main_rect.min,
-                Pos2::new(
-                    main_rect.right(),
-                    main_rect.bottom() - controls_height - 10.0,
-                ),
-            );
-            let preview_painter = ui.painter_at(preview_rect);
-            preview_painter.rect_filled(preview_rect, 12.0, Color32::from_gray(235));
-            if let Some(texture) = self.page_textures.get(self.selected_page) {
-                let bounds = preview_rect.shrink(14.0);
-                let image_size = fit_size(texture.size_vec2(), bounds.size());
-                let image_rect = Rect::from_center_size(bounds.center(), image_size);
-                preview_painter.image(
-                    texture.id(),
-                    image_rect,
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-                preview_painter.rect_stroke(
-                    image_rect,
-                    0.0,
-                    Stroke::new(1.0, Color32::from_gray(150)),
-                    egui::StrokeKind::Inside,
-                );
-            }
-
-            let controls_rect = Rect::from_min_max(
-                Pos2::new(main_rect.left(), preview_rect.bottom() + 10.0),
-                main_rect.max,
-            );
-            let mut controls_ui = ui.new_child(
-                UiBuilder::new()
-                    .id_salt("review-controls")
-                    .max_rect(controls_rect)
-                    .layout(Layout::left_to_right(Align::Center).with_main_align(Align::Center)),
-            );
-            let can_move_left = self.selected_page > 0;
-            let can_move_right = self.selected_page + 1 < self.pages.len();
-            if controls_ui
-                .add_enabled(can_move_left, Button::new("← W lewo"))
-                .clicked()
-            {
-                self.move_selected_page(-1);
-            }
-            if controls_ui
-                .add_enabled(can_move_right, Button::new("W prawo →"))
-                .clicked()
-            {
-                self.move_selected_page(1);
-            }
-            if controls_ui.button("Obróć").clicked() {
-                self.rotate_selected_page(context);
-            }
-            if controls_ui
-                .button(RichText::new("Usuń stronę").color(Color32::DARK_RED))
-                .clicked()
-            {
-                self.show_delete_confirm = true;
-            }
-        });
+            });
+        if let Some(index) = clicked {
+            self.selected_slot = Some(index);
+        }
     }
 
     fn dialogs(&mut self, context: &egui::Context) {
@@ -1034,7 +968,7 @@ impl DocumentScannerApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(context, |ui| {
-                    ui.label(format!("Liczba stron: {}", self.pages.len()));
+                    ui.label(format!("Liczba stron: {}", self.slots.len()));
                     ui.label("Nazwa pliku:");
                     let response = ui.add_sized(
                         [390.0, 36.0],
@@ -1059,51 +993,14 @@ impl DocumentScannerApp {
                 });
         }
 
-        if self.show_saved {
-            egui::Window::new("Dokument zapisany")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(context, |ui| {
-                    ui.label(
-                        RichText::new("PDF został zapisany pomyślnie.")
-                            .size(18.0)
-                            .color(Color32::DARK_GREEN),
-                    );
-                    if let Some(path) = &self.saved_path {
-                        ui.label(path.display().to_string());
-                    }
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Otwórz PDF").clicked()
-                            && let Some(path) = &self.saved_path
-                            && let Err(error) = open::that_detached(path)
-                        {
-                            self.message = Some(format!("Nie można otworzyć PDF: {error}"));
-                        }
-                        if primary_button(ui, "Gotowe").clicked() {
-                            self.show_saved = false;
-                            self.pages.clear();
-                            self.page_textures.clear();
-                            self.screen = Screen::Folder;
-                            self.refresh_pdfs();
-                        }
-                    });
-                });
-        }
-
         if self.show_delete_confirm {
             egui::Window::new("Usunąć stronę?")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(context, |ui| {
-                    if self.pages.len() == 1 {
-                        ui.label("To jest jedyna strona dokumentu.");
-                        ui.label("Po usunięciu program wróci do skanowania.");
-                    } else {
-                        ui.label(format!("Usunąć stronę {}?", self.selected_page + 1));
-                    }
+                    let index = self.selected_slot.map(|index| index + 1).unwrap_or(0);
+                    ui.label(format!("Usunąć stronę {index}?"));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if ui.button("Anuluj").clicked() {
@@ -1167,8 +1064,7 @@ impl DocumentScannerApp {
 impl eframe::App for DocumentScannerApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         let close_requested = context.input(|input| input.viewport().close_requested());
-        let has_unsaved_scan =
-            self.saved_path.is_none() && (self.crop_image.is_some() || !self.pages.is_empty());
+        let has_unsaved_scan = !self.slots.is_empty();
         if close_requested && has_unsaved_scan && !self.allow_exit {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.show_exit_confirm = true;
@@ -1183,9 +1079,7 @@ impl eframe::App for DocumentScannerApp {
             match self.screen {
                 Screen::Library => self.library_ui(ui),
                 Screen::Folder => self.folder_ui(ui),
-                Screen::Scan => self.scan_ui(ui, &context),
-                Screen::Crop => self.crop_ui(ui, &context),
-                Screen::Review => self.review_ui(ui, &context),
+                Screen::ScanHub => self.scan_hub_ui(ui, &context),
             }
         });
         self.dialogs(&context);
@@ -1286,16 +1180,6 @@ fn fit_size(source: Vec2, bounds: Vec2) -> Vec2 {
     }
     let scale = (bounds.x / source.x).min(bounds.y / source.y).max(0.0);
     source * scale
-}
-
-fn constrain_corner(index: usize, point: CropPoint) -> CropPoint {
-    match index {
-        0 => CropPoint::new(point.x.min(0.49), point.y.min(0.49)),
-        1 => CropPoint::new(point.x.max(0.51), point.y.min(0.49)),
-        2 => CropPoint::new(point.x.max(0.51), point.y.max(0.51)),
-        3 => CropPoint::new(point.x.min(0.49), point.y.max(0.51)),
-        _ => point,
-    }
 }
 
 fn polish_page_count(count: usize) -> String {
