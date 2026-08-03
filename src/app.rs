@@ -23,6 +23,7 @@ const BLUE: Color32 = Color32::from_rgb(38, 101, 180);
 const BLUE_DARK: Color32 = Color32::from_rgb(24, 72, 130);
 const PALE_BLUE: Color32 = Color32::from_rgb(231, 241, 252);
 const BACKGROUND: Color32 = Color32::from_rgb(246, 248, 251);
+const STRIP_HEIGHT: f32 = 160.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Screen {
@@ -90,6 +91,7 @@ pub struct DocumentScannerApp {
     autocapture: AutoCapture,
     pending_preview: Option<RgbImage>,
     editor: Option<EditorState>,
+    last_slot_count: usize,
     session: Option<SessionStore>,
     session_broken: bool,
     recovered: Option<RecoveredSession>,
@@ -140,6 +142,7 @@ impl DocumentScannerApp {
             autocapture: AutoCapture::new(),
             pending_preview: None,
             editor: None,
+            last_slot_count: 0,
             session: None,
             session_broken: false,
             recovered: None,
@@ -915,29 +918,25 @@ impl DocumentScannerApp {
             let camera_status = self.camera_status.clone();
             let page_count_text = polish_page_count(self.slots.len());
             let slots_empty = self.slots.is_empty();
-            let ((cancel, back), ()) = two_sided(
+            let ((back, cancel), ()) = two_sided(
                 ui,
                 48.0,
                 |ui| {
-                    let mut cancel = false;
                     let mut back = false;
+                    let mut cancel = false;
                     ui.horizontal(|ui| {
-                        cancel = ui.button("Anuluj dokument").clicked();
                         back = ui
                             .add_enabled(slots_empty, Button::new("Wróć do folderu"))
+                            .clicked();
+                        cancel = ui
+                            .button(RichText::new("Anuluj dokument").color(Color32::DARK_RED))
                             .clicked();
                         ui.add_space(10.0);
                         ui.heading(format!("Skanowanie · {page_count_text}"));
                     });
-                    (cancel, back)
+                    (back, cancel)
                 },
                 |ui| {
-                    let color = if camera_ready {
-                        Color32::DARK_GREEN
-                    } else {
-                        Color32::DARK_GRAY
-                    };
-                    ui.label(RichText::new(camera_status).color(color));
                     let auto_on = self.autocapture.enabled();
                     let toggle_label = if auto_on { "Auto: WŁ" } else { "Auto: WYŁ" };
                     let toggle = Button::new(
@@ -951,25 +950,38 @@ impl DocumentScannerApp {
                     if ui.add(toggle).clicked() {
                         self.autocapture.set_enabled(!auto_on);
                     }
-                    if camera_ready {
-                        ui.label(
-                            RichText::new(self.autocapture.hint()).color(Color32::from_gray(90)),
-                        );
-                    }
                 },
             );
-            if cancel {
-                self.request_cancel_scan();
-                return;
-            }
             if back {
                 self.abandon_scan();
                 return;
             }
-            ui.add_space(10.0);
+            if cancel {
+                self.request_cancel_scan();
+                return;
+            }
+            let status_color = if camera_ready {
+                Color32::DARK_GREEN
+            } else {
+                Color32::DARK_GRAY
+            };
+            ui.allocate_ui(Vec2::new(ui.available_width(), 22.0), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(camera_status).color(status_color).size(14.0));
+                    if camera_ready {
+                        ui.label(RichText::new("·").color(Color32::GRAY).size(14.0));
+                        ui.label(
+                            RichText::new(self.autocapture.hint())
+                                .color(Color32::from_gray(95))
+                                .size(14.0),
+                        );
+                    }
+                });
+            });
+            ui.add_space(6.0);
 
             let controls_min = ui.available_rect_before_wrap().min;
-            let controls_width = (ui.clip_rect().right() - controls_min.x).max(0.0);
+            let controls_width = (ui.max_rect().right() - controls_min.x).max(0.0);
             let (controls_rect, _) =
                 ui.allocate_exact_size(Vec2::new(controls_width, 54.0), Sense::hover());
             let mut controls_ui = ui.new_child(
@@ -1018,62 +1030,83 @@ impl DocumentScannerApp {
             }
             ui.add_space(8.0);
 
-            if let Some(index) = self.selected_slot {
-                if index >= self.slots.len() {
-                    self.selected_slot = None;
-                } else {
-                    ui.horizontal(|ui| {
+            if self
+                .selected_slot
+                .is_some_and(|index| index >= self.slots.len())
+            {
+                self.selected_slot = None;
+            }
+            let selection = self.selected_slot;
+            ui.horizontal(|ui| {
+                match selection {
+                    Some(index) => {
                         ui.label(
                             RichText::new(format!("Strona {} z {}", index + 1, self.slots.len()))
                                 .strong(),
                         );
-                        let can_left = index > 0;
-                        let can_right = index + 1 < self.slots.len();
-                        if ui.add_enabled(can_left, Button::new("← W lewo")).clicked() {
-                            self.move_selected_page(-1);
-                        }
-                        if ui
-                            .add_enabled(can_right, Button::new("W prawo →"))
-                            .clicked()
-                        {
-                            self.move_selected_page(1);
-                        }
-                        let rotatable = matches!(
-                            self.slots.get(index).map(|entry| &entry.slot),
-                            Some(PageSlot::Ready(_))
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("Kliknij miniaturę, aby zaznaczyć stronę")
+                                .color(Color32::GRAY),
                         );
-                        if ui.add_enabled(rotatable, Button::new("Obróć")).clicked() {
-                            self.rotate_selected_page(context);
-                        }
-                        let editable = matches!(
-                            self.slots.get(index).map(|entry| &entry.slot),
-                            Some(PageSlot::Ready(_)) | Some(PageSlot::Failed { .. })
-                        );
-                        if ui
-                            .add_enabled(editable, Button::new("Popraw kadr"))
-                            .clicked()
-                        {
-                            self.open_editor(index, context);
-                        }
-                        if ui
-                            .button(RichText::new("Usuń stronę").color(Color32::DARK_RED))
-                            .clicked()
-                        {
-                            self.show_delete_confirm = true;
-                        }
-                        if ui.button("Odznacz").clicked() {
-                            self.selected_slot = None;
-                        }
-                    });
-                    ui.add_space(6.0);
+                    }
                 }
-            }
+                let can_left = selection.is_some_and(|index| index > 0);
+                let can_right = selection.is_some_and(|index| index + 1 < self.slots.len());
+                if ui.add_enabled(can_left, Button::new("← W lewo")).clicked() {
+                    self.move_selected_page(-1);
+                }
+                if ui
+                    .add_enabled(can_right, Button::new("W prawo →"))
+                    .clicked()
+                {
+                    self.move_selected_page(1);
+                }
+                let rotatable = selection.is_some_and(|index| {
+                    matches!(
+                        self.slots.get(index).map(|entry| &entry.slot),
+                        Some(PageSlot::Ready(_))
+                    )
+                });
+                if ui.add_enabled(rotatable, Button::new("Obróć")).clicked() {
+                    self.rotate_selected_page(context);
+                }
+                let editable = selection.is_some_and(|index| {
+                    matches!(
+                        self.slots.get(index).map(|entry| &entry.slot),
+                        Some(PageSlot::Ready(_)) | Some(PageSlot::Failed { .. })
+                    )
+                });
+                if ui
+                    .add_enabled(editable, Button::new("Popraw kadr"))
+                    .clicked()
+                    && let Some(index) = selection
+                {
+                    self.open_editor(index, context);
+                }
+                if ui
+                    .add_enabled(
+                        selection.is_some(),
+                        Button::new(RichText::new("Usuń stronę").color(Color32::DARK_RED)),
+                    )
+                    .clicked()
+                {
+                    self.show_delete_confirm = true;
+                }
+                if ui
+                    .add_enabled(selection.is_some(), Button::new("Odznacz"))
+                    .clicked()
+                {
+                    self.selected_slot = None;
+                }
+            });
+            ui.add_space(6.0);
 
-            const STRIP_HEIGHT: f32 = 160.0;
             let preview_min = ui.available_rect_before_wrap().min;
             let preview_max = Pos2::new(
-                ui.clip_rect().right(),
-                (ui.clip_rect().bottom() - STRIP_HEIGHT - 10.0).max(preview_min.y + 80.0),
+                ui.max_rect().right(),
+                (ui.max_rect().bottom() - STRIP_HEIGHT - 10.0).max(preview_min.y + 80.0),
             );
             if preview_max.x > preview_min.x && preview_max.y > preview_min.y {
                 let preview_rect = Rect::from_min_max(preview_min, preview_max);
@@ -1120,7 +1153,7 @@ impl DocumentScannerApp {
             }
 
             let strip_min = Pos2::new(preview_min.x, preview_max.y + 10.0);
-            let strip_max = Pos2::new(ui.clip_rect().right(), ui.clip_rect().bottom());
+            let strip_max = Pos2::new(ui.max_rect().right(), ui.max_rect().bottom());
             if strip_max.x > strip_min.x && strip_max.y > strip_min.y {
                 let strip_rect = Rect::from_min_max(strip_min, strip_max);
                 ui.allocate_rect(strip_rect, Sense::hover());
@@ -1136,6 +1169,19 @@ impl DocumentScannerApp {
     }
 
     fn film_strip_ui(&mut self, ui: &mut egui::Ui) {
+        if self.slots.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(56.0);
+                ui.label(
+                    RichText::new("Naciśnij Spację lub połóż stronę — miniatury pojawią się tutaj")
+                        .color(Color32::GRAY),
+                );
+            });
+            self.last_slot_count = 0;
+            return;
+        }
+        let strip_grew = self.slots.len() > self.last_slot_count;
+        let last_index = self.slots.len() - 1;
         let mut clicked = None;
         egui::ScrollArea::horizontal()
             .id_salt("film-strip-scroll")
@@ -1188,10 +1234,14 @@ impl DocumentScannerApp {
                         if frame_response.response.interact(Sense::click()).clicked() {
                             clicked = Some(index);
                         }
+                        if strip_grew && index == last_index {
+                            frame_response.response.scroll_to_me(Some(Align::Max));
+                        }
                         ui.add_space(6.0);
                     }
                 });
             });
+        self.last_slot_count = self.slots.len();
         if let Some(index) = clicked {
             self.selected_slot = Some(index);
         }
@@ -1589,8 +1639,13 @@ impl DocumentScannerApp {
             self.toast = None;
         }
         if let Some(toast) = &self.toast {
+            let toast_lift = if self.screen == Screen::ScanHub && self.editor.is_none() {
+                -(STRIP_HEIGHT + 44.0)
+            } else {
+                -24.0
+            };
             egui::Area::new(Id::new("zapis-toast"))
-                .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-24.0, -24.0))
+                .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-24.0, toast_lift))
                 .show(context, |ui| {
                     Frame::new()
                         .fill(Color32::from_rgb(34, 120, 62))
@@ -1627,7 +1682,8 @@ impl eframe::App for DocumentScannerApp {
             || self.show_restore
             || self.message.is_some()
             || self.editor.is_some();
-        if self.screen == Screen::ScanHub && !dialog_open {
+        let focus_free = context.memory(|memory| memory.focused().is_none());
+        if self.screen == Screen::ScanHub && !dialog_open && focus_free {
             let (space, enter) = context.input(|input| {
                 (
                     input.key_pressed(egui::Key::Space),
@@ -1694,7 +1750,7 @@ fn two_sided<Left, Right>(
     add_right: impl FnOnce(&mut egui::Ui) -> Right,
 ) -> (Left, Right) {
     let min = ui.available_rect_before_wrap().min;
-    let width = (ui.clip_rect().right() - min.x).max(0.0);
+    let width = (ui.max_rect().right() - min.x).max(0.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
     let id = ui.next_auto_id();
     let mut left_ui = ui.new_child(
