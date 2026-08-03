@@ -21,11 +21,27 @@ pub enum PipelineEvent {
         original_jpeg: Vec<u8>,
         error: String,
     },
+    ReprocessDone {
+        id: u64,
+        page: ScannedPage,
+        corners: [CropPoint; 4],
+    },
+    ReprocessFailed {
+        id: u64,
+        error: String,
+    },
 }
 
-struct Job {
-    id: u64,
-    frame: Arc<RgbImage>,
+enum Job {
+    New {
+        id: u64,
+        frame: Arc<RgbImage>,
+    },
+    Reprocess {
+        id: u64,
+        frame: Arc<RgbImage>,
+        corners: [CropPoint; 4],
+    },
 }
 
 pub struct ProcessingPipeline {
@@ -54,7 +70,13 @@ impl ProcessingPipeline {
     pub fn try_submit(&self, id: u64, frame: Arc<RgbImage>) -> bool {
         self.jobs
             .as_ref()
-            .is_some_and(|jobs| jobs.try_send(Job { id, frame }).is_ok())
+            .is_some_and(|jobs| jobs.try_send(Job::New { id, frame }).is_ok())
+    }
+
+    pub fn submit_reprocess(&self, id: u64, frame: Arc<RgbImage>, corners: [CropPoint; 4]) -> bool {
+        self.jobs.as_ref().is_some_and(|jobs| {
+            jobs.try_send(Job::Reprocess { id, frame, corners }).is_ok()
+        })
     }
 
     pub fn try_event(&self) -> Option<PipelineEvent> {
@@ -88,25 +110,40 @@ fn worker_loop(jobs: &Receiver<Job>, events: &Sender<PipelineEvent>, abort: &Arc
 }
 
 fn process_job(job: &Job) -> PipelineEvent {
-    let corners = detect_document_corners(&job.frame);
-    let mut original_jpeg = Vec::new();
-    if JpegEncoder::new_with_quality(&mut original_jpeg, ORIGINAL_JPEG_QUALITY)
-        .encode_image(job.frame.as_ref())
-        .is_err()
-    {
-        original_jpeg.clear();
-    }
-    match process_page(&job.frame, corners) {
-        Ok(page) => PipelineEvent::PageReady {
-            id: job.id,
-            page,
-            original_jpeg,
-            corners,
-        },
-        Err(error) => PipelineEvent::PageFailed {
-            id: job.id,
-            original_jpeg,
-            error,
+    match job {
+        Job::New { id, frame } => {
+            let corners = detect_document_corners(frame);
+            let mut original_jpeg = Vec::new();
+            if JpegEncoder::new_with_quality(&mut original_jpeg, ORIGINAL_JPEG_QUALITY)
+                .encode_image(frame.as_ref())
+                .is_err()
+            {
+                original_jpeg.clear();
+            }
+            match process_page(frame, corners) {
+                Ok(page) => PipelineEvent::PageReady {
+                    id: *id,
+                    page,
+                    original_jpeg,
+                    corners,
+                },
+                Err(error) => PipelineEvent::PageFailed {
+                    id: *id,
+                    original_jpeg,
+                    error,
+                },
+            }
+        }
+        Job::Reprocess { id, frame, corners } => match process_page(frame, *corners) {
+            Ok(page) => PipelineEvent::ReprocessDone {
+                id: *id,
+                page,
+                corners: *corners,
+            },
+            Err(error) => PipelineEvent::ReprocessFailed {
+                id: *id,
+                error,
+            },
         },
     }
 }
@@ -158,6 +195,8 @@ mod tests {
             .map(|event| match event {
                 PipelineEvent::PageReady { id, .. } => *id,
                 PipelineEvent::PageFailed { id, .. } => *id,
+                PipelineEvent::ReprocessDone { id, .. } => *id,
+                PipelineEvent::ReprocessFailed { id, .. } => *id,
             })
             .collect();
         assert_eq!(ids, vec![7, 9]);
@@ -182,7 +221,33 @@ mod tests {
                 PipelineEvent::PageFailed { error, .. } => {
                     panic!("nieoczekiwany błąd przetwarzania: {error}")
                 }
+                _ => panic!("nieoczekiwany rodzaj zdarzenia"),
             }
+        }
+    }
+
+    #[test]
+    fn reprocess_uses_caller_corners() {
+        let pipeline = ProcessingPipeline::start();
+        let corners = [
+            CropPoint::new(0.2, 0.2),
+            CropPoint::new(0.8, 0.2),
+            CropPoint::new(0.8, 0.8),
+            CropPoint::new(0.2, 0.8),
+        ];
+        assert!(pipeline.submit_reprocess(3, Arc::new(white_document_frame(400, 300)), corners));
+        let events = collect_events(&pipeline, 1, Duration::from_secs(120));
+        match events.first() {
+            Some(PipelineEvent::ReprocessDone {
+                id,
+                page,
+                corners: returned,
+            }) => {
+                assert_eq!(*id, 3);
+                assert_eq!((page.width, page.height), (A4_WIDTH_PX, A4_HEIGHT_PX));
+                assert_eq!(returned, &corners);
+            }
+            _ => panic!("oczekiwano ReprocessDone"),
         }
     }
 

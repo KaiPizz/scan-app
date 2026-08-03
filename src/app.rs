@@ -338,6 +338,7 @@ impl DocumentScannerApp {
                         };
                     }
                 }
+                PipelineEvent::ReprocessDone { .. } | PipelineEvent::ReprocessFailed { .. } => {}
             }
         }
         if self.pending_jobs > 0 {
