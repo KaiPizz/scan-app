@@ -3,6 +3,7 @@
 mod app;
 mod camera;
 mod document;
+mod pipeline;
 mod storage;
 
 use app::DocumentScannerApp;
