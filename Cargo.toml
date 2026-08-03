@@ -1,0 +1,23 @@
+[package]
+name = "skaner-dokumentow"
+version = "0.1.0"
+edition = "2024"
+description = "Prosty skaner dokumentow dla IRIScan Visualizer 7"
+
+[dependencies]
+directories = "6.0.0"
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+imageproc = { version = "0.27.0", default-features = false }
+nokhwa = { version = "0.10.11", default-features = false, features = ["decoding", "input-msmf"] }
+open = "5.4.0"
+printpdf = { version = "0.12.5", default-features = false, features = ["jpeg"] }
+rfd = "0.15.4"
+ron = "0.12.2"
+serde = { version = "1.0.229", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+opt-level = "s"
+strip = true
+
