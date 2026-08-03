@@ -6,6 +6,7 @@ mod camera;
 mod document;
 mod overlay;
 mod pipeline;
+mod session;
 mod storage;
 
 use app::DocumentScannerApp;

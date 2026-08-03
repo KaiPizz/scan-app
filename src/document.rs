@@ -327,6 +327,17 @@ fn page_from_image(image: RgbImage) -> Result<ScannedPage, String> {
     })
 }
 
+pub fn page_from_jpeg_bytes(jpeg: Vec<u8>) -> Result<ScannedPage, String> {
+    let image = decode_jpeg(&jpeg)?;
+    let review_image = resize_to_fit(&image, 1200, 1200, imageops::FilterType::Lanczos3);
+    Ok(ScannedPage {
+        width: image.width(),
+        height: image.height(),
+        jpeg,
+        review_image,
+    })
+}
+
 fn decode_jpeg(bytes: &[u8]) -> Result<RgbImage, String> {
     ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
