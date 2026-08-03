@@ -6,8 +6,8 @@ use crate::storage::{
     list_folders, list_pdfs, load_settings, rename_folder, save_settings, unique_pdf_path,
 };
 use eframe::egui::{
-    self, Align, Button, Color32, ColorImage, CornerRadius, FontId, Frame, Layout, Margin, Pos2,
-    Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, UiBuilder, Vec2,
+    self, Align, Button, Color32, ColorImage, CornerRadius, FontId, Frame, Id, Layout, Margin,
+    Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, UiBuilder, Vec2,
 };
 use image::RgbImage;
 use std::path::PathBuf;
@@ -79,6 +79,7 @@ pub struct DocumentScannerApp {
     rename_folder_name: String,
     show_settings: bool,
     show_save: bool,
+    save_dialog_needs_focus: bool,
     show_cancel_confirm: bool,
     show_delete_confirm: bool,
     show_exit_confirm: bool,
@@ -119,6 +120,7 @@ impl DocumentScannerApp {
             rename_folder_name: String::new(),
             show_settings: false,
             show_save: false,
+            save_dialog_needs_focus: false,
             show_cancel_confirm: false,
             show_delete_confirm: false,
             show_exit_confirm: false,
@@ -703,6 +705,7 @@ impl DocumentScannerApp {
                 )
                 .clicked()
             {
+                self.save_dialog_needs_focus = true;
                 self.show_save = true;
             }
             if !self.camera_ready && controls_ui.button("Spróbuj ponownie").clicked() {
@@ -975,19 +978,54 @@ impl DocumentScannerApp {
                         egui::TextEdit::singleline(&mut self.filename)
                             .hint_text("np. Umowa - Kowalski"),
                     );
-                    response.request_focus();
+                    if self.save_dialog_needs_focus {
+                        self.save_dialog_needs_focus = false;
+                        response.request_focus();
+                    }
                     ui.label(
                         RichText::new("Rozszerzenie .pdf zostanie dodane automatycznie.")
                             .small()
                             .color(Color32::GRAY),
                     );
                     ui.add_space(10.0);
+                    let submitted = response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    let mut save_clicked = false;
+                    let mut back_clicked = false;
                     ui.horizontal(|ui| {
-                        if ui.button("Wróć").clicked() {
-                            self.show_save = false;
+                        back_clicked = ui.button("Wróć (Esc)").clicked();
+                        save_clicked = primary_button(ui, "Zapisz PDF (Enter)").clicked();
+                    });
+                    if back_clicked || ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                        self.show_save = false;
+                    }
+                    if submitted || save_clicked {
+                        self.save_current_document();
+                    }
+                });
+        }
+
+        if self.show_cancel_confirm {
+            egui::Window::new("Anulować dokument?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(context, |ui| {
+                    ui.label(format!(
+                        "Zeskanowane strony ({}) zostaną utracone.",
+                        self.slots.len()
+                    ));
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Wróć do skanowania").clicked() {
+                            self.show_cancel_confirm = false;
                         }
-                        if primary_button(ui, "Zapisz PDF").clicked() {
-                            self.save_current_document();
+                        if ui
+                            .button(RichText::new("Anuluj dokument").color(Color32::DARK_RED))
+                            .clicked()
+                        {
+                            self.show_cancel_confirm = false;
+                            self.abandon_scan();
                         }
                     });
                 });
@@ -1058,6 +1096,28 @@ impl DocumentScannerApp {
                     }
                 });
         }
+
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.shown_at.elapsed() > Duration::from_secs(4))
+        {
+            self.toast = None;
+        }
+        if let Some(toast) = &self.toast {
+            egui::Area::new(Id::new("zapis-toast"))
+                .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-24.0, -24.0))
+                .show(context, |ui| {
+                    Frame::new()
+                        .fill(Color32::from_rgb(34, 120, 62))
+                        .corner_radius(10.0)
+                        .inner_margin(Margin::symmetric(16, 10))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(&toast.text).color(Color32::WHITE).size(16.0));
+                        });
+                });
+            context.request_repaint_after(Duration::from_millis(250));
+        }
     }
 }
 
@@ -1073,6 +1133,29 @@ impl eframe::App for DocumentScannerApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        let dialog_open = self.show_save
+            || self.show_cancel_confirm
+            || self.show_delete_confirm
+            || self.show_settings
+            || self.show_new_folder
+            || self.show_rename_folder
+            || self.show_exit_confirm
+            || self.message.is_some();
+        if self.screen == Screen::ScanHub && !dialog_open {
+            let (space, enter) = context.input(|input| {
+                (
+                    input.key_pressed(egui::Key::Space),
+                    input.key_pressed(egui::Key::Enter),
+                )
+            });
+            if space {
+                self.capture();
+            }
+            if enter && self.can_save() {
+                self.save_dialog_needs_focus = true;
+                self.show_save = true;
+            }
+        }
         Frame::new().fill(BACKGROUND).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             self.top_bar(ui);
