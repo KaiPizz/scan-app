@@ -1,8 +1,11 @@
 use crate::autocapture::{AutoCapture, FeedResult};
 use crate::camera::{CameraController, CameraEvent};
-use crate::document::{CropPoint, ScannedPage, rotate_page_clockwise, save_pdf};
+use crate::document::{
+    CropPoint, ScannedPage, page_from_jpeg_bytes, rotate_page_clockwise, save_pdf,
+};
 use crate::overlay::OverlayDetector;
 use crate::pipeline::{PipelineEvent, ProcessingPipeline};
+use crate::session::{RecoveredSession, SessionStore};
 use crate::storage::{
     FolderInfo, PdfInfo, Settings, create_folder, default_library_root, ensure_library,
     list_folders, list_pdfs, load_settings, rename_folder, save_settings, unique_pdf_path,
@@ -87,6 +90,10 @@ pub struct DocumentScannerApp {
     autocapture: AutoCapture,
     pending_preview: Option<RgbImage>,
     editor: Option<EditorState>,
+    session: Option<SessionStore>,
+    session_broken: bool,
+    recovered: Option<RecoveredSession>,
+    show_restore: bool,
     filename: String,
     toast: Option<Toast>,
 
@@ -133,6 +140,10 @@ impl DocumentScannerApp {
             autocapture: AutoCapture::new(),
             pending_preview: None,
             editor: None,
+            session: None,
+            session_broken: false,
+            recovered: None,
+            show_restore: false,
             filename: String::new(),
             toast: None,
             show_new_folder: false,
@@ -153,6 +164,11 @@ impl DocumentScannerApp {
         }
         app.refresh_folders();
         app.restore_last_folder();
+        app.session = SessionStore::open_default();
+        if let Some(recovered) = app.session.as_ref().and_then(SessionStore::load_existing) {
+            app.recovered = Some(recovered);
+            app.show_restore = true;
+        }
         app
     }
 
@@ -213,7 +229,54 @@ impl DocumentScannerApp {
         self.pipeline = Some(ProcessingPipeline::start());
         self.overlay = Some(OverlayDetector::start());
         self.autocapture = AutoCapture::new();
+        self.session_broken = false;
+        if let (Some(session), Some(folder)) = (&self.session, &self.selected_folder)
+            && let Err(error) = session.begin(&folder.path)
+        {
+            self.session_broken = true;
+            self.toast = Some(Toast {
+                text: format!("Kopia sesji wyłączona: {error}"),
+                shown_at: Instant::now(),
+            });
+        }
         self.start_camera();
+    }
+
+    fn session_write_page(&mut self, id: u64, jpeg: &[u8]) {
+        if self.session_broken {
+            return;
+        }
+        if let Some(session) = &self.session
+            && let Err(error) = session.write_page(id, jpeg)
+        {
+            self.session_broken = true;
+            self.toast = Some(Toast {
+                text: format!("Kopia sesji wyłączona: {error}"),
+                shown_at: Instant::now(),
+            });
+        }
+    }
+
+    fn session_sync_order(&mut self) {
+        if self.session_broken {
+            return;
+        }
+        let ids: Vec<u64> = self.slots.iter().map(|entry| entry.id).collect();
+        if let Some(session) = &self.session
+            && let Err(error) = session.set_order(&ids)
+        {
+            self.session_broken = true;
+            self.toast = Some(Toast {
+                text: format!("Kopia sesji wyłączona: {error}"),
+                shown_at: Instant::now(),
+            });
+        }
+    }
+
+    fn session_clear(&mut self) {
+        if let Some(session) = &self.session {
+            let _ = session.clear();
+        }
     }
 
     fn start_camera(&mut self) {
@@ -325,6 +388,7 @@ impl DocumentScannerApp {
                     original_jpeg,
                     corners,
                 } => {
+                    self.session_write_page(id, &page.jpeg);
                     let texture = context.load_texture(
                         format!("strona-{id}"),
                         rgb_to_color_image(&page.review_image),
@@ -352,6 +416,7 @@ impl DocumentScannerApp {
                     }
                 }
                 PipelineEvent::ReprocessDone { id, page, corners } => {
+                    self.session_write_page(id, &page.jpeg);
                     let texture = context.load_texture(
                         format!("strona-{id}-kadr"),
                         rgb_to_color_image(&page.review_image),
@@ -421,7 +486,20 @@ impl DocumentScannerApp {
                 );
                 data.page = rotated;
             }
-            Err(error) => self.message = Some(error),
+            Err(error) => {
+                self.message = Some(error);
+                return;
+            }
+        }
+        let written = match self.slots.get(index) {
+            Some(entry) => match &entry.slot {
+                PageSlot::Ready(data) => Some((entry.id, data.page.jpeg.clone())),
+                _ => None,
+            },
+            None => None,
+        };
+        if let Some((id, jpeg)) = written {
+            self.session_write_page(id, &jpeg);
         }
     }
 
@@ -433,12 +511,17 @@ impl DocumentScannerApp {
             self.selected_slot = None;
             return;
         }
+        let removed_id = self.slots[index].id;
         self.slots.remove(index);
         self.selected_slot = if self.slots.is_empty() {
             None
         } else {
             Some(index.min(self.slots.len() - 1))
         };
+        if let Some(session) = &self.session {
+            let _ = session.remove_page(removed_id);
+        }
+        self.session_sync_order();
     }
 
     fn move_selected_page(&mut self, direction: isize) {
@@ -452,6 +535,7 @@ impl DocumentScannerApp {
         let target = target as usize;
         self.slots.swap(index, target);
         self.selected_slot = Some(target);
+        self.session_sync_order();
     }
 
     fn save_current_document(&mut self) {
@@ -493,9 +577,60 @@ impl DocumentScannerApp {
                 self.filename.clear();
                 self.refresh_pdfs();
                 self.refresh_folders();
+                self.session_clear();
             }
             Err(error) => self.message = Some(error),
         }
+    }
+
+    fn restore_recovered_session(&mut self, context: &egui::Context) {
+        let Some(recovered) = self.recovered.take() else {
+            return;
+        };
+        let folder_name = recovered
+            .folder_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.selected_folder = Some(FolderInfo {
+            name: folder_name,
+            path: recovered.folder_path.clone(),
+            pdf_count: 0,
+        });
+        self.slots.clear();
+        self.selected_slot = None;
+        self.pending_jobs = 0;
+        self.filename.clear();
+        self.pipeline = Some(ProcessingPipeline::start());
+        self.overlay = Some(OverlayDetector::start());
+        self.autocapture = AutoCapture::new();
+        self.session_broken = false;
+        let mut max_id = 0;
+        for (id, jpeg) in recovered.pages {
+            max_id = max_id.max(id);
+            match page_from_jpeg_bytes(jpeg) {
+                Ok(page) => {
+                    let texture = context.load_texture(
+                        format!("strona-{id}"),
+                        rgb_to_color_image(&page.review_image),
+                        TextureOptions::LINEAR,
+                    );
+                    self.slots.push(SlotEntry {
+                        id,
+                        slot: PageSlot::Ready(Box::new(PageData {
+                            page,
+                            original_jpeg: Vec::new(),
+                            corners: fallback_editor_corners(),
+                            texture,
+                        })),
+                    });
+                }
+                Err(error) => self.message = Some(error),
+            }
+        }
+        self.next_page_id = max_id + 1;
+        self.refresh_pdfs();
+        self.start_camera();
     }
 
     fn open_editor(&mut self, index: usize, context: &egui::Context) {
@@ -572,6 +707,7 @@ impl DocumentScannerApp {
         self.slots.clear();
         self.selected_slot = None;
         self.pending_jobs = 0;
+        self.session_clear();
         self.screen = Screen::Folder;
         self.refresh_pdfs();
     }
@@ -760,6 +896,7 @@ impl DocumentScannerApp {
             || self.show_new_folder
             || self.show_rename_folder
             || self.show_exit_confirm
+            || self.show_restore
             || self.message.is_some();
         if let Some(preview) = self.pending_preview.take()
             && self.camera_ready
@@ -1162,6 +1299,56 @@ impl DocumentScannerApp {
     }
 
     fn dialogs(&mut self, context: &egui::Context) {
+        if self.show_restore {
+            egui::Window::new("Niezapisana sesja")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(context, |ui| {
+                    let (count, folder_display, folder_exists) = match &self.recovered {
+                        Some(recovered) => (
+                            recovered.pages.len(),
+                            recovered.folder_path.display().to_string(),
+                            recovered.folder_path.is_dir(),
+                        ),
+                        None => (0, String::new(), false),
+                    };
+                    ui.label(format!(
+                        "Znaleziono niezapisaną sesję ({}).",
+                        polish_page_count(count)
+                    ));
+                    ui.label(format!("Folder: {folder_display}"));
+                    if !folder_exists {
+                        ui.label(
+                            RichText::new(
+                                "Ten folder już nie istnieje — przywracanie niemożliwe.",
+                            )
+                            .color(Color32::DARK_RED),
+                        );
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(RichText::new("Usuń sesję").color(Color32::DARK_RED))
+                            .clicked()
+                        {
+                            if let Some(session) = &self.session {
+                                let _ = session.clear();
+                            }
+                            self.recovered = None;
+                            self.show_restore = false;
+                        }
+                        if ui
+                            .add_enabled(folder_exists, Button::new("Przywróć"))
+                            .clicked()
+                        {
+                            self.show_restore = false;
+                            self.restore_recovered_session(context);
+                        }
+                    });
+                });
+        }
+
         if self.show_new_folder {
             egui::Window::new("Nowy folder")
                 .collapsible(false)
@@ -1436,6 +1623,7 @@ impl eframe::App for DocumentScannerApp {
             || self.show_new_folder
             || self.show_rename_folder
             || self.show_exit_confirm
+            || self.show_restore
             || self.message.is_some()
             || self.editor.is_some();
         if self.screen == Screen::ScanHub && !dialog_open {
