@@ -13,6 +13,7 @@ use eframe::egui::{
 };
 use image::RgbImage;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const BLUE: Color32 = Color32::from_rgb(38, 101, 180);
@@ -41,6 +42,16 @@ enum PageSlot {
         original_jpeg: Vec<u8>,
         error: String,
     },
+    Reprocessing {
+        original_jpeg: Vec<u8>,
+    },
+}
+
+struct EditorState {
+    slot_index: usize,
+    original: RgbImage,
+    texture: TextureHandle,
+    corners: [CropPoint; 4],
 }
 
 struct SlotEntry {
@@ -75,6 +86,7 @@ pub struct DocumentScannerApp {
     overlay: Option<OverlayDetector>,
     autocapture: AutoCapture,
     pending_preview: Option<RgbImage>,
+    editor: Option<EditorState>,
     filename: String,
     toast: Option<Toast>,
 
@@ -120,6 +132,7 @@ impl DocumentScannerApp {
             overlay: None,
             autocapture: AutoCapture::new(),
             pending_preview: None,
+            editor: None,
             filename: String::new(),
             toast: None,
             show_new_folder: false,
@@ -338,7 +351,41 @@ impl DocumentScannerApp {
                         };
                     }
                 }
-                PipelineEvent::ReprocessDone { .. } | PipelineEvent::ReprocessFailed { .. } => {}
+                PipelineEvent::ReprocessDone { id, page, corners } => {
+                    let texture = context.load_texture(
+                        format!("strona-{id}-kadr"),
+                        rgb_to_color_image(&page.review_image),
+                        TextureOptions::LINEAR,
+                    );
+                    if let Some(entry) = self.slots.iter_mut().find(|entry| entry.id == id) {
+                        let original_jpeg = match &mut entry.slot {
+                            PageSlot::Reprocessing { original_jpeg } => {
+                                std::mem::take(original_jpeg)
+                            }
+                            _ => Vec::new(),
+                        };
+                        entry.slot = PageSlot::Ready(Box::new(PageData {
+                            page,
+                            original_jpeg,
+                            corners,
+                            texture,
+                        }));
+                    }
+                }
+                PipelineEvent::ReprocessFailed { id, error } => {
+                    if let Some(entry) = self.slots.iter_mut().find(|entry| entry.id == id) {
+                        let original_jpeg = match &mut entry.slot {
+                            PageSlot::Reprocessing { original_jpeg } => {
+                                std::mem::take(original_jpeg)
+                            }
+                            _ => Vec::new(),
+                        };
+                        entry.slot = PageSlot::Failed {
+                            original_jpeg,
+                            error,
+                        };
+                    }
+                }
             }
         }
         if self.pending_jobs > 0 {
@@ -448,6 +495,65 @@ impl DocumentScannerApp {
                 self.refresh_folders();
             }
             Err(error) => self.message = Some(error),
+        }
+    }
+
+    fn open_editor(&mut self, index: usize, context: &egui::Context) {
+        let Some(entry) = self.slots.get(index) else {
+            return;
+        };
+        let (original_jpeg, corners) = match &entry.slot {
+            PageSlot::Ready(data) => (&data.original_jpeg, data.corners),
+            PageSlot::Failed { original_jpeg, .. } => (original_jpeg, fallback_editor_corners()),
+            _ => return,
+        };
+        if original_jpeg.is_empty() {
+            self.message =
+                Some("Ta strona nie ma zapisanego oryginału (odzyskana sesja).".to_owned());
+            return;
+        }
+        match image::load_from_memory(original_jpeg) {
+            Ok(image) => {
+                let original = image.to_rgb8();
+                let texture = context.load_texture(
+                    format!("edytor-{}", entry.id),
+                    rgb_to_color_image(&original),
+                    TextureOptions::LINEAR,
+                );
+                self.editor = Some(EditorState {
+                    slot_index: index,
+                    original,
+                    texture,
+                    corners,
+                });
+            }
+            Err(error) => self.message = Some(format!("Nie można odczytać oryginału: {error}")),
+        }
+    }
+
+    fn apply_editor(&mut self) {
+        let Some(editor) = self.editor.take() else {
+            return;
+        };
+        let Some(entry) = self.slots.get_mut(editor.slot_index) else {
+            return;
+        };
+        let Some(pipeline) = &self.pipeline else {
+            return;
+        };
+        let original_jpeg = match &mut entry.slot {
+            PageSlot::Ready(data) => std::mem::take(&mut data.original_jpeg),
+            PageSlot::Failed { original_jpeg, .. } => std::mem::take(original_jpeg),
+            _ => return,
+        };
+        if pipeline.submit_reprocess(entry.id, Arc::new(editor.original), editor.corners) {
+            entry.slot = PageSlot::Reprocessing { original_jpeg };
+            self.pending_jobs += 1;
+        } else {
+            entry.slot = PageSlot::Failed {
+                original_jpeg,
+                error: "Kolejka przetwarzania jest pełna. Spróbuj ponownie.".to_owned(),
+            };
         }
     }
 
@@ -658,9 +764,14 @@ impl DocumentScannerApp {
         if let Some(preview) = self.pending_preview.take()
             && self.camera_ready
             && !dialog_open
+            && self.editor.is_none()
             && self.autocapture.feed(&preview, Instant::now()) == FeedResult::Trigger
         {
             self.capture(false);
+        }
+        if self.editor.is_some() {
+            self.editor_ui(ui, context);
+            return;
         }
         page_container(ui, |ui| {
             let camera_ready = self.camera_ready;
@@ -797,6 +908,16 @@ impl DocumentScannerApp {
                         if ui.add_enabled(rotatable, Button::new("Obróć")).clicked() {
                             self.rotate_selected_page(context);
                         }
+                        let editable = matches!(
+                            self.slots.get(index).map(|entry| &entry.slot),
+                            Some(PageSlot::Ready(_)) | Some(PageSlot::Failed { .. })
+                        );
+                        if ui
+                            .add_enabled(editable, Button::new("Popraw kadr"))
+                            .clicked()
+                        {
+                            self.open_editor(index, context);
+                        }
                         if ui
                             .button(RichText::new("Usuń stronę").color(Color32::DARK_RED))
                             .clicked()
@@ -910,7 +1031,7 @@ impl DocumentScannerApp {
                                         );
                                         ui.label(format!("{}", index + 1));
                                     }
-                                    PageSlot::Processing => {
+                                    PageSlot::Processing | PageSlot::Reprocessing { .. } => {
                                         ui.add_space(40.0);
                                         ui.spinner();
                                         ui.label(format!("{}", index + 1));
@@ -935,6 +1056,108 @@ impl DocumentScannerApp {
             });
         if let Some(index) = clicked {
             self.selected_slot = Some(index);
+        }
+    }
+
+    fn editor_ui(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        let mut close = false;
+        let mut redetect = false;
+        let mut apply = false;
+        let Some(editor) = &mut self.editor else {
+            return;
+        };
+        page_container(ui, |ui| {
+            two_sided(
+                ui,
+                42.0,
+                |ui| {
+                    ui.horizontal(|ui| {
+                        close = ui.button("Wróć (Esc)").clicked();
+                        ui.add_space(8.0);
+                        ui.heading(format!("Popraw kadr · strona {}", editor.slot_index + 1));
+                    });
+                },
+                |ui| {
+                    ui.label("Przeciągnij niebieskie punkty do narożników kartki.");
+                },
+            );
+            ui.add_space(10.0);
+            let available = Vec2::new(
+                ui.available_width(),
+                (ui.available_height() - 70.0).max(320.0),
+            );
+            let (response, painter) = ui.allocate_painter(available, Sense::hover());
+            painter.rect_filled(response.rect, 12.0, Color32::from_gray(28));
+            let image_size = fit_size(
+                Vec2::new(editor.original.width() as f32, editor.original.height() as f32),
+                available - Vec2::splat(12.0),
+            );
+            let image_rect = Rect::from_center_size(response.rect.center(), image_size);
+            painter.image(
+                editor.texture.id(),
+                image_rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            let positions = editor.corners.map(|point| {
+                Pos2::new(
+                    image_rect.left() + point.x * image_rect.width(),
+                    image_rect.top() + point.y * image_rect.height(),
+                )
+            });
+            for edge in 0..4 {
+                painter.line_segment(
+                    [positions[edge], positions[(edge + 1) % 4]],
+                    Stroke::new(3.0, Color32::from_rgb(70, 165, 255)),
+                );
+            }
+            for (index, position) in positions.iter().enumerate() {
+                let handle_rect = Rect::from_center_size(*position, Vec2::splat(44.0));
+                let drag = ui.interact(
+                    handle_rect,
+                    Id::new(("editor-handle", index)),
+                    Sense::drag(),
+                );
+                if drag.dragged() {
+                    let pointer = drag.interact_pointer_pos().unwrap_or(*position);
+                    let normalized = CropPoint::new(
+                        ((pointer.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0),
+                        ((pointer.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0),
+                    );
+                    editor.corners[index] = constrain_editor_corner(index, normalized);
+                }
+                painter.circle_filled(*position, 11.0, Color32::WHITE);
+                painter.circle_filled(*position, 7.0, BLUE);
+            }
+            ui.add_space(10.0);
+            two_sided(
+                ui,
+                48.0,
+                |ui| {
+                    redetect = ui.button("Wykryj ponownie").clicked();
+                },
+                |ui| {
+                    apply = ui
+                        .add(
+                            Button::new(RichText::new("Zastosuj").strong().color(Color32::WHITE))
+                                .fill(BLUE)
+                                .corner_radius(10.0)
+                                .min_size(Vec2::new(180.0, 44.0)),
+                        )
+                        .clicked();
+                },
+            );
+        });
+        if redetect
+            && let Some(editor) = &mut self.editor
+        {
+            editor.corners = crate::document::detect_document_corners(&editor.original);
+        }
+        if close || context.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.editor = None;
+        }
+        if apply {
+            self.apply_editor();
         }
     }
 
@@ -1213,7 +1436,8 @@ impl eframe::App for DocumentScannerApp {
             || self.show_new_folder
             || self.show_rename_folder
             || self.show_exit_confirm
-            || self.message.is_some();
+            || self.message.is_some()
+            || self.editor.is_some();
         if self.screen == Screen::ScanHub && !dialog_open {
             let (space, enter) = context.input(|input| {
                 (
@@ -1342,6 +1566,25 @@ fn fit_size(source: Vec2, bounds: Vec2) -> Vec2 {
 #[link(name = "user32")]
 unsafe extern "system" {
     fn MessageBeep(utype: u32) -> i32;
+}
+
+fn fallback_editor_corners() -> [CropPoint; 4] {
+    [
+        CropPoint::new(0.06, 0.06),
+        CropPoint::new(0.94, 0.06),
+        CropPoint::new(0.94, 0.94),
+        CropPoint::new(0.06, 0.94),
+    ]
+}
+
+fn constrain_editor_corner(index: usize, point: CropPoint) -> CropPoint {
+    match index {
+        0 => CropPoint::new(point.x.min(0.49), point.y.min(0.49)),
+        1 => CropPoint::new(point.x.max(0.51), point.y.min(0.49)),
+        2 => CropPoint::new(point.x.max(0.51), point.y.max(0.51)),
+        3 => CropPoint::new(point.x.min(0.49), point.y.max(0.51)),
+        _ => point,
+    }
 }
 
 fn beep() {
