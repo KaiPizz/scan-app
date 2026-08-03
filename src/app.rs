@@ -1,3 +1,4 @@
+use crate::autocapture::{AutoCapture, FeedResult};
 use crate::camera::{CameraController, CameraEvent};
 use crate::document::{CropPoint, ScannedPage, rotate_page_clockwise, save_pdf};
 use crate::pipeline::{PipelineEvent, ProcessingPipeline};
@@ -70,6 +71,8 @@ pub struct DocumentScannerApp {
     next_page_id: u64,
     pending_jobs: usize,
     pipeline: Option<ProcessingPipeline>,
+    autocapture: AutoCapture,
+    pending_preview: Option<RgbImage>,
     filename: String,
     toast: Option<Toast>,
 
@@ -112,6 +115,8 @@ impl DocumentScannerApp {
             next_page_id: 0,
             pending_jobs: 0,
             pipeline: None,
+            autocapture: AutoCapture::new(),
+            pending_preview: None,
             filename: String::new(),
             toast: None,
             show_new_folder: false,
@@ -190,6 +195,7 @@ impl DocumentScannerApp {
         self.pending_jobs = 0;
         self.filename.clear();
         self.pipeline = Some(ProcessingPipeline::start());
+        self.autocapture = AutoCapture::new();
         self.start_camera();
     }
 
@@ -225,7 +231,10 @@ impl DocumentScannerApp {
                     self.camera_ready = true;
                     self.camera_status = format!("{device_name} · {width} × {height} px");
                 }
-                CameraEvent::Preview(image) => self.update_preview_texture(context, &image),
+                CameraEvent::Preview(image) => {
+                    self.update_preview_texture(context, &image);
+                    self.pending_preview = Some(image);
+                }
                 CameraEvent::Error(error) => {
                     self.camera_ready = false;
                     self.preview_texture = None;
@@ -249,13 +258,15 @@ impl DocumentScannerApp {
         }
     }
 
-    fn capture(&mut self) {
+    fn capture(&mut self, manual: bool) {
         let Some(frame) = self
             .camera
             .as_ref()
             .and_then(CameraController::latest_full_image)
         else {
-            self.message = Some("Poczekaj, aż pojawi się obraz z kamery.".to_owned());
+            if manual {
+                self.message = Some("Poczekaj, aż pojawi się obraz z kamery.".to_owned());
+            }
             return;
         };
         let Some(pipeline) = &self.pipeline else {
@@ -269,7 +280,11 @@ impl DocumentScannerApp {
                 slot: PageSlot::Processing,
             });
             self.pending_jobs += 1;
-        } else {
+            if manual {
+                self.autocapture.note_manual_capture();
+            }
+            beep();
+        } else if manual {
             self.message = Some("Poczekaj — przetwarzanie poprzednich stron…".to_owned());
         }
     }
@@ -623,6 +638,21 @@ impl DocumentScannerApp {
     fn scan_hub_ui(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         self.poll_camera(context);
         self.poll_pipeline(context);
+        let dialog_open = self.show_save
+            || self.show_cancel_confirm
+            || self.show_delete_confirm
+            || self.show_settings
+            || self.show_new_folder
+            || self.show_rename_folder
+            || self.show_exit_confirm
+            || self.message.is_some();
+        if let Some(preview) = self.pending_preview.take()
+            && self.camera_ready
+            && !dialog_open
+            && self.autocapture.feed(&preview, Instant::now()) == FeedResult::Trigger
+        {
+            self.capture(false);
+        }
         page_container(ui, |ui| {
             let camera_ready = self.camera_ready;
             let camera_status = self.camera_status.clone();
@@ -651,6 +681,24 @@ impl DocumentScannerApp {
                         Color32::DARK_GRAY
                     };
                     ui.label(RichText::new(camera_status).color(color));
+                    let auto_on = self.autocapture.enabled();
+                    let toggle_label = if auto_on { "Auto: WŁ" } else { "Auto: WYŁ" };
+                    let toggle = Button::new(
+                        RichText::new(toggle_label)
+                            .strong()
+                            .color(if auto_on { Color32::WHITE } else { BLUE_DARK }),
+                    )
+                    .fill(if auto_on { BLUE } else { Color32::WHITE })
+                    .stroke(Stroke::new(1.0, BLUE))
+                    .corner_radius(9.0);
+                    if ui.add(toggle).clicked() {
+                        self.autocapture.set_enabled(!auto_on);
+                    }
+                    if camera_ready {
+                        ui.label(
+                            RichText::new(self.autocapture.hint()).color(Color32::from_gray(90)),
+                        );
+                    }
                 },
             );
             if cancel {
@@ -688,7 +736,7 @@ impl DocumentScannerApp {
                 )
                 .clicked();
             if capture_clicked {
-                self.capture();
+                self.capture(true);
             }
             let save_label = if self.pending_jobs > 0 {
                 format!("Przetwarzanie {} stron…", self.pending_jobs)
@@ -832,7 +880,8 @@ impl DocumentScannerApp {
                                             Vec2::new(96.0, 112.0),
                                         );
                                         ui.add(
-                                            egui::Image::new(&data.texture).fit_to_exact_size(size),
+                                            egui::Image::new(&data.texture)
+                                                .fit_to_exact_size(size),
                                         );
                                         ui.label(format!("{}", index + 1));
                                     }
@@ -844,7 +893,9 @@ impl DocumentScannerApp {
                                     PageSlot::Failed { .. } => {
                                         ui.add_space(34.0);
                                         ui.label(
-                                            RichText::new("⚠").size(30.0).color(Color32::DARK_RED),
+                                            RichText::new("⚠")
+                                                .size(30.0)
+                                                .color(Color32::DARK_RED),
                                         );
                                         ui.label(RichText::new("Błąd").color(Color32::DARK_RED));
                                     }
@@ -1146,7 +1197,7 @@ impl eframe::App for DocumentScannerApp {
                 )
             });
             if space {
-                self.capture();
+                self.capture(true);
             }
             if enter && self.can_save() {
                 self.save_dialog_needs_focus = true;
@@ -1260,6 +1311,19 @@ fn fit_size(source: Vec2, bounds: Vec2) -> Vec2 {
     }
     let scale = (bounds.x / source.x).min(bounds.y / source.y).max(0.0);
     source * scale
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn MessageBeep(utype: u32) -> i32;
+}
+
+fn beep() {
+    #[cfg(windows)]
+    unsafe {
+        let _ = MessageBeep(0);
+    }
 }
 
 fn polish_page_count(count: usize) -> String {
