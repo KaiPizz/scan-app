@@ -1,3 +1,4 @@
+use crate::document::CropPoint;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -11,9 +12,22 @@ struct Manifest {
     page_ids: Vec<u64>,
 }
 
+#[derive(Debug, PartialEq)]
+pub struct RecoveredPage {
+    pub id: u64,
+    pub jpeg: Vec<u8>,
+    pub original_jpeg: Option<Vec<u8>>,
+    pub corners: Option<[CropPoint; 4]>,
+}
+
 pub struct RecoveredSession {
     pub folder_path: PathBuf,
-    pub pages: Vec<(u64, Vec<u8>)>,
+    pub pages: Vec<RecoveredPage>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PageMetadata {
+    corners: [CropPoint; 4],
 }
 
 pub struct SessionStore {
@@ -40,6 +54,14 @@ impl SessionStore {
         self.dir.join(format!("{id}.jpg"))
     }
 
+    fn original_path(&self, id: u64) -> PathBuf {
+        self.dir.join(format!("{id}.original.jpg"))
+    }
+
+    fn metadata_path(&self, id: u64) -> PathBuf {
+        self.dir.join(format!("{id}.crop.ron"))
+    }
+
     fn read_manifest(&self) -> Option<Manifest> {
         let contents = fs::read_to_string(self.manifest_path()).ok()?;
         ron::from_str(&contents).ok()
@@ -63,11 +85,21 @@ impl SessionStore {
         })
     }
 
-    pub fn write_page(&self, id: u64, jpeg: &[u8]) -> Result<(), String> {
+    pub fn write_page(
+        &self,
+        id: u64,
+        jpeg: &[u8],
+        original_jpeg: &[u8],
+        corners: [CropPoint; 4],
+    ) -> Result<(), String> {
         let Some(mut manifest) = self.read_manifest() else {
             return Err("Brak manifestu sesji.".to_owned());
         };
         fs::write(self.page_path(id), jpeg).map_err(io_error)?;
+        fs::write(self.original_path(id), original_jpeg).map_err(io_error)?;
+        let metadata =
+            ron::to_string(&PageMetadata { corners }).map_err(|error| error.to_string())?;
+        fs::write(self.metadata_path(id), metadata).map_err(io_error)?;
         if !manifest.page_ids.contains(&id) {
             manifest.page_ids.push(id);
         }
@@ -79,6 +111,8 @@ impl SessionStore {
             return Err("Brak manifestu sesji.".to_owned());
         };
         let _ = fs::remove_file(self.page_path(id));
+        let _ = fs::remove_file(self.original_path(id));
+        let _ = fs::remove_file(self.metadata_path(id));
         manifest.page_ids.retain(|existing| *existing != id);
         self.write_manifest(&manifest)
     }
@@ -98,8 +132,18 @@ impl SessionStore {
         }
         let mut pages = Vec::new();
         for id in &manifest.page_ids {
-            let bytes = fs::read(self.page_path(*id)).ok()?;
-            pages.push((*id, bytes));
+            let jpeg = fs::read(self.page_path(*id)).ok()?;
+            let original_jpeg = fs::read(self.original_path(*id)).ok();
+            let corners = fs::read_to_string(self.metadata_path(*id))
+                .ok()
+                .and_then(|contents| ron::from_str::<PageMetadata>(&contents).ok())
+                .map(|metadata| metadata.corners);
+            pages.push(RecoveredPage {
+                id: *id,
+                jpeg,
+                original_jpeg,
+                corners,
+            });
         }
         Some(RecoveredSession {
             folder_path: manifest.folder_path,
@@ -131,6 +175,15 @@ mod tests {
         store
     }
 
+    fn corners() -> [CropPoint; 4] {
+        [
+            CropPoint::new(0.1, 0.2),
+            CropPoint::new(0.9, 0.2),
+            CropPoint::new(0.9, 0.8),
+            CropPoint::new(0.1, 0.8),
+        ]
+    }
+
     #[test]
     fn empty_session_loads_as_none() {
         let store = test_store("empty");
@@ -146,17 +199,22 @@ mod tests {
         let store = test_store("roundtrip");
         let folder = Path::new("D:/dokumenty/umowy");
         store.begin(folder).expect("begin");
-        store.write_page(5, b"piata-strona").expect("write 5");
-        store.write_page(9, b"dziewiata-strona").expect("write 9");
+        store
+            .write_page(5, b"piata-strona", b"oryginal-5", corners())
+            .expect("write 5");
+        store
+            .write_page(9, b"dziewiata-strona", b"oryginal-9", corners())
+            .expect("write 9");
         let recovered = store.load_existing().expect("session");
         assert_eq!(recovered.folder_path, folder);
+        assert_eq!(recovered.pages[0].id, 5);
+        assert_eq!(recovered.pages[0].jpeg, b"piata-strona");
         assert_eq!(
-            recovered.pages,
-            vec![
-                (5, b"piata-strona".to_vec()),
-                (9, b"dziewiata-strona".to_vec())
-            ]
+            recovered.pages[0].original_jpeg.as_deref(),
+            Some(b"oryginal-5".as_slice())
         );
+        assert_eq!(recovered.pages[0].corners, Some(corners()));
+        assert_eq!(recovered.pages[1].id, 9);
         store.clear().expect("clear");
         assert!(store.load_existing().is_none());
     }
@@ -165,13 +223,19 @@ mod tests {
     fn remove_and_reorder_update_manifest() {
         let store = test_store("mutations");
         store.begin(Path::new("D:/dokumenty")).expect("begin");
-        store.write_page(1, b"a").expect("write 1");
-        store.write_page(2, b"b").expect("write 2");
-        store.write_page(3, b"c").expect("write 3");
+        store
+            .write_page(1, b"a", b"oa", corners())
+            .expect("write 1");
+        store
+            .write_page(2, b"b", b"ob", corners())
+            .expect("write 2");
+        store
+            .write_page(3, b"c", b"oc", corners())
+            .expect("write 3");
         store.remove_page(2).expect("remove");
         store.set_order(&[3, 1]).expect("reorder");
         let recovered = store.load_existing().expect("session");
-        let ids: Vec<u64> = recovered.pages.iter().map(|(id, _)| *id).collect();
+        let ids: Vec<u64> = recovered.pages.iter().map(|page| page.id).collect();
         assert_eq!(ids, vec![3, 1]);
         store.clear().expect("clear");
     }
@@ -179,7 +243,7 @@ mod tests {
     #[test]
     fn write_without_manifest_errors_without_panic() {
         let store = test_store("nomanifest");
-        assert!(store.write_page(1, b"x").is_err());
+        assert!(store.write_page(1, b"x", b"ox", corners()).is_err());
         let _ = store.clear();
     }
 
@@ -187,10 +251,33 @@ mod tests {
     fn rewriting_same_id_keeps_single_entry() {
         let store = test_store("rewrite");
         store.begin(Path::new("D:/dokumenty")).expect("begin");
-        store.write_page(4, b"stara").expect("write");
-        store.write_page(4, b"nowa").expect("rewrite");
+        store
+            .write_page(4, b"stara", b"oryginal", corners())
+            .expect("write");
+        store
+            .write_page(4, b"nowa", b"oryginal", corners())
+            .expect("rewrite");
         let recovered = store.load_existing().expect("session");
-        assert_eq!(recovered.pages, vec![(4, b"nowa".to_vec())]);
+        assert_eq!(recovered.pages.len(), 1);
+        assert_eq!(recovered.pages[0].id, 4);
+        assert_eq!(recovered.pages[0].jpeg, b"nowa");
+        store.clear().expect("clear");
+    }
+
+    #[test]
+    fn legacy_page_without_original_still_loads() {
+        let store = test_store("legacy");
+        store.begin(Path::new("D:/dokumenty")).expect("begin");
+        fs::write(store.page_path(7), b"stary-format").expect("legacy page");
+        let mut manifest = store.read_manifest().expect("manifest");
+        manifest.page_ids.push(7);
+        store.write_manifest(&manifest).expect("manifest update");
+
+        let recovered = store.load_existing().expect("session");
+        assert_eq!(recovered.pages.len(), 1);
+        assert_eq!(recovered.pages[0].jpeg, b"stary-format");
+        assert_eq!(recovered.pages[0].original_jpeg, None);
+        assert_eq!(recovered.pages[0].corners, None);
         store.clear().expect("clear");
     }
 }

@@ -259,12 +259,18 @@ impl DocumentScannerApp {
         self.start_camera();
     }
 
-    fn session_write_page(&mut self, id: u64, jpeg: &[u8]) {
+    fn session_write_page(
+        &mut self,
+        id: u64,
+        jpeg: &[u8],
+        original_jpeg: &[u8],
+        corners: [CropPoint; 4],
+    ) {
         if self.session_broken {
             return;
         }
         if let Some(session) = &self.session
-            && let Err(error) = session.write_page(id, jpeg)
+            && let Err(error) = session.write_page(id, jpeg, original_jpeg, corners)
         {
             self.session_broken = true;
             self.toast = Some(Toast {
@@ -408,7 +414,7 @@ impl DocumentScannerApp {
                     original_jpeg,
                     corners,
                 } => {
-                    self.session_write_page(id, &page.jpeg);
+                    self.session_write_page(id, &page.jpeg, &original_jpeg, corners);
                     let texture = context.load_texture(
                         format!("strona-{id}"),
                         rgb_to_color_image(&page.review_image),
@@ -436,12 +442,13 @@ impl DocumentScannerApp {
                     }
                 }
                 PipelineEvent::ReprocessDone { id, page, corners } => {
-                    self.session_write_page(id, &page.jpeg);
+                    let persisted_jpeg = page.jpeg.clone();
                     let texture = context.load_texture(
                         format!("strona-{id}-kadr"),
                         rgb_to_color_image(&page.review_image),
                         TextureOptions::LINEAR,
                     );
+                    let mut persisted_original = None;
                     if let Some(entry) = self.slots.iter_mut().find(|entry| entry.id == id) {
                         let original_jpeg = match &mut entry.slot {
                             PageSlot::Reprocessing { original_jpeg } => {
@@ -449,12 +456,16 @@ impl DocumentScannerApp {
                             }
                             _ => Vec::new(),
                         };
+                        persisted_original = Some(original_jpeg.clone());
                         entry.slot = PageSlot::Ready(Box::new(PageData {
                             page,
                             original_jpeg,
                             corners,
                             texture,
                         }));
+                    }
+                    if let Some(original_jpeg) = persisted_original {
+                        self.session_write_page(id, &persisted_jpeg, &original_jpeg, corners);
                     }
                 }
                 PipelineEvent::ReprocessFailed { id, error } => {
@@ -513,13 +524,18 @@ impl DocumentScannerApp {
         }
         let written = match self.slots.get(index) {
             Some(entry) => match &entry.slot {
-                PageSlot::Ready(data) => Some((entry.id, data.page.jpeg.clone())),
+                PageSlot::Ready(data) => Some((
+                    entry.id,
+                    data.page.jpeg.clone(),
+                    data.original_jpeg.clone(),
+                    data.corners,
+                )),
                 _ => None,
             },
             None => None,
         };
-        if let Some((id, jpeg)) = written {
-            self.session_write_page(id, &jpeg);
+        if let Some((id, jpeg, original_jpeg, corners)) = written {
+            self.session_write_page(id, &jpeg, &original_jpeg, corners);
         }
     }
 
@@ -654,7 +670,13 @@ impl DocumentScannerApp {
         }
         self.session_broken = false;
         let mut max_id = 0;
-        for (id, jpeg) in recovered.pages {
+        for recovered_page in recovered.pages {
+            let id = recovered_page.id;
+            let jpeg = recovered_page.jpeg;
+            let original_jpeg = recovered_page.original_jpeg.unwrap_or_else(|| jpeg.clone());
+            let corners = recovered_page
+                .corners
+                .unwrap_or_else(full_frame_editor_corners);
             max_id = max_id.max(id);
             match page_from_jpeg_bytes(jpeg) {
                 Ok(page) => {
@@ -667,8 +689,8 @@ impl DocumentScannerApp {
                         id,
                         slot: PageSlot::Ready(Box::new(PageData {
                             page,
-                            original_jpeg: Vec::new(),
-                            corners: fallback_editor_corners(),
+                            original_jpeg,
+                            corners,
                             texture,
                         })),
                     });
@@ -783,7 +805,9 @@ impl DocumentScannerApp {
                 Ok(page) => {
                     let id = self.next_page_id;
                     self.next_page_id += 1;
-                    self.session_write_page(id, &page.jpeg);
+                    let original_jpeg = page.jpeg.clone();
+                    let corners = full_frame_editor_corners();
+                    self.session_write_page(id, &page.jpeg, &original_jpeg, corners);
                     let texture = context.load_texture(
                         format!("strona-{id}"),
                         rgb_to_color_image(&page.review_image),
@@ -793,8 +817,8 @@ impl DocumentScannerApp {
                         id,
                         slot: PageSlot::Ready(Box::new(PageData {
                             page,
-                            original_jpeg: Vec::new(),
-                            corners: fallback_editor_corners(),
+                            original_jpeg,
+                            corners,
                             texture,
                         })),
                     });
@@ -2236,6 +2260,15 @@ fn fallback_editor_corners() -> [CropPoint; 4] {
         CropPoint::new(0.94, 0.06),
         CropPoint::new(0.94, 0.94),
         CropPoint::new(0.06, 0.94),
+    ]
+}
+
+fn full_frame_editor_corners() -> [CropPoint; 4] {
+    [
+        CropPoint::new(0.0, 0.0),
+        CropPoint::new(1.0, 0.0),
+        CropPoint::new(1.0, 1.0),
+        CropPoint::new(0.0, 1.0),
     ]
 }
 

@@ -5,6 +5,7 @@ use printpdf::{
     ImageCompression, ImageOptimizationOptions, Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, Pt,
     RawImage, XObjectTransform,
 };
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
@@ -14,7 +15,7 @@ pub const A4_HEIGHT_PX: u32 = 3508;
 const FLATTEN_COLS: usize = 12;
 const FLATTEN_ROWS: usize = 16;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CropPoint {
     pub x: f32,
     pub y: f32,
