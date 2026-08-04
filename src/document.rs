@@ -193,6 +193,14 @@ pub fn detect_document(image: &RgbImage) -> DetectResult {
 }
 
 pub fn process_page(image: &RgbImage, corners: [CropPoint; 4]) -> Result<ScannedPage, String> {
+    let mut output = warp_only(image, corners)?;
+    enhance_document(&mut output);
+    page_from_image(output)
+}
+
+/// Geometry only: perspective-corrects the page onto an A4 canvas without any
+/// tone or colour work (used by the version-comparison harness).
+fn warp_only(image: &RgbImage, corners: [CropPoint; 4]) -> Result<RgbImage, String> {
     let corners = expand_corners(corners, 0.018);
     let source = corners.map(|point| {
         (
@@ -216,8 +224,7 @@ pub fn process_page(image: &RgbImage, corners: [CropPoint; 4]) -> Result<Scanned
         Border::Constant(Rgb([255, 255, 255])),
         &mut output,
     );
-    enhance_document(&mut output);
-    page_from_image(output)
+    Ok(output)
 }
 
 fn valid_quadrilateral(corners: [(f32, f32); 4], width: f32, height: f32) -> bool {
@@ -643,6 +650,123 @@ mod tests {
         assert_eq!(review.dimensions(), (85, 120));
     }
 
+    /// Renders one raw camera frame through every enhancement generation so the
+    /// versions can be compared side by side on identical input.
+    /// RAW_FRAME=<in.png> OUT_DIR=<dir> cargo test --release variants -- --ignored
+    #[test]
+    #[ignore = "narzędzie porównawcze wersji przetwarzania"]
+    fn renders_enhancement_variants() {
+        let input = std::env::var("RAW_FRAME").expect("RAW_FRAME");
+        let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
+        let image = image::open(input).expect("odczyt klatki").to_rgb8();
+        let detected = detect_document(&image);
+        println!(
+            "detect: confident={} corners={:?}",
+            detected.confident, detected.corners
+        );
+        let warped = warp_only(&image, detected.corners).expect("warp");
+
+        let mut raw = warped.clone();
+        save_variant(&out_dir, "0-bez-korekcji", &raw);
+
+        raw = warped.clone();
+        enhance_v0_luminance(&mut raw);
+        save_variant(&out_dir, "1-stara-wersja-luminancja", &raw);
+
+        raw = warped.clone();
+        enhance_v2_per_channel(&mut raw);
+        save_variant(&out_dir, "2-kanaly-globalnie", &raw);
+
+        raw = warped.clone();
+        enhance_document(&mut raw);
+        save_variant(&out_dir, "3-obecna-lokalny-balans", &raw);
+    }
+
+    fn save_variant(dir: &str, name: &str, image: &RgbImage) {
+        let preview = resize_to_fit(image, 1240, 1754, imageops::FilterType::Lanczos3);
+        let path = format!("{dir}/{name}.png");
+        preview.save(&path).expect("zapis wariantu");
+        let mut sums = [0_u64; 3];
+        let mut count = 0_u64;
+        for y in (preview.height() / 5..preview.height() * 4 / 5).step_by(3) {
+            for x in (preview.width() / 5..preview.width() * 4 / 5).step_by(3) {
+                let pixel = preview.get_pixel(x, y);
+                if pixel[1] > 140 {
+                    for channel in 0..3 {
+                        sums[channel] += pixel[channel] as u64;
+                    }
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 {
+            println!(
+                "{name}: papier RGB = {:.0} {:.0} {:.0}",
+                sums[0] as f64 / count as f64,
+                sums[1] as f64 / count as f64,
+                sums[2] as f64 / count as f64
+            );
+        }
+    }
+
+    /// v0.2.1 — one luminance histogram, one scale for all channels.
+    fn enhance_v0_luminance(image: &mut RgbImage) {
+        let mut histogram = [0_u64; 256];
+        for pixel in image.pixels().step_by(8) {
+            let luminance =
+                (pixel[0] as u32 * 54 + pixel[1] as u32 * 183 + pixel[2] as u32 * 19) / 256;
+            histogram[luminance as usize] += 1;
+        }
+        let sample_count: u64 = histogram.iter().sum();
+        if sample_count == 0 {
+            return;
+        }
+        let low = percentile(&histogram, sample_count / 200);
+        let high = percentile(&histogram, sample_count * 199 / 200);
+        if high <= low + 60 {
+            return;
+        }
+        let scale = 245.0 / (high - low) as f32;
+        for pixel in image.pixels_mut() {
+            for channel in &mut pixel.0 {
+                let adjusted = (*channel as i32 - low as i32) as f32 * scale + 5.0;
+                *channel = adjusted.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    /// Second generation — per-channel percentiles over the whole frame.
+    fn enhance_v2_per_channel(image: &mut RgbImage) {
+        let mut histograms = [[0_u64; 256]; 3];
+        for pixel in image.pixels().step_by(8) {
+            for channel in 0..3 {
+                histograms[channel][pixel[channel] as usize] += 1;
+            }
+        }
+        let sample_count: u64 = histograms[0].iter().sum();
+        if sample_count == 0 {
+            return;
+        }
+        let mut lows = [0_usize; 3];
+        let mut highs = [0_usize; 3];
+        for channel in 0..3 {
+            lows[channel] = percentile(&histograms[channel], sample_count / 200);
+            highs[channel] = percentile(&histograms[channel], sample_count * 199 / 200);
+        }
+        if (0..3).any(|channel| highs[channel] <= lows[channel] + 60) {
+            return;
+        }
+        let scales: [f32; 3] =
+            std::array::from_fn(|channel| 245.0 / (highs[channel] - lows[channel]) as f32);
+        for pixel in image.pixels_mut() {
+            for channel in 0..3 {
+                let adjusted =
+                    (pixel[channel] as i32 - lows[channel] as i32) as f32 * scales[channel] + 5.0;
+                pixel[channel] = adjusted.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
     #[test]
     #[ignore = "narzędzie diagnostyczne dla prawdziwej klatki IRIScan"]
     fn processes_an_external_camera_frame() {
@@ -703,11 +827,7 @@ mod tests {
                 image.put_pixel(
                     x,
                     y,
-                    Rgb([
-                        base as u8,
-                        (base * 1.02) as u8,
-                        (base * 1.12).min(255.0) as u8,
-                    ]),
+                    Rgb([base as u8, (base * 1.02) as u8, (base * 1.12).min(255.0) as u8]),
                 );
             }
         }
@@ -717,13 +837,7 @@ mod tests {
             }
         }
         enhance_document(&mut image);
-        for (x, y) in [
-            (40_u32, 40_u32),
-            (440, 40),
-            (40, 600),
-            (440, 600),
-            (240, 470),
-        ] {
+        for (x, y) in [(40_u32, 40_u32), (440, 40), (40, 600), (440, 600), (240, 470)] {
             let sample = image.get_pixel(x, y);
             assert!(
                 sample[0] >= 225 && sample[1] >= 225 && sample[2] >= 225,
