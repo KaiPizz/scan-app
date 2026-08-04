@@ -376,27 +376,42 @@ fn resize_to_fit(
 }
 
 fn enhance_document(image: &mut RgbImage) {
+    let width = image.width();
+    let height = image.height();
+    if width < 20 || height < 20 {
+        return;
+    }
+    // Sample only the central region: page borders (dark mat) and lamp
+    // reflections near the edges must not skew the paper-color estimate.
+    let x_range = width / 5..width - width / 5;
+    let y_range = height / 5..height - height / 5;
     let mut histograms = [[0_u64; 256]; 3];
-    for pixel in image.pixels().step_by(8) {
-        for channel in 0..3 {
-            histograms[channel][pixel[channel] as usize] += 1;
+    let mut sample_count = 0_u64;
+    for y in y_range.step_by(4) {
+        for x in x_range.clone().step_by(4) {
+            let pixel = image.get_pixel(x, y);
+            for channel in 0..3 {
+                histograms[channel][pixel[channel] as usize] += 1;
+            }
+            sample_count += 1;
         }
     }
-    let sample_count: u64 = histograms[0].iter().sum();
     if sample_count == 0 {
         return;
     }
     let mut lows = [0_usize; 3];
-    let mut highs = [0_usize; 3];
+    let mut papers = [0_usize; 3];
     for channel in 0..3 {
         lows[channel] = percentile(&histograms[channel], sample_count / 200);
-        highs[channel] = percentile(&histograms[channel], sample_count * 199 / 200);
+        // Paper white = the dominant bright value, immune to small specular
+        // highlights that fool a high percentile.
+        papers[channel] = bright_mode(&histograms[channel]);
     }
-    if (0..3).any(|channel| highs[channel] <= lows[channel] + 60) {
+    if (0..3).any(|channel| papers[channel] <= lows[channel] + 60) {
         return;
     }
     let scales: [f32; 3] =
-        std::array::from_fn(|channel| 245.0 / (highs[channel] - lows[channel]) as f32);
+        std::array::from_fn(|channel| 242.0 / (papers[channel] - lows[channel]) as f32);
     for pixel in image.pixels_mut() {
         for channel in 0..3 {
             let adjusted =
@@ -404,6 +419,16 @@ fn enhance_document(image: &mut RgbImage) {
             pixel[channel] = adjusted.round().clamp(0.0, 255.0) as u8;
         }
     }
+}
+
+fn bright_mode(histogram: &[u64; 256]) -> usize {
+    histogram
+        .iter()
+        .enumerate()
+        .skip(100)
+        .max_by_key(|(_, count)| **count)
+        .map(|(value, _)| value)
+        .unwrap_or(255)
 }
 
 fn percentile(histogram: &[u64; 256], target: u64) -> usize {
@@ -497,6 +522,38 @@ mod tests {
         println!("wykryte narożniki: {corners:?}");
         let page = process_page(&image, corners).expect("przetworzenie strony");
         page.review_image.save(output).expect("zapis podglądu");
+    }
+
+    #[test]
+    fn ignores_borders_and_highlights_when_estimating_paper() {
+        let mut image = RgbImage::from_pixel(400, 400, Rgb([20, 20, 25]));
+        for y in 40..360 {
+            for x in 40..360 {
+                image.put_pixel(x, y, Rgb([185, 195, 225]));
+            }
+        }
+        for y in 180..240 {
+            for x in 180..240 {
+                image.put_pixel(x, y, Rgb([255, 255, 255]));
+            }
+        }
+        for y in 120..150 {
+            for x in 120..280 {
+                image.put_pixel(x, y, Rgb([40, 45, 70]));
+            }
+        }
+        enhance_document(&mut image);
+        let paper = image.get_pixel(100, 100);
+        assert!(
+            paper[0] >= 240 && paper[1] >= 240 && paper[2] >= 240,
+            "papier nie został rozjaśniony: {:?}",
+            paper
+        );
+        let gap = paper[0]
+            .abs_diff(paper[1])
+            .max(paper[1].abs_diff(paper[2]))
+            .max(paper[0].abs_diff(paper[2]));
+        assert!(gap <= 6, "papier nie jest neutralny: {:?}", paper);
     }
 
     #[test]
