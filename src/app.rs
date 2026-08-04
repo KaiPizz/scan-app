@@ -66,6 +66,7 @@ struct SlotEntry {
 struct Toast {
     text: String,
     shown_at: Instant,
+    pdf_path: Option<PathBuf>,
 }
 
 pub struct DocumentScannerApp {
@@ -108,6 +109,7 @@ pub struct DocumentScannerApp {
     save_dialog_needs_focus: bool,
     show_cancel_confirm: bool,
     show_delete_confirm: bool,
+    delete_pdf_target: Option<PdfInfo>,
     show_exit_confirm: bool,
     allow_exit: bool,
     message: Option<String>,
@@ -158,6 +160,7 @@ impl DocumentScannerApp {
             save_dialog_needs_focus: false,
             show_cancel_confirm: false,
             show_delete_confirm: false,
+            delete_pdf_target: None,
             show_exit_confirm: false,
             allow_exit: false,
             message: None,
@@ -240,6 +243,7 @@ impl DocumentScannerApp {
             self.toast = Some(Toast {
                 text: format!("Kopia sesji wyłączona: {error}"),
                 shown_at: Instant::now(),
+                pdf_path: None,
             });
         }
         self.start_camera();
@@ -256,6 +260,7 @@ impl DocumentScannerApp {
             self.toast = Some(Toast {
                 text: format!("Kopia sesji wyłączona: {error}"),
                 shown_at: Instant::now(),
+                pdf_path: None,
             });
         }
     }
@@ -272,6 +277,7 @@ impl DocumentScannerApp {
             self.toast = Some(Toast {
                 text: format!("Kopia sesji wyłączona: {error}"),
                 shown_at: Instant::now(),
+                pdf_path: None,
             });
         }
     }
@@ -573,6 +579,7 @@ impl DocumentScannerApp {
                 self.toast = Some(Toast {
                     text: format!("Zapisano: {name}"),
                     shown_at: Instant::now(),
+                    pdf_path: Some(path.clone()),
                 });
                 self.show_save = false;
                 self.slots.clear();
@@ -862,6 +869,8 @@ impl DocumentScannerApp {
                     "Kliknij „Nowy skan”, aby dodać pierwszy dokument.",
                 );
             } else {
+                let mut open_target: Option<PathBuf> = None;
+                let mut delete_target: Option<PdfInfo> = None;
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for pdf in &self.pdfs {
                         Frame::new()
@@ -870,21 +879,40 @@ impl DocumentScannerApp {
                             .stroke(Stroke::new(1.0, Color32::from_gray(222)))
                             .inner_margin(Margin::symmetric(18, 14))
                             .show(ui, |ui| {
-                                let (_, open_pdf) = two_sided(
+                                let (_, (open_pdf, delete_pdf)) = two_sided(
                                     ui,
                                     38.0,
                                     |ui| {
                                         ui.label(RichText::new(&pdf.name).size(16.0));
                                     },
-                                    |ui| ui.button("Otwórz PDF").clicked(),
+                                    |ui| {
+                                        let open_pdf = ui.button("Otwórz PDF").clicked();
+                                        let delete_pdf = ui
+                                            .button(
+                                                RichText::new("Usuń").color(Color32::DARK_RED),
+                                            )
+                                            .clicked();
+                                        (open_pdf, delete_pdf)
+                                    },
                                 );
-                                if open_pdf && let Err(error) = open::that_detached(&pdf.path) {
-                                    self.message = Some(format!("Nie można otworzyć PDF: {error}"));
+                                if open_pdf {
+                                    open_target = Some(pdf.path.clone());
+                                }
+                                if delete_pdf {
+                                    delete_target = Some(pdf.clone());
                                 }
                             });
                         ui.add_space(8.0);
                     }
                 });
+                if let Some(path) = open_target
+                    && let Err(error) = open::that_detached(&path)
+                {
+                    self.message = Some(format!("Nie można otworzyć PDF: {error}"));
+                }
+                if delete_target.is_some() {
+                    self.delete_pdf_target = delete_target;
+                }
             }
         });
     }
@@ -1539,6 +1567,39 @@ impl DocumentScannerApp {
                 });
         }
 
+        if let Some(pdf) = self.delete_pdf_target.clone() {
+            egui::Window::new("Usunąć dokument?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(context, |ui| {
+                    ui.set_max_width(480.0);
+                    ui.label(format!("Plik „{}” zostanie trwale usunięty.", pdf.name));
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Anuluj").clicked() {
+                            self.delete_pdf_target = None;
+                        }
+                        if ui
+                            .button(RichText::new("Usuń dokument").color(Color32::DARK_RED))
+                            .clicked()
+                        {
+                            self.delete_pdf_target = None;
+                            match std::fs::remove_file(&pdf.path) {
+                                Ok(()) => {
+                                    self.refresh_pdfs();
+                                    self.refresh_folders();
+                                }
+                                Err(error) => {
+                                    self.message =
+                                        Some(format!("Nie można usunąć pliku: {error}"));
+                                }
+                            }
+                        }
+                    });
+                });
+        }
+
         if self.show_cancel_confirm {
             egui::Window::new("Anulować dokument?")
                 .collapsible(false)
@@ -1631,10 +1692,19 @@ impl DocumentScannerApp {
                 });
         }
 
+        let toast_lifetime = if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.pdf_path.is_some())
+        {
+            Duration::from_secs(8)
+        } else {
+            Duration::from_secs(4)
+        };
         if self
             .toast
             .as_ref()
-            .is_some_and(|toast| toast.shown_at.elapsed() > Duration::from_secs(4))
+            .is_some_and(|toast| toast.shown_at.elapsed() > toast_lifetime)
         {
             self.toast = None;
         }
@@ -1644,6 +1714,7 @@ impl DocumentScannerApp {
             } else {
                 -24.0
             };
+            let mut open_error = None;
             egui::Area::new(Id::new("zapis-toast"))
                 .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-24.0, toast_lift))
                 .show(context, |ui| {
@@ -1652,9 +1723,32 @@ impl DocumentScannerApp {
                         .corner_radius(10.0)
                         .inner_margin(Margin::symmetric(16, 10))
                         .show(ui, |ui| {
-                            ui.label(RichText::new(&toast.text).color(Color32::WHITE).size(16.0));
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(&toast.text).color(Color32::WHITE).size(16.0),
+                                );
+                                if let Some(path) = &toast.pdf_path
+                                    && ui
+                                        .add(
+                                            Button::new(
+                                                RichText::new("Otwórz PDF")
+                                                    .strong()
+                                                    .color(Color32::from_rgb(34, 120, 62)),
+                                            )
+                                            .fill(Color32::WHITE)
+                                            .corner_radius(8.0),
+                                        )
+                                        .clicked()
+                                    && let Err(error) = open::that_detached(path)
+                                {
+                                    open_error = Some(format!("Nie można otworzyć PDF: {error}"));
+                                }
+                            });
                         });
                 });
+            if let Some(error) = open_error {
+                self.message = Some(error);
+            }
             context.request_repaint_after(Duration::from_millis(250));
         }
     }
