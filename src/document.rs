@@ -1,8 +1,6 @@
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, ImageReader, Rgb, RgbImage, imageops};
-use imageproc::edges::canny;
 use imageproc::geometric_transformations::{Border, Interpolation, Projection, warp_into};
-use imageproc::hough::{LineDetectionOptions, PolarLine, detect_lines};
 use printpdf::{
     ImageCompression, ImageOptimizationOptions, Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, Pt,
     RawImage, XObjectTransform,
@@ -34,69 +32,160 @@ pub struct ScannedPage {
     pub height: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DetectResult {
+    pub corners: [CropPoint; 4],
+    pub confident: bool,
+}
+
 pub fn detect_document_corners(image: &RgbImage) -> [CropPoint; 4] {
+    detect_document(image).corners
+}
+
+/// Contour-first detection: the page is the largest bright region on the dark
+/// scanner mat, so its outer boundary is found by thresholding — interior
+/// content (table rules, dense text) cannot hijack the crop the way strong
+/// Hough lines could.
+pub fn detect_document(image: &RgbImage) -> DetectResult {
+    let fallback = DetectResult {
+        corners: fallback_corners(),
+        confident: false,
+    };
     if image.width() < 40 || image.height() < 40 {
-        return fallback_corners();
+        return fallback;
     }
     let preview = resize_to_fit(image, 720, 720, imageops::FilterType::Triangle);
     let gray = DynamicImage::ImageRgb8(preview).to_luma8();
     let width = gray.width() as usize;
     let height = gray.height() as usize;
     if width < 40 || height < 40 {
-        return fallback_corners();
+        return fallback;
     }
 
-    let mut vertical_scores = vec![0.0_f64; width];
-    let mut horizontal_scores = vec![0.0_f64; height];
-    let y_margin = (height / 20).max(2);
-    let x_margin = (width / 20).max(2);
+    // Threshold midway between the dark and bright population peaks.
+    let mut histogram = [0_u64; 256];
+    for pixel in gray.pixels() {
+        histogram[pixel[0] as usize] += 1;
+    }
+    let total: u64 = histogram.iter().sum();
+    let dark = percentile(&histogram, total / 10) as u32;
+    let bright = percentile(&histogram, total * 9 / 10) as u32;
+    if bright < dark + 50 {
+        return fallback;
+    }
+    let threshold = ((dark + bright) / 2) as u8;
 
-    for y in y_margin..height.saturating_sub(y_margin) {
-        for (x, score) in vertical_scores
-            .iter_mut()
-            .enumerate()
-            .take(width - 1)
-            .skip(1)
-        {
-            let left = gray.get_pixel((x - 1) as u32, y as u32)[0] as f64;
-            let right = gray.get_pixel((x + 1) as u32, y as u32)[0] as f64;
-            *score += (right - left).abs();
+    // Largest connected bright component via two-pass union-find labelling.
+    let mask: Vec<bool> = gray.pixels().map(|pixel| pixel[0] > threshold).collect();
+    let mut labels = vec![0_u32; width * height];
+    let mut parents: Vec<u32> = vec![0];
+    fn find(parents: &mut Vec<u32>, mut label: u32) -> u32 {
+        while parents[label as usize] != label {
+            parents[label as usize] = parents[parents[label as usize] as usize];
+            label = parents[label as usize];
+        }
+        label
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            if !mask[index] {
+                continue;
+            }
+            let left = if x > 0 { labels[index - 1] } else { 0 };
+            let up = if y > 0 { labels[index - width] } else { 0 };
+            labels[index] = match (left, up) {
+                (0, 0) => {
+                    let label = parents.len() as u32;
+                    parents.push(label);
+                    label
+                }
+                (label, 0) | (0, label) => label,
+                (first, second) => {
+                    let first_root = find(&mut parents, first);
+                    let second_root = find(&mut parents, second);
+                    if first_root != second_root {
+                        let min_root = first_root.min(second_root);
+                        parents[first_root.max(second_root) as usize] = min_root;
+                        min_root
+                    } else {
+                        first_root
+                    }
+                }
+            };
         }
     }
-    for (y, score) in horizontal_scores
-        .iter_mut()
+    let mut areas = vec![0_u64; parents.len()];
+    for &label in &labels {
+        if label != 0 {
+            let root = find(&mut parents, label);
+            areas[root as usize] += 1;
+        }
+    }
+    let Some((component, &area)) = areas
+        .iter()
         .enumerate()
-        .take(height - 1)
         .skip(1)
-    {
-        for x in x_margin..width.saturating_sub(x_margin) {
-            let top = gray.get_pixel(x as u32, (y - 1) as u32)[0] as f64;
-            let bottom = gray.get_pixel(x as u32, (y + 1) as u32)[0] as f64;
-            *score += (bottom - top).abs();
+        .max_by_key(|(_, area)| **area)
+    else {
+        return fallback;
+    };
+    if area < (width * height) as u64 * 18 / 100 {
+        return fallback;
+    }
+    let component = component as u32;
+
+    // Corner estimate: extreme points of the component (rotation-tolerant).
+    let mut top_left = (0_f32, 0_f32);
+    let mut top_right = (0_f32, 0_f32);
+    let mut bottom_right = (0_f32, 0_f32);
+    let mut bottom_left = (0_f32, 0_f32);
+    let (mut min_sum, mut max_sum) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut min_diff, mut max_diff) = (f32::INFINITY, f32::NEG_INFINITY);
+    let mut inside_brightness = 0_u64;
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            if labels[index] == 0 || find(&mut parents, labels[index]) != component {
+                continue;
+            }
+            inside_brightness += gray.get_pixel(x as u32, y as u32)[0] as u64;
+            let (fx, fy) = (x as f32, y as f32);
+            if fx + fy < min_sum {
+                min_sum = fx + fy;
+                top_left = (fx, fy);
+            }
+            if fx + fy > max_sum {
+                max_sum = fx + fy;
+                bottom_right = (fx, fy);
+            }
+            if fx - fy > max_diff {
+                max_diff = fx - fy;
+                top_right = (fx, fy);
+            }
+            if fx - fy < min_diff {
+                min_diff = fx - fy;
+                bottom_left = (fx, fy);
+            }
         }
     }
-
-    let vertical_scores = smooth_scores(&vertical_scores, 7);
-    let horizontal_scores = smooth_scores(&horizontal_scores, 7);
-    let left = strongest_index(&vertical_scores, width / 40, width * 9 / 20);
-    let right = strongest_index(&vertical_scores, width * 11 / 20, width * 39 / 40);
-    let top = strongest_index(&horizontal_scores, height / 40, height * 9 / 20);
-    let bottom = strongest_index(&horizontal_scores, height * 11 / 20, height * 39 / 40);
-
-    let (Some(left), Some(right), Some(top), Some(bottom)) = (left, right, top, bottom) else {
-        return fallback_corners();
-    };
-    if right.saturating_sub(left) < width / 3 || bottom.saturating_sub(top) < height / 3 {
-        return fallback_corners();
+    let corners = [top_left, top_right, bottom_right, bottom_left];
+    if !valid_quadrilateral(corners, width as f32, height as f32) {
+        return fallback;
     }
-    let rectangle = [
-        (left as f32, top as f32),
-        (right as f32, top as f32),
-        (right as f32, bottom as f32),
-        (left as f32, bottom as f32),
-    ];
-    let corners = perspective_corners(&gray, rectangle).unwrap_or(rectangle);
-    corners.map(|(x, y)| CropPoint::new(x / width as f32, y / height as f32))
+
+    // Confidence: page interior must clearly outshine the surrounding mat.
+    let outside_area = (width * height) as u64 - area;
+    let total_brightness: u64 = gray.pixels().map(|pixel| pixel[0] as u64).sum();
+    let inside_mean = inside_brightness / area.max(1);
+    let outside_mean = total_brightness.saturating_sub(inside_brightness) / outside_area.max(1);
+    let confident = inside_mean >= outside_mean + 40 && outside_area > 0;
+
+    DetectResult {
+        corners: corners
+            .map(|(x, y)| CropPoint::new(x / width as f32, y / height as f32)),
+        confident,
+    }
 }
 
 pub fn process_page(image: &RgbImage, corners: [CropPoint; 4]) -> Result<ScannedPage, String> {
@@ -125,110 +214,6 @@ pub fn process_page(image: &RgbImage, corners: [CropPoint; 4]) -> Result<Scanned
     );
     enhance_document(&mut output);
     page_from_image(output)
-}
-
-fn perspective_corners(
-    gray: &image::GrayImage,
-    rectangle: [(f32, f32); 4],
-) -> Option<[(f32, f32); 4]> {
-    let edges = canny(gray, 35.0, 90.0);
-    let threshold = (gray.width().min(gray.height()) / 5).max(55);
-    let lines = detect_lines(
-        &edges,
-        LineDetectionOptions {
-            vote_threshold: threshold,
-            suppression_radius: 8,
-        },
-    );
-    let center_x = gray.width() as f32 * 0.5;
-    let center_y = gray.height() as f32 * 0.5;
-    let left = closest_vertical_line(&lines, rectangle[0].0, center_y, gray.width())?;
-    let right = closest_vertical_line(&lines, rectangle[1].0, center_y, gray.width())?;
-    let top = closest_horizontal_line(&lines, rectangle[0].1, center_x, gray.height())?;
-    let bottom = closest_horizontal_line(&lines, rectangle[2].1, center_x, gray.height())?;
-    let corners = [
-        line_intersection(left, top)?,
-        line_intersection(right, top)?,
-        line_intersection(right, bottom)?,
-        line_intersection(left, bottom)?,
-    ];
-    valid_quadrilateral(corners, gray.width() as f32, gray.height() as f32).then_some(corners.map(
-        |(x, y)| {
-            (
-                x.clamp(0.0, gray.width() as f32 - 1.0),
-                y.clamp(0.0, gray.height() as f32 - 1.0),
-            )
-        },
-    ))
-}
-
-fn closest_vertical_line(
-    lines: &[PolarLine],
-    expected_x: f32,
-    center_y: f32,
-    width: u32,
-) -> Option<PolarLine> {
-    lines
-        .iter()
-        .copied()
-        .filter(|line| line.angle_in_degrees <= 18 || line.angle_in_degrees >= 162)
-        .filter_map(|line| {
-            let angle = (line.angle_in_degrees as f32).to_radians();
-            let (sin, cos) = angle.sin_cos();
-            (cos.abs() > 0.1).then(|| {
-                let x = (line.r - center_y * sin) / cos;
-                (line, x)
-            })
-        })
-        .filter(|(_, x)| *x >= 0.0 && *x < width as f32)
-        .min_by(|(_, left_x), (_, right_x)| {
-            (left_x - expected_x)
-                .abs()
-                .total_cmp(&(right_x - expected_x).abs())
-        })
-        .map(|(line, _)| line)
-}
-
-fn closest_horizontal_line(
-    lines: &[PolarLine],
-    expected_y: f32,
-    center_x: f32,
-    height: u32,
-) -> Option<PolarLine> {
-    lines
-        .iter()
-        .copied()
-        .filter(|line| line.angle_in_degrees.abs_diff(90) <= 18)
-        .filter_map(|line| {
-            let angle = (line.angle_in_degrees as f32).to_radians();
-            let (sin, cos) = angle.sin_cos();
-            (sin.abs() > 0.1).then(|| {
-                let y = (line.r - center_x * cos) / sin;
-                (line, y)
-            })
-        })
-        .filter(|(_, y)| *y >= 0.0 && *y < height as f32)
-        .min_by(|(_, left_y), (_, right_y)| {
-            (left_y - expected_y)
-                .abs()
-                .total_cmp(&(right_y - expected_y).abs())
-        })
-        .map(|(line, _)| line)
-}
-
-fn line_intersection(first: PolarLine, second: PolarLine) -> Option<(f32, f32)> {
-    let first_angle = (first.angle_in_degrees as f32).to_radians();
-    let second_angle = (second.angle_in_degrees as f32).to_radians();
-    let (first_sin, first_cos) = first_angle.sin_cos();
-    let (second_sin, second_cos) = second_angle.sin_cos();
-    let determinant = first_cos * second_sin - second_cos * first_sin;
-    if determinant.abs() < 0.01 {
-        return None;
-    }
-    Some((
-        (first.r * second_sin - second.r * first_sin) / determinant,
-        (first_cos * second.r - second_cos * first.r) / determinant,
-    ))
 }
 
 fn valid_quadrilateral(corners: [(f32, f32); 4], width: f32, height: f32) -> bool {
@@ -451,26 +436,6 @@ fn fallback_corners() -> [CropPoint; 4] {
     ]
 }
 
-fn smooth_scores(scores: &[f64], radius: usize) -> Vec<f64> {
-    let mut smoothed = vec![0.0; scores.len()];
-    for (index, output) in smoothed.iter_mut().enumerate() {
-        let start = index.saturating_sub(radius);
-        let end = (index + radius + 1).min(scores.len());
-        *output = scores[start..end].iter().sum::<f64>() / (end - start) as f64;
-    }
-    smoothed
-}
-
-fn strongest_index(scores: &[f64], start: usize, end: usize) -> Option<usize> {
-    if start >= end || end > scores.len() {
-        return None;
-    }
-    scores[start..end]
-        .iter()
-        .enumerate()
-        .max_by(|(_, left), (_, right)| left.total_cmp(right))
-        .map(|(offset, _)| start + offset)
-}
 
 #[cfg(test)]
 mod tests {
@@ -522,6 +487,57 @@ mod tests {
         println!("wykryte narożniki: {corners:?}");
         let page = process_page(&image, corners).expect("przetworzenie strony");
         page.review_image.save(output).expect("zapis podglądu");
+    }
+
+    #[test]
+    fn table_lines_do_not_hijack_the_crop() {
+        let mut image = RgbImage::from_pixel(800, 600, Rgb([25, 25, 25]));
+        for y in 60..540 {
+            for x in 100..700 {
+                image.put_pixel(x, y, Rgb([240, 240, 240]));
+            }
+        }
+        for line in 0..4 {
+            let y = 180 + line * 80;
+            for x in 160..640 {
+                for dy in 0..3 {
+                    image.put_pixel(x, y + dy, Rgb([30, 30, 30]));
+                }
+            }
+        }
+        for line in 0..5 {
+            let x = 200 + line * 100;
+            for y in 180..460 {
+                for dx in 0..3 {
+                    image.put_pixel(x + dx, y, Rgb([30, 30, 30]));
+                }
+            }
+        }
+        let result = detect_document(&image);
+        assert!(result.confident, "strona na macie powinna być pewna");
+        let expected = [
+            CropPoint::new(100.0 / 800.0, 60.0 / 600.0),
+            CropPoint::new(699.0 / 800.0, 60.0 / 600.0),
+            CropPoint::new(699.0 / 800.0, 539.0 / 600.0),
+            CropPoint::new(100.0 / 800.0, 539.0 / 600.0),
+        ];
+        for (actual, expected) in result.corners.into_iter().zip(expected) {
+            assert!(
+                (actual.x - expected.x).abs() < 0.03,
+                "narożnik x wpadł w tabelę: {actual:?}"
+            );
+            assert!(
+                (actual.y - expected.y).abs() < 0.03,
+                "narożnik y wpadł w tabelę: {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_mat_is_not_confident() {
+        let image = RgbImage::from_pixel(640, 480, Rgb([30, 30, 35]));
+        let result = detect_document(&image);
+        assert!(!result.confident, "pusta mata nie może być pewna");
     }
 
     #[test]

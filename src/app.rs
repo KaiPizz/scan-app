@@ -92,6 +92,7 @@ pub struct DocumentScannerApp {
     autocapture: AutoCapture,
     pending_preview: Option<RgbImage>,
     editor: Option<EditorState>,
+    capture_flash: Option<Instant>,
     last_slot_count: usize,
     session: Option<SessionStore>,
     session_broken: bool,
@@ -144,6 +145,7 @@ impl DocumentScannerApp {
             autocapture: AutoCapture::new(),
             pending_preview: None,
             editor: None,
+            capture_flash: None,
             last_slot_count: 0,
             session: None,
             session_broken: false,
@@ -375,6 +377,7 @@ impl DocumentScannerApp {
             if manual {
                 self.autocapture.note_manual_capture();
             }
+            self.capture_flash = Some(Instant::now());
             beep();
         } else if manual {
             self.message = Some("Poczekaj — przetwarzanie poprzednich stron…".to_owned());
@@ -929,11 +932,19 @@ impl DocumentScannerApp {
             || self.show_exit_confirm
             || self.show_restore
             || self.message.is_some();
+        let document_present = self
+            .overlay
+            .as_ref()
+            .and_then(OverlayDetector::latest)
+            .is_some_and(|result| result.confident);
         if let Some(preview) = self.pending_preview.take()
             && self.camera_ready
             && !dialog_open
             && self.editor.is_none()
-            && self.autocapture.feed(&preview, Instant::now()) == FeedResult::Trigger
+            && self
+                .autocapture
+                .feed(&preview, Instant::now(), document_present)
+                == FeedResult::Trigger
         {
             self.capture(false);
         }
@@ -1154,19 +1165,33 @@ impl DocumentScannerApp {
                         Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                         Color32::WHITE,
                     );
-                    if let Some(corners) = self.overlay.as_ref().and_then(OverlayDetector::latest)
+                    if let Some(result) = self.overlay.as_ref().and_then(OverlayDetector::latest)
+                        && result.confident
                     {
-                        let points = corners.map(|corner| {
+                        let points = result.corners.map(|corner| {
                             Pos2::new(
                                 draw_rect.left() + corner.x * draw_rect.width(),
                                 draw_rect.top() + corner.y * draw_rect.height(),
                             )
                         });
+                        let flash = self
+                            .capture_flash
+                            .is_some_and(|at| at.elapsed() < Duration::from_millis(350));
+                        let base_color = if flash {
+                            Color32::from_rgb(60, 210, 110)
+                        } else {
+                            Color32::from_rgb(70, 165, 255)
+                        };
+                        let base_width = if flash { 6.0 } else { 2.0 };
                         for edge in 0..4 {
                             painter.line_segment(
                                 [points[edge], points[(edge + 1) % 4]],
-                                Stroke::new(3.0, Color32::from_rgb(70, 165, 255)),
+                                Stroke::new(base_width, base_color),
                             );
+                        }
+                        let progress = self.autocapture.settle_progress(Instant::now());
+                        if !flash && progress > 0.0 {
+                            draw_progress_outline(&painter, &points, progress);
                         }
                     }
                 } else {
@@ -1905,6 +1930,43 @@ fn fit_size(source: Vec2, bounds: Vec2) -> Vec2 {
 #[link(name = "user32")]
 unsafe extern "system" {
     fn MessageBeep(utype: u32) -> i32;
+}
+
+fn draw_progress_outline(painter: &egui::Painter, points: &[Pos2; 4], progress: f32) {
+    let mut lengths = [0.0_f32; 4];
+    let mut total = 0.0;
+    for edge in 0..4 {
+        let start = points[edge];
+        let end = points[(edge + 1) % 4];
+        lengths[edge] = ((end.x - start.x).powi(2) + (end.y - start.y).powi(2)).sqrt();
+        total += lengths[edge];
+    }
+    if total <= 0.0 {
+        return;
+    }
+    let mut remaining = total * progress.clamp(0.0, 1.0);
+    for edge in 0..4 {
+        if remaining <= 0.0 {
+            break;
+        }
+        let start = points[edge];
+        let end = points[(edge + 1) % 4];
+        let take = lengths[edge].min(remaining);
+        let fraction = if lengths[edge] > 0.0 {
+            take / lengths[edge]
+        } else {
+            0.0
+        };
+        let tip = Pos2::new(
+            start.x + (end.x - start.x) * fraction,
+            start.y + (end.y - start.y) * fraction,
+        );
+        painter.line_segment(
+            [start, tip],
+            Stroke::new(6.0, Color32::from_rgb(255, 200, 60)),
+        );
+        remaining -= take;
+    }
 }
 
 fn fallback_editor_corners() -> [CropPoint; 4] {

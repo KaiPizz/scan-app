@@ -1,4 +1,4 @@
-use crate::document::{CropPoint, detect_document_corners};
+use crate::document::{DetectResult, detect_document};
 use image::RgbImage;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,7 +9,7 @@ const DETECT_INTERVAL_MS: u64 = 330;
 
 pub struct OverlayDetector {
     input: Arc<Mutex<Option<RgbImage>>>,
-    output: Arc<Mutex<Option<[CropPoint; 4]>>>,
+    output: Arc<Mutex<Option<DetectResult>>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -17,7 +17,7 @@ pub struct OverlayDetector {
 impl OverlayDetector {
     pub fn start() -> Self {
         let input: Arc<Mutex<Option<RgbImage>>> = Arc::new(Mutex::new(None));
-        let output: Arc<Mutex<Option<[CropPoint; 4]>>> = Arc::new(Mutex::new(None));
+        let output: Arc<Mutex<Option<DetectResult>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let worker_input = Arc::clone(&input);
         let worker_output = Arc::clone(&output);
@@ -26,9 +26,9 @@ impl OverlayDetector {
             while !worker_stop.load(Ordering::Acquire) {
                 let frame = worker_input.lock().ok().and_then(|mut slot| slot.take());
                 if let Some(frame) = frame {
-                    let corners = detect_document_corners(&frame);
+                    let result = detect_document(&frame);
                     if let Ok(mut slot) = worker_output.lock() {
-                        *slot = Some(corners);
+                        *slot = Some(result);
                     }
                 }
                 thread::sleep(Duration::from_millis(DETECT_INTERVAL_MS));
@@ -48,7 +48,7 @@ impl OverlayDetector {
         }
     }
 
-    pub fn latest(&self) -> Option<[CropPoint; 4]> {
+    pub fn latest(&self) -> Option<DetectResult> {
         self.output.lock().ok().and_then(|slot| *slot)
     }
 }

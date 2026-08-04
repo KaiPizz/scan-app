@@ -73,7 +73,16 @@ impl AutoCapture {
         }
     }
 
-    pub fn feed(&mut self, preview: &RgbImage, now: Instant) -> FeedResult {
+    pub fn settle_progress(&self, now: Instant) -> f32 {
+        match (self.state, self.stable_since) {
+            (State::Settling, Some(since)) => {
+                (now.duration_since(since).as_millis() as f32 / STABLE_MS as f32).clamp(0.0, 1.0)
+            }
+            _ => 0.0,
+        }
+    }
+
+    pub fn feed(&mut self, preview: &RgbImage, now: Instant, document_present: bool) -> FeedResult {
         let sample = downsample(preview);
         let motion = self
             .previous
@@ -94,14 +103,14 @@ impl AutoCapture {
                 FeedResult::None
             }
             State::Armed => {
-                if novelty.unwrap_or(f32::INFINITY) > NOVELTY_MIN {
+                if document_present && novelty.unwrap_or(f32::INFINITY) > NOVELTY_MIN {
                     self.state = State::Settling;
                     self.stable_since = Some(now);
                 }
                 FeedResult::None
             }
             State::Settling => {
-                if novelty.unwrap_or(f32::INFINITY) <= NOVELTY_MIN {
+                if !document_present || novelty.unwrap_or(f32::INFINITY) <= NOVELTY_MIN {
                     self.state = State::Armed;
                     self.stable_since = None;
                     return FeedResult::None;
@@ -171,7 +180,7 @@ mod tests {
         let base = Instant::now();
         for step in 0..30 {
             assert_eq!(
-                auto.feed(&frame(200), t(base, step * 100)),
+                auto.feed(&frame(200), t(base, step * 100), true),
                 FeedResult::None,
                 "pusty blat nie może wyzwolić zdjęcia"
             );
@@ -182,13 +191,13 @@ mod tests {
     fn triggers_after_page_settles() {
         let mut auto = AutoCapture::new();
         let base = Instant::now();
-        auto.feed(&frame(200), t(base, 0));
-        assert_eq!(auto.feed(&frame(100), t(base, 100)), FeedResult::None);
-        assert_eq!(auto.feed(&frame(100), t(base, 200)), FeedResult::None);
-        assert_eq!(auto.feed(&frame(100), t(base, 900)), FeedResult::Trigger);
+        auto.feed(&frame(200), t(base, 0), true);
+        assert_eq!(auto.feed(&frame(100), t(base, 100), true), FeedResult::None);
+        assert_eq!(auto.feed(&frame(100), t(base, 200), true), FeedResult::None);
+        assert_eq!(auto.feed(&frame(100), t(base, 900), true), FeedResult::Trigger);
         for step in 10..20 {
             assert_eq!(
-                auto.feed(&frame(100), t(base, step * 100)),
+                auto.feed(&frame(100), t(base, step * 100), true),
                 FeedResult::None,
                 "ta sama strona nie może wyzwolić drugi raz"
             );
@@ -199,60 +208,76 @@ mod tests {
     fn motion_resets_the_settle_timer() {
         let mut auto = AutoCapture::new();
         let base = Instant::now();
-        auto.feed(&frame(200), t(base, 0));
-        auto.feed(&frame(100), t(base, 100));
-        auto.feed(&frame(100), t(base, 200));
-        assert_eq!(auto.feed(&frame(110), t(base, 500)), FeedResult::None);
-        assert_eq!(auto.feed(&frame(100), t(base, 900)), FeedResult::None);
-        assert_eq!(auto.feed(&frame(100), t(base, 1600)), FeedResult::Trigger);
+        auto.feed(&frame(200), t(base, 0), true);
+        auto.feed(&frame(100), t(base, 100), true);
+        auto.feed(&frame(100), t(base, 200), true);
+        assert_eq!(auto.feed(&frame(110), t(base, 500), true), FeedResult::None);
+        assert_eq!(auto.feed(&frame(100), t(base, 900), true), FeedResult::None);
+        assert_eq!(auto.feed(&frame(100), t(base, 1600), true), FeedResult::Trigger);
     }
 
     #[test]
     fn flip_produces_second_trigger() {
         let mut auto = AutoCapture::new();
         let base = Instant::now();
-        auto.feed(&frame(200), t(base, 0));
-        auto.feed(&frame(100), t(base, 100));
-        auto.feed(&frame(100), t(base, 200));
-        assert_eq!(auto.feed(&frame(100), t(base, 900)), FeedResult::Trigger);
-        auto.feed(&frame(200), t(base, 1000));
-        auto.feed(&frame(50), t(base, 1100));
-        assert_eq!(auto.feed(&frame(50), t(base, 1200)), FeedResult::None);
-        assert_eq!(auto.feed(&frame(50), t(base, 1900)), FeedResult::Trigger);
+        auto.feed(&frame(200), t(base, 0), true);
+        auto.feed(&frame(100), t(base, 100), true);
+        auto.feed(&frame(100), t(base, 200), true);
+        assert_eq!(auto.feed(&frame(100), t(base, 900), true), FeedResult::Trigger);
+        auto.feed(&frame(200), t(base, 1000), true);
+        auto.feed(&frame(50), t(base, 1100), true);
+        assert_eq!(auto.feed(&frame(50), t(base, 1200), true), FeedResult::None);
+        assert_eq!(auto.feed(&frame(50), t(base, 1900), true), FeedResult::Trigger);
     }
 
     #[test]
     fn disabled_never_triggers_and_reenable_rebaselines() {
         let mut auto = AutoCapture::new();
         let base = Instant::now();
-        auto.feed(&frame(200), t(base, 0));
+        auto.feed(&frame(200), t(base, 0), true);
         auto.set_enabled(false);
-        auto.feed(&frame(100), t(base, 100));
-        assert_eq!(auto.feed(&frame(100), t(base, 900)), FeedResult::None);
+        auto.feed(&frame(100), t(base, 100), true);
+        assert_eq!(auto.feed(&frame(100), t(base, 900), true), FeedResult::None);
         auto.set_enabled(true);
-        assert_eq!(auto.feed(&frame(100), t(base, 1000)), FeedResult::None);
+        assert_eq!(auto.feed(&frame(100), t(base, 1000), true), FeedResult::None);
         for step in 11..18 {
             assert_eq!(
-                auto.feed(&frame(100), t(base, step * 100)),
+                auto.feed(&frame(100), t(base, step * 100), true),
                 FeedResult::None,
                 "po ponownym włączeniu bieżąca scena nie wyzwala"
             );
         }
-        auto.feed(&frame(50), t(base, 1900));
-        auto.feed(&frame(50), t(base, 2000));
-        assert_eq!(auto.feed(&frame(50), t(base, 2700)), FeedResult::Trigger);
+        auto.feed(&frame(50), t(base, 1900), true);
+        auto.feed(&frame(50), t(base, 2000), true);
+        assert_eq!(auto.feed(&frame(50), t(base, 2700), true), FeedResult::Trigger);
+    }
+
+    #[test]
+    fn no_document_no_trigger() {
+        let mut auto = AutoCapture::new();
+        let base = Instant::now();
+        auto.feed(&frame(200), t(base, 0), true);
+        auto.feed(&frame(100), t(base, 100), false);
+        auto.feed(&frame(100), t(base, 200), false);
+        assert_eq!(
+            auto.feed(&frame(100), t(base, 900), false),
+            FeedResult::None,
+            "bez wykrytego dokumentu nie wolno wyzwolić"
+        );
+        auto.feed(&frame(100), t(base, 1000), true);
+        assert_eq!(auto.feed(&frame(100), t(base, 1700), true), FeedResult::Trigger);
     }
 
     #[test]
     fn manual_capture_enters_cooldown() {
         let mut auto = AutoCapture::new();
         let base = Instant::now();
-        auto.feed(&frame(200), t(base, 0));
-        auto.feed(&frame(100), t(base, 100));
+        auto.feed(&frame(200), t(base, 0), true);
+        auto.feed(&frame(100), t(base, 100), true);
         auto.note_manual_capture();
         for step in 2..12 {
             assert_eq!(
-                auto.feed(&frame(100), t(base, step * 100)),
+                auto.feed(&frame(100), t(base, step * 100), true),
                 FeedResult::None,
                 "po ręcznym zdjęciu ta sama strona nie wyzwala auto"
             );
