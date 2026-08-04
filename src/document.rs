@@ -182,8 +182,7 @@ pub fn detect_document(image: &RgbImage) -> DetectResult {
     let confident = inside_mean >= outside_mean + 40 && outside_area > 0;
 
     DetectResult {
-        corners: corners
-            .map(|(x, y)| CropPoint::new(x / width as f32, y / height as f32)),
+        corners: corners.map(|(x, y)| CropPoint::new(x / width as f32, y / height as f32)),
         confident,
     }
 }
@@ -401,9 +400,9 @@ pub fn extract_pdf_pages(path: &Path) -> Result<Vec<Vec<u8>>, String> {
                 .unwrap_or(false);
             let is_jpeg = match stream.dict.get(b"Filter") {
                 Ok(lopdf::Object::Name(name)) => name == b"DCTDecode",
-                Ok(lopdf::Object::Array(filters)) => filters
-                    .iter()
-                    .any(|filter| matches!(filter, lopdf::Object::Name(name) if name == b"DCTDecode")),
+                Ok(lopdf::Object::Array(filters)) => filters.iter().any(
+                    |filter| matches!(filter, lopdf::Object::Name(name) if name == b"DCTDecode"),
+                ),
                 _ => false,
             };
             if is_image && is_jpeg {
@@ -529,7 +528,6 @@ fn fallback_corners() -> [CropPoint; 4] {
     ]
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,7 +597,10 @@ mod tests {
         let decoded_first = image::load_from_memory(&pages[0]).expect("dekodowanie 1");
         let decoded_second = image::load_from_memory(&pages[1]).expect("dekodowanie 2");
         assert_eq!((decoded_first.width(), decoded_first.height()), (400, 566));
-        assert_eq!((decoded_second.width(), decoded_second.height()), (300, 424));
+        assert_eq!(
+            (decoded_second.width(), decoded_second.height()),
+            (300, 424)
+        );
     }
 
     #[test]
@@ -608,8 +609,11 @@ mod tests {
             "skaner-dokumentow-foreign-{}.pdf",
             std::process::id()
         ));
-        std::fs::write(&path, b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF")
-            .expect("zapis atrapy");
+        std::fs::write(
+            &path,
+            b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF",
+        )
+        .expect("zapis atrapy");
         let result = extract_pdf_pages(&path);
         std::fs::remove_file(&path).expect("usunięcie atrapy");
         assert!(result.is_err(), "obcy PDF musi zwrócić błąd");
@@ -724,10 +728,8 @@ mod tests {
     fn saved_pdf_keeps_full_resolution() {
         let image = RgbImage::from_pixel(1000, 1414, Rgb([245, 245, 245]));
         let page = page_from_image(image).expect("strona testowa");
-        let path = std::env::temp_dir().join(format!(
-            "skaner-dokumentow-res-{}.pdf",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("skaner-dokumentow-res-{}.pdf", std::process::id()));
         save_pdf(&path, &[&page]).expect("zapis PDF");
         let bytes = std::fs::read(&path).expect("odczyt PDF");
         std::fs::remove_file(&path).expect("usunięcie testowego PDF");

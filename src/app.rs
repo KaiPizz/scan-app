@@ -1,7 +1,8 @@
 use crate::autocapture::{AutoCapture, FeedResult};
 use crate::camera::{CameraController, CameraEvent};
 use crate::document::{
-    CropPoint, ScannedPage, page_from_jpeg_bytes, rotate_page_clockwise, save_pdf,
+    CropPoint, ScannedPage, extract_pdf_pages, page_from_jpeg_bytes, rotate_page_clockwise,
+    save_pdf,
 };
 use crate::overlay::OverlayDetector;
 use crate::pipeline::{PipelineEvent, ProcessingPipeline};
@@ -99,6 +100,8 @@ pub struct DocumentScannerApp {
     recovered: Option<RecoveredSession>,
     show_restore: bool,
     filename: String,
+    editing_target: Option<PathBuf>,
+    reviewing: bool,
     toast: Option<Toast>,
 
     show_new_folder: bool,
@@ -106,7 +109,6 @@ pub struct DocumentScannerApp {
     show_rename_folder: bool,
     rename_folder_name: String,
     show_settings: bool,
-    show_save: bool,
     save_dialog_needs_focus: bool,
     show_cancel_confirm: bool,
     show_delete_confirm: bool,
@@ -152,13 +154,14 @@ impl DocumentScannerApp {
             recovered: None,
             show_restore: false,
             filename: String::new(),
+            editing_target: None,
+            reviewing: false,
             toast: None,
             show_new_folder: false,
             new_folder_name: String::new(),
             show_rename_folder: false,
             rename_folder_name: String::new(),
             show_settings: false,
-            show_save: false,
             save_dialog_needs_focus: false,
             show_cancel_confirm: false,
             show_delete_confirm: false,
@@ -234,6 +237,8 @@ impl DocumentScannerApp {
         self.selected_slot = None;
         self.pending_jobs = 0;
         self.filename.clear();
+        self.editing_target = None;
+        self.reviewing = false;
         self.pipeline = Some(ProcessingPipeline::start());
         self.overlay = Some(OverlayDetector::start());
         self.autocapture = AutoCapture::new();
@@ -566,25 +571,49 @@ impl DocumentScannerApp {
                 }
             }
         }
-        let path = match unique_pdf_path(&folder_path, &self.filename) {
-            Ok(path) => path,
-            Err(error) => {
-                self.message = Some(error);
-                return;
-            }
+        let target_stem = self.editing_target.as_ref().and_then(|target| {
+            target
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        });
+        let (path, replace_old) = match (&self.editing_target, target_stem) {
+            (Some(target), Some(stem)) if stem == self.filename.trim() => (target.clone(), None),
+            (Some(target), _) => match unique_pdf_path(&folder_path, &self.filename) {
+                Ok(new_path) => (new_path, Some(target.clone())),
+                Err(error) => {
+                    self.message = Some(error);
+                    return;
+                }
+            },
+            (None, _) => match unique_pdf_path(&folder_path, &self.filename) {
+                Ok(new_path) => (new_path, None),
+                Err(error) => {
+                    self.message = Some(error);
+                    return;
+                }
+            },
         };
         match save_pdf(&path, &pages) {
             Ok(()) => {
+                if let Some(old_path) = replace_old {
+                    let _ = std::fs::remove_file(old_path);
+                }
+                let verb = if self.editing_target.is_some() {
+                    "Zaktualizowano"
+                } else {
+                    "Zapisano"
+                };
                 let name = path
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 self.toast = Some(Toast {
-                    text: format!("Zapisano: {name}"),
+                    text: format!("{verb}: {name}"),
                     shown_at: Instant::now(),
                     pdf_path: Some(path.clone()),
                 });
-                self.show_save = false;
+                self.editing_target = None;
+                self.reviewing = false;
                 self.slots.clear();
                 self.selected_slot = None;
                 self.filename.clear();
@@ -720,9 +749,57 @@ impl DocumentScannerApp {
         self.slots.clear();
         self.selected_slot = None;
         self.pending_jobs = 0;
+        self.editing_target = None;
+        self.reviewing = false;
         self.session_clear();
         self.screen = Screen::Folder;
         self.refresh_pdfs();
+    }
+
+    fn open_pdf_for_edit(&mut self, pdf: &PdfInfo, context: &egui::Context) {
+        let jpegs = match extract_pdf_pages(&pdf.path) {
+            Ok(jpegs) => jpegs,
+            Err(error) => {
+                self.message = Some(error);
+                return;
+            }
+        };
+        let stem = pdf
+            .name
+            .strip_suffix(".pdf")
+            .or_else(|| pdf.name.strip_suffix(".PDF"))
+            .unwrap_or(&pdf.name)
+            .to_owned();
+        let target = pdf.path.clone();
+        self.begin_scan();
+        for jpeg in jpegs {
+            match page_from_jpeg_bytes(jpeg) {
+                Ok(page) => {
+                    let id = self.next_page_id;
+                    self.next_page_id += 1;
+                    self.session_write_page(id, &page.jpeg);
+                    let texture = context.load_texture(
+                        format!("strona-{id}"),
+                        rgb_to_color_image(&page.review_image),
+                        TextureOptions::LINEAR,
+                    );
+                    self.slots.push(SlotEntry {
+                        id,
+                        slot: PageSlot::Ready(Box::new(PageData {
+                            page,
+                            original_jpeg: Vec::new(),
+                            corners: fallback_editor_corners(),
+                            texture,
+                        })),
+                    });
+                }
+                Err(error) => {
+                    self.message = Some(error);
+                }
+            }
+        }
+        self.filename = stem;
+        self.editing_target = Some(target);
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -874,6 +951,7 @@ impl DocumentScannerApp {
             } else {
                 let mut open_target: Option<PathBuf> = None;
                 let mut delete_target: Option<PdfInfo> = None;
+                let mut edit_target: Option<PdfInfo> = None;
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for pdf in &self.pdfs {
                         Frame::new()
@@ -882,7 +960,7 @@ impl DocumentScannerApp {
                             .stroke(Stroke::new(1.0, Color32::from_gray(222)))
                             .inner_margin(Margin::symmetric(18, 14))
                             .show(ui, |ui| {
-                                let (_, (open_pdf, delete_pdf)) = two_sided(
+                                let (_, (open_pdf, edit_pdf, delete_pdf)) = two_sided(
                                     ui,
                                     38.0,
                                     |ui| {
@@ -890,16 +968,18 @@ impl DocumentScannerApp {
                                     },
                                     |ui| {
                                         let open_pdf = ui.button("Otwórz PDF").clicked();
+                                        let edit_pdf = ui.button("Edytuj").clicked();
                                         let delete_pdf = ui
-                                            .button(
-                                                RichText::new("Usuń").color(Color32::DARK_RED),
-                                            )
+                                            .button(RichText::new("Usuń").color(Color32::DARK_RED))
                                             .clicked();
-                                        (open_pdf, delete_pdf)
+                                        (open_pdf, edit_pdf, delete_pdf)
                                     },
                                 );
                                 if open_pdf {
                                     open_target = Some(pdf.path.clone());
+                                }
+                                if edit_pdf {
+                                    edit_target = Some(pdf.clone());
                                 }
                                 if delete_pdf {
                                     delete_target = Some(pdf.clone());
@@ -916,6 +996,9 @@ impl DocumentScannerApp {
                 if delete_target.is_some() {
                     self.delete_pdf_target = delete_target;
                 }
+                if let Some(pdf) = edit_target {
+                    self.open_pdf_for_edit(&pdf, ui.ctx());
+                }
             }
         });
     }
@@ -923,7 +1006,7 @@ impl DocumentScannerApp {
     fn scan_hub_ui(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         self.poll_camera(context);
         self.poll_pipeline(context);
-        let dialog_open = self.show_save
+        let dialog_open = self.reviewing
             || self.show_cancel_confirm
             || self.show_delete_confirm
             || self.show_settings
@@ -952,6 +1035,10 @@ impl DocumentScannerApp {
             self.editor_ui(ui, context);
             return;
         }
+        if self.reviewing {
+            self.review_ui(ui, context);
+            return;
+        }
         page_container(ui, |ui| {
             let camera_ready = self.camera_ready;
             let camera_status = self.camera_status.clone();
@@ -978,14 +1065,15 @@ impl DocumentScannerApp {
                 |ui| {
                     let auto_on = self.autocapture.enabled();
                     let toggle_label = if auto_on { "Auto: WŁ" } else { "Auto: WYŁ" };
-                    let toggle = Button::new(
-                        RichText::new(toggle_label)
-                            .strong()
-                            .color(if auto_on { Color32::WHITE } else { BLUE_DARK }),
-                    )
-                    .fill(if auto_on { BLUE } else { Color32::WHITE })
-                    .stroke(Stroke::new(1.0, BLUE))
-                    .corner_radius(9.0);
+                    let toggle =
+                        Button::new(RichText::new(toggle_label).strong().color(if auto_on {
+                            Color32::WHITE
+                        } else {
+                            BLUE_DARK
+                        }))
+                        .fill(if auto_on { BLUE } else { Color32::WHITE })
+                        .stroke(Stroke::new(1.0, BLUE))
+                        .corner_radius(9.0);
                     if ui.add(toggle).clicked() {
                         self.autocapture.set_enabled(!auto_on);
                     }
@@ -1062,7 +1150,7 @@ impl DocumentScannerApp {
                 .clicked()
             {
                 self.save_dialog_needs_focus = true;
-                self.show_save = true;
+                self.reviewing = true;
             }
             if !self.camera_ready && controls_ui.button("Spróbuj ponownie").clicked() {
                 self.start_camera();
@@ -1262,8 +1350,7 @@ impl DocumentScannerApp {
                                             Vec2::new(96.0, 112.0),
                                         );
                                         ui.add(
-                                            egui::Image::new(&data.texture)
-                                                .fit_to_exact_size(size),
+                                            egui::Image::new(&data.texture).fit_to_exact_size(size),
                                         );
                                         ui.label(format!("{}", index + 1));
                                     }
@@ -1275,9 +1362,7 @@ impl DocumentScannerApp {
                                     PageSlot::Failed { error, .. } => {
                                         ui.add_space(34.0);
                                         ui.label(
-                                            RichText::new("⚠")
-                                                .size(30.0)
-                                                .color(Color32::DARK_RED),
+                                            RichText::new("⚠").size(30.0).color(Color32::DARK_RED),
                                         );
                                         ui.label(RichText::new("Błąd").color(Color32::DARK_RED))
                                             .on_hover_text(error);
@@ -1330,7 +1415,10 @@ impl DocumentScannerApp {
             let (response, painter) = ui.allocate_painter(available, Sense::hover());
             painter.rect_filled(response.rect, 12.0, Color32::from_gray(28));
             let image_size = fit_size(
-                Vec2::new(editor.original.width() as f32, editor.original.height() as f32),
+                Vec2::new(
+                    editor.original.width() as f32,
+                    editor.original.height() as f32,
+                ),
                 available - Vec2::splat(12.0),
             );
             let image_rect = Rect::from_center_size(response.rect.center(), image_size);
@@ -1389,9 +1477,7 @@ impl DocumentScannerApp {
                 },
             );
         });
-        if redetect
-            && let Some(editor) = &mut self.editor
-        {
+        if redetect && let Some(editor) = &mut self.editor {
             editor.corners = crate::document::detect_document_corners(&editor.original);
         }
         if close || context.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -1399,6 +1485,216 @@ impl DocumentScannerApp {
         }
         if apply {
             self.apply_editor();
+        }
+    }
+
+    fn review_ui(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        if self.slots.is_empty() {
+            self.reviewing = false;
+            return;
+        }
+        if self
+            .selected_slot
+            .is_none_or(|index| index >= self.slots.len())
+        {
+            self.selected_slot = Some(0);
+        }
+        let (arrow_left, arrow_right, escape) = context.input(|input| {
+            (
+                input.key_pressed(egui::Key::ArrowLeft),
+                input.key_pressed(egui::Key::ArrowRight),
+                input.key_pressed(egui::Key::Escape),
+            )
+        });
+        if escape {
+            self.reviewing = false;
+            return;
+        }
+        if arrow_left
+            && let Some(index) = self.selected_slot
+            && index > 0
+        {
+            self.selected_slot = Some(index - 1);
+        }
+        if arrow_right
+            && let Some(index) = self.selected_slot
+            && index + 1 < self.slots.len()
+        {
+            self.selected_slot = Some(index + 1);
+        }
+        let index = self.selected_slot.unwrap_or(0);
+        let mut back = false;
+        let mut save_now = false;
+        let mut go_prev = false;
+        let mut go_next = false;
+        let mut rotate = false;
+        let mut fix_crop = false;
+        let mut delete_page = false;
+        page_container(ui, |ui| {
+            let page_count_text = polish_page_count(self.slots.len());
+            two_sided(
+                ui,
+                48.0,
+                |ui| {
+                    ui.horizontal(|ui| {
+                        back = ui.button("Wróć do skanowania (Esc)").clicked();
+                        ui.add_space(10.0);
+                        ui.heading(format!("Przegląd · {page_count_text}"));
+                    });
+                },
+                |ui| {
+                    ui.label(
+                        RichText::new(format!("Strona {} z {}", index + 1, self.slots.len()))
+                            .strong(),
+                    );
+                },
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Nazwa pliku:");
+                let response = ui.add_sized(
+                    [340.0, 34.0],
+                    egui::TextEdit::singleline(&mut self.filename)
+                        .hint_text("np. Umowa - Kowalski"),
+                );
+                if self.save_dialog_needs_focus {
+                    self.save_dialog_needs_focus = false;
+                    response.request_focus();
+                }
+                let submitted =
+                    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if primary_button(ui, "Zapisz PDF (Enter)").clicked() || submitted {
+                    save_now = true;
+                }
+                if self.editing_target.is_some() {
+                    ui.label(
+                        RichText::new("(nadpisze istniejący plik)")
+                            .small()
+                            .color(Color32::DARK_RED),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(".pdf doda się automatycznie")
+                            .small()
+                            .color(Color32::GRAY),
+                    );
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(index > 0, Button::new("◀ Poprzednia"))
+                    .clicked()
+                {
+                    go_prev = true;
+                }
+                if ui
+                    .add_enabled(index + 1 < self.slots.len(), Button::new("Następna ▶"))
+                    .clicked()
+                {
+                    go_next = true;
+                }
+                let rotatable = matches!(
+                    self.slots.get(index).map(|entry| &entry.slot),
+                    Some(PageSlot::Ready(_))
+                );
+                if ui.add_enabled(rotatable, Button::new("Obróć")).clicked() {
+                    rotate = true;
+                }
+                let editable = matches!(
+                    self.slots.get(index).map(|entry| &entry.slot),
+                    Some(PageSlot::Ready(_)) | Some(PageSlot::Failed { .. })
+                );
+                if ui
+                    .add_enabled(editable, Button::new("Popraw kadr"))
+                    .clicked()
+                {
+                    fix_crop = true;
+                }
+                if ui
+                    .button(RichText::new("Usuń stronę").color(Color32::DARK_RED))
+                    .clicked()
+                {
+                    delete_page = true;
+                }
+            });
+            ui.add_space(8.0);
+
+            let preview_min = ui.available_rect_before_wrap().min;
+            let preview_max = Pos2::new(
+                ui.max_rect().right(),
+                (ui.max_rect().bottom() - STRIP_HEIGHT - 10.0).max(preview_min.y + 80.0),
+            );
+            if preview_max.x > preview_min.x && preview_max.y > preview_min.y {
+                let preview_rect = Rect::from_min_max(preview_min, preview_max);
+                ui.allocate_rect(preview_rect, Sense::hover());
+                let painter = ui.painter_at(preview_rect);
+                painter.rect_filled(preview_rect, 12.0, Color32::from_gray(235));
+                match self.slots.get(index).map(|entry| &entry.slot) {
+                    Some(PageSlot::Ready(data)) => {
+                        let bounds = preview_rect.shrink(14.0);
+                        let image_size = fit_size(data.texture.size_vec2(), bounds.size());
+                        let image_rect = Rect::from_center_size(bounds.center(), image_size);
+                        painter.image(
+                            data.texture.id(),
+                            image_rect,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        painter.rect_stroke(
+                            image_rect,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_gray(150)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    _ => {
+                        painter.text(
+                            preview_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Strona jeszcze się przetwarza…",
+                            FontId::proportional(18.0),
+                            Color32::DARK_GRAY,
+                        );
+                    }
+                }
+            }
+
+            let strip_min = Pos2::new(preview_min.x, preview_max.y + 10.0);
+            let strip_max = Pos2::new(ui.max_rect().right(), ui.max_rect().bottom());
+            if strip_max.x > strip_min.x && strip_max.y > strip_min.y {
+                let strip_rect = Rect::from_min_max(strip_min, strip_max);
+                ui.allocate_rect(strip_rect, Sense::hover());
+                let mut strip_ui = ui.new_child(
+                    UiBuilder::new()
+                        .id_salt("review-strip")
+                        .max_rect(strip_rect)
+                        .layout(Layout::left_to_right(Align::Center)),
+                );
+                self.film_strip_ui(&mut strip_ui);
+            }
+        });
+        if back {
+            self.reviewing = false;
+            return;
+        }
+        if go_prev && index > 0 {
+            self.selected_slot = Some(index - 1);
+        }
+        if go_next && index + 1 < self.slots.len() {
+            self.selected_slot = Some(index + 1);
+        }
+        if rotate {
+            self.rotate_selected_page(context);
+        }
+        if fix_crop {
+            self.open_editor(index, context);
+        }
+        if delete_page {
+            self.show_delete_confirm = true;
+        }
+        if save_now {
+            self.save_current_document();
         }
     }
 
@@ -1424,10 +1720,8 @@ impl DocumentScannerApp {
                     ui.label(format!("Folder: {folder_display}"));
                     if !folder_exists {
                         ui.label(
-                            RichText::new(
-                                "Ten folder już nie istnieje — przywracanie niemożliwe.",
-                            )
-                            .color(Color32::DARK_RED),
+                            RichText::new("Ten folder już nie istnieje — przywracanie niemożliwe.")
+                                .color(Color32::DARK_RED),
                         );
                     }
                     ui.add_space(12.0);
@@ -1552,46 +1846,6 @@ impl DocumentScannerApp {
                 });
         }
 
-        if self.show_save {
-            egui::Window::new("Zapisz dokument")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(context, |ui| {
-                    ui.label(format!("Liczba stron: {}", self.slots.len()));
-                    ui.label("Nazwa pliku:");
-                    let response = ui.add_sized(
-                        [390.0, 36.0],
-                        egui::TextEdit::singleline(&mut self.filename)
-                            .hint_text("np. Umowa - Kowalski"),
-                    );
-                    if self.save_dialog_needs_focus {
-                        self.save_dialog_needs_focus = false;
-                        response.request_focus();
-                    }
-                    ui.label(
-                        RichText::new("Rozszerzenie .pdf zostanie dodane automatycznie.")
-                            .small()
-                            .color(Color32::GRAY),
-                    );
-                    ui.add_space(10.0);
-                    let submitted = response.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                    let mut save_clicked = false;
-                    let mut back_clicked = false;
-                    ui.horizontal(|ui| {
-                        back_clicked = ui.button("Wróć (Esc)").clicked();
-                        save_clicked = primary_button(ui, "Zapisz PDF (Enter)").clicked();
-                    });
-                    if back_clicked || ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-                        self.show_save = false;
-                    }
-                    if submitted || save_clicked {
-                        self.save_current_document();
-                    }
-                });
-        }
-
         if let Some(pdf) = self.delete_pdf_target.clone() {
             egui::Window::new("Usunąć dokument?")
                 .collapsible(false)
@@ -1616,8 +1870,7 @@ impl DocumentScannerApp {
                                     self.refresh_folders();
                                 }
                                 Err(error) => {
-                                    self.message =
-                                        Some(format!("Nie można usunąć pliku: {error}"));
+                                    self.message = Some(format!("Nie można usunąć pliku: {error}"));
                                 }
                             }
                         }
@@ -1791,7 +2044,7 @@ impl eframe::App for DocumentScannerApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
-        let dialog_open = self.show_save
+        let dialog_open = self.reviewing
             || self.show_cancel_confirm
             || self.show_delete_confirm
             || self.show_settings
@@ -1814,7 +2067,7 @@ impl eframe::App for DocumentScannerApp {
             }
             if enter && self.can_save() {
                 self.save_dialog_needs_focus = true;
-                self.show_save = true;
+                self.reviewing = true;
             }
         }
         Frame::new().fill(BACKGROUND).show(ui, |ui| {
