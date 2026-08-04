@@ -326,6 +326,99 @@ fn page_from_image(image: RgbImage) -> Result<ScannedPage, String> {
     })
 }
 
+/// Reads back the pages of a PDF produced by this app: every page is exactly
+/// one full-page JPEG XObject (DCTDecode). Foreign PDFs yield an error.
+pub fn extract_pdf_pages(path: &Path) -> Result<Vec<Vec<u8>>, String> {
+    let document =
+        lopdf::Document::load(path).map_err(|error| format!("Nie można odczytać PDF: {error}"))?;
+    let page_map = document.get_pages();
+    if page_map.is_empty() {
+        return Err("Ten PDF nie zawiera stron.".to_owned());
+    }
+    let mut pages = Vec::new();
+    for (_number, page_id) in page_map {
+        let (resources_dict, resource_ids) = document
+            .get_page_resources(page_id)
+            .map_err(|error| format!("Nie można odczytać zasobów strony: {error}"))?;
+        let mut dicts: Vec<&lopdf::Dictionary> = Vec::new();
+        if let Some(dict) = resources_dict {
+            dicts.push(dict);
+        }
+        for id in resource_ids {
+            if let Ok(object) = document.get_object(id)
+                && let Ok(dict) = object.as_dict()
+            {
+                dicts.push(dict);
+            }
+        }
+        // Resources are shared between pages; the page's content stream names
+        // which XObject it actually draws (the `Do` operator).
+        let mut xobjects: Option<&lopdf::Dictionary> = None;
+        for dict in dicts {
+            let resolved = match dict.get(b"XObject") {
+                Ok(lopdf::Object::Reference(id)) => document
+                    .get_object(*id)
+                    .ok()
+                    .and_then(|object| object.as_dict().ok()),
+                Ok(object) => object.as_dict().ok(),
+                Err(_) => None,
+            };
+            if let Some(dict) = resolved {
+                xobjects = Some(dict);
+                break;
+            }
+        }
+        let Some(xobjects) = xobjects else {
+            return Err("Ten PDF nie pochodzi z tego programu.".to_owned());
+        };
+        let content = document
+            .get_and_decode_page_content(page_id)
+            .map_err(|error| format!("Nie można odczytać treści strony: {error}"))?;
+        let mut page_jpeg: Option<Vec<u8>> = None;
+        for operation in &content.operations {
+            if operation.operator != "Do" {
+                continue;
+            }
+            let Some(lopdf::Object::Name(name)) = operation.operands.first() else {
+                continue;
+            };
+            let Ok(value) = xobjects.get(name) else {
+                continue;
+            };
+            let stream = match value {
+                lopdf::Object::Reference(id) => match document.get_object(*id) {
+                    Ok(lopdf::Object::Stream(stream)) => stream,
+                    _ => continue,
+                },
+                lopdf::Object::Stream(stream) => stream,
+                _ => continue,
+            };
+            let is_image = stream
+                .dict
+                .get(b"Subtype")
+                .and_then(|subtype| subtype.as_name())
+                .map(|name| name == b"Image")
+                .unwrap_or(false);
+            let is_jpeg = match stream.dict.get(b"Filter") {
+                Ok(lopdf::Object::Name(name)) => name == b"DCTDecode",
+                Ok(lopdf::Object::Array(filters)) => filters
+                    .iter()
+                    .any(|filter| matches!(filter, lopdf::Object::Name(name) if name == b"DCTDecode")),
+                _ => false,
+            };
+            if is_image && is_jpeg {
+                page_jpeg = Some(stream.content.clone());
+                break;
+            }
+        }
+        match page_jpeg {
+            Some(jpeg) => pages.push(jpeg),
+            None => return Err("Ten PDF nie pochodzi z tego programu.".to_owned()),
+        }
+    }
+    Ok(pages)
+}
+
 pub fn page_from_jpeg_bytes(jpeg: Vec<u8>) -> Result<ScannedPage, String> {
     let image = decode_jpeg(&jpeg)?;
     let review_image = resize_to_fit(&image, 1200, 1200, imageops::FilterType::Lanczos3);
@@ -487,6 +580,39 @@ mod tests {
         println!("wykryte narożniki: {corners:?}");
         let page = process_page(&image, corners).expect("przetworzenie strony");
         page.review_image.save(output).expect("zapis podglądu");
+    }
+
+    #[test]
+    fn extracts_pages_from_own_pdf() {
+        let first = page_from_image(RgbImage::from_pixel(400, 566, Rgb([245, 245, 245])))
+            .expect("strona 1");
+        let second = page_from_image(RgbImage::from_pixel(300, 424, Rgb([200, 200, 200])))
+            .expect("strona 2");
+        let path = std::env::temp_dir().join(format!(
+            "skaner-dokumentow-extract-{}.pdf",
+            std::process::id()
+        ));
+        save_pdf(&path, &[&first, &second]).expect("zapis PDF");
+        let pages = extract_pdf_pages(&path).expect("ekstrakcja");
+        std::fs::remove_file(&path).expect("usunięcie testowego PDF");
+        assert_eq!(pages.len(), 2, "oczekiwano dwóch stron");
+        let decoded_first = image::load_from_memory(&pages[0]).expect("dekodowanie 1");
+        let decoded_second = image::load_from_memory(&pages[1]).expect("dekodowanie 2");
+        assert_eq!((decoded_first.width(), decoded_first.height()), (400, 566));
+        assert_eq!((decoded_second.width(), decoded_second.height()), (300, 424));
+    }
+
+    #[test]
+    fn foreign_pdf_without_jpeg_streams_errors() {
+        let path = std::env::temp_dir().join(format!(
+            "skaner-dokumentow-foreign-{}.pdf",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF")
+            .expect("zapis atrapy");
+        let result = extract_pdf_pages(&path);
+        std::fs::remove_file(&path).expect("usunięcie atrapy");
+        assert!(result.is_err(), "obcy PDF musi zwrócić błąd");
     }
 
     #[test]
