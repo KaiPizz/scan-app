@@ -101,6 +101,7 @@ pub struct DocumentScannerApp {
     show_restore: bool,
     filename: String,
     editing_target: Option<PathBuf>,
+    edit_dirty: bool,
     reviewing: bool,
     toast: Option<Toast>,
 
@@ -155,6 +156,7 @@ impl DocumentScannerApp {
             show_restore: false,
             filename: String::new(),
             editing_target: None,
+            edit_dirty: false,
             reviewing: false,
             toast: None,
             show_new_folder: false,
@@ -238,6 +240,7 @@ impl DocumentScannerApp {
         self.pending_jobs = 0;
         self.filename.clear();
         self.editing_target = None;
+        self.edit_dirty = false;
         self.reviewing = false;
         self.pipeline = Some(ProcessingPipeline::start());
         self.overlay = Some(OverlayDetector::start());
@@ -388,6 +391,9 @@ impl DocumentScannerApp {
                 slot: PageSlot::Processing,
             });
             self.pending_jobs += 1;
+            if self.editing_target.is_some() {
+                self.edit_dirty = true;
+            }
             if manual {
                 self.autocapture.note_manual_capture();
             }
@@ -516,6 +522,9 @@ impl DocumentScannerApp {
                     TextureOptions::LINEAR,
                 );
                 data.page = rotated;
+                if self.editing_target.is_some() {
+                    self.edit_dirty = true;
+                }
             }
             Err(error) => {
                 self.message = Some(error);
@@ -549,6 +558,9 @@ impl DocumentScannerApp {
         }
         let removed_id = self.slots[index].id;
         self.slots.remove(index);
+        if self.editing_target.is_some() {
+            self.edit_dirty = true;
+        }
         self.selected_slot = if self.slots.is_empty() {
             None
         } else {
@@ -571,6 +583,9 @@ impl DocumentScannerApp {
         let target = target as usize;
         self.slots.swap(index, target);
         self.selected_slot = Some(target);
+        if self.editing_target.is_some() {
+            self.edit_dirty = true;
+        }
         self.session_sync_order();
     }
 
@@ -631,14 +646,9 @@ impl DocumentScannerApp {
                     shown_at: Instant::now(),
                     pdf_path: Some(path.clone()),
                 });
-                self.editing_target = None;
-                self.reviewing = false;
-                self.slots.clear();
-                self.selected_slot = None;
                 self.filename.clear();
-                self.refresh_pdfs();
                 self.refresh_folders();
-                self.session_clear();
+                self.abandon_scan();
             }
             Err(error) => self.message = Some(error),
         }
@@ -754,6 +764,9 @@ impl DocumentScannerApp {
         if pipeline.submit_reprocess(entry.id, Arc::new(editor.original), editor.corners) {
             entry.slot = PageSlot::Reprocessing { original_jpeg };
             self.pending_jobs += 1;
+            if self.editing_target.is_some() {
+                self.edit_dirty = true;
+            }
         } else {
             entry.slot = PageSlot::Failed {
                 original_jpeg,
@@ -763,7 +776,11 @@ impl DocumentScannerApp {
     }
 
     fn request_cancel_scan(&mut self) {
-        if self.slots.is_empty() {
+        if can_leave_scan_without_confirmation(
+            self.slots.is_empty(),
+            self.editing_target.is_some(),
+            self.edit_dirty,
+        ) {
             self.abandon_scan();
         } else {
             self.show_cancel_confirm = true;
@@ -778,7 +795,11 @@ impl DocumentScannerApp {
         self.selected_slot = None;
         self.pending_jobs = 0;
         self.editing_target = None;
+        self.edit_dirty = false;
         self.reviewing = false;
+        self.editor = None;
+        self.pending_preview = None;
+        self.filename.clear();
         self.session_clear();
         self.screen = Screen::Folder;
         self.refresh_pdfs();
@@ -830,6 +851,7 @@ impl DocumentScannerApp {
         }
         self.filename = stem;
         self.editing_target = Some(target);
+        self.edit_dirty = false;
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -1074,6 +1096,9 @@ impl DocumentScannerApp {
             let camera_status = self.camera_status.clone();
             let page_count_text = polish_page_count(self.slots.len());
             let slots_empty = self.slots.is_empty();
+            let editing_pdf = self.editing_target.is_some();
+            let can_return_to_folder =
+                can_leave_scan_without_confirmation(slots_empty, editing_pdf, self.edit_dirty);
             let ((back, cancel), ()) = two_sided(
                 ui,
                 48.0,
@@ -1082,10 +1107,15 @@ impl DocumentScannerApp {
                     let mut cancel = false;
                     ui.horizontal(|ui| {
                         back = ui
-                            .add_enabled(slots_empty, Button::new("Wróć do folderu"))
+                            .add_enabled(can_return_to_folder, Button::new("Wróć do folderu"))
                             .clicked();
+                        let cancel_label = if editing_pdf {
+                            "Anuluj edycję"
+                        } else {
+                            "Anuluj dokument"
+                        };
                         cancel = ui
-                            .button(RichText::new("Anuluj dokument").color(Color32::DARK_RED))
+                            .button(RichText::new(cancel_label).color(Color32::DARK_RED))
                             .clicked();
                         ui.add_space(10.0);
                         ui.heading(format!("Skanowanie · {page_count_text}"));
@@ -1593,6 +1623,9 @@ impl DocumentScannerApp {
                     self.save_dialog_needs_focus = false;
                     response.request_focus();
                 }
+                if response.changed() && self.editing_target.is_some() {
+                    self.edit_dirty = true;
+                }
                 let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
                 let submitted = enter_pressed && (response.lost_focus() || response.has_focus());
                 if primary_button(ui, "Zapisz PDF (Enter)").clicked() || submitted {
@@ -1911,22 +1944,42 @@ impl DocumentScannerApp {
         }
 
         if self.show_cancel_confirm {
-            egui::Window::new("Anulować dokument?")
+            let editing_pdf = self.editing_target.is_some();
+            let title = if editing_pdf {
+                "Anulować edycję?"
+            } else {
+                "Anulować dokument?"
+            };
+            egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(context, |ui| {
-                    ui.label(format!(
-                        "Zeskanowane strony ({}) zostaną utracone.",
-                        self.slots.len()
-                    ));
+                    if editing_pdf {
+                        ui.label("Niezapisane zmiany w dokumencie zostaną utracone.");
+                    } else {
+                        ui.label(format!(
+                            "Zeskanowane strony ({}) zostaną utracone.",
+                            self.slots.len()
+                        ));
+                    }
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Wróć do skanowania").clicked() {
+                        let return_label = if editing_pdf {
+                            "Wróć do edycji"
+                        } else {
+                            "Wróć do skanowania"
+                        };
+                        if ui.button(return_label).clicked() {
                             self.show_cancel_confirm = false;
                         }
+                        let cancel_label = if editing_pdf {
+                            "Anuluj edycję"
+                        } else {
+                            "Anuluj dokument"
+                        };
                         if ui
-                            .button(RichText::new("Anuluj dokument").color(Color32::DARK_RED))
+                            .button(RichText::new(cancel_label).color(Color32::DARK_RED))
                             .clicked()
                         {
                             self.show_cancel_confirm = false;
@@ -2298,4 +2351,37 @@ fn polish_page_count(count: usize) -> String {
         "stron"
     };
     format!("{count} {word}")
+}
+
+fn can_leave_scan_without_confirmation(
+    slots_empty: bool,
+    editing_pdf: bool,
+    edit_dirty: bool,
+) -> bool {
+    slots_empty || (editing_pdf && !edit_dirty)
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::can_leave_scan_without_confirmation;
+
+    #[test]
+    fn empty_scan_can_return_to_folder() {
+        assert!(can_leave_scan_without_confirmation(true, false, false));
+    }
+
+    #[test]
+    fn unchanged_pdf_edit_can_return_to_folder() {
+        assert!(can_leave_scan_without_confirmation(false, true, false));
+    }
+
+    #[test]
+    fn modified_pdf_edit_requires_confirmation() {
+        assert!(!can_leave_scan_without_confirmation(false, true, true));
+    }
+
+    #[test]
+    fn unsaved_scan_requires_confirmation() {
+        assert!(!can_leave_scan_without_confirmation(false, false, false));
+    }
 }
