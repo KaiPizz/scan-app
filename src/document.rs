@@ -298,9 +298,13 @@ pub fn save_pdf(path: &Path, pages: &[&ScannedPage]) -> Result<(), String> {
         }];
         pdf_pages.push(PdfPage::new(page_width, page_height, operations));
     }
+    let save_options = PdfSaveOptions {
+        image_optimization: None,
+        ..PdfSaveOptions::default()
+    };
     let bytes = document
         .with_pages(pdf_pages)
-        .save(&PdfSaveOptions::default(), &mut Vec::new());
+        .save(&save_options, &mut Vec::new());
     let part_path = path.with_extension("pdf.part");
     fs::write(&part_path, bytes)
         .map_err(|error| format!("Nie można zapisać pliku PDF: {error}"))?;
@@ -476,6 +480,34 @@ mod tests {
         println!("wykryte narożniki: {corners:?}");
         let page = process_page(&image, corners).expect("przetworzenie strony");
         page.review_image.save(output).expect("zapis podglądu");
+    }
+
+    #[test]
+    fn saved_pdf_keeps_full_resolution() {
+        let image = RgbImage::from_pixel(1000, 1414, Rgb([245, 245, 245]));
+        let page = page_from_image(image).expect("strona testowa");
+        let path = std::env::temp_dir().join(format!(
+            "skaner-dokumentow-res-{}.pdf",
+            std::process::id()
+        ));
+        save_pdf(&path, &[&page]).expect("zapis PDF");
+        let bytes = std::fs::read(&path).expect("odczyt PDF");
+        std::fs::remove_file(&path).expect("usunięcie testowego PDF");
+        let start = bytes
+            .windows(3)
+            .position(|w| w == [0xFF, 0xD8, 0xFF])
+            .expect("brak strumienia JPEG w PDF");
+        let end = bytes[start..]
+            .windows(2)
+            .position(|w| w == [0xFF, 0xD9])
+            .map(|offset| start + offset + 2)
+            .expect("brak końca JPEG");
+        let embedded = image::load_from_memory(&bytes[start..end]).expect("dekodowanie JPEG");
+        assert_eq!(
+            (embedded.width(), embedded.height()),
+            (1000, 1414),
+            "printpdf zmniejszył osadzony obraz"
+        );
     }
 
     #[test]
