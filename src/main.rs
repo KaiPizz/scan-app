@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod atomic_file;
 mod autocapture;
 mod camera;
 mod document;
 mod overlay;
 mod pipeline;
+mod review_viewport;
 mod session;
 mod storage;
 

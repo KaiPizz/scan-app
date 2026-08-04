@@ -135,12 +135,7 @@ pub fn rename_folder(folder: &FolderInfo, requested_name: &str) -> Result<Folder
 }
 
 pub fn unique_pdf_path(folder: &Path, requested_name: &str) -> Result<PathBuf, String> {
-    let raw = requested_name.trim();
-    let without_extension = raw
-        .strip_suffix(".pdf")
-        .or_else(|| raw.strip_suffix(".PDF"))
-        .unwrap_or(raw);
-    let base = validate_windows_name(without_extension, "Nazwa pliku")?;
+    let base = normalized_pdf_stem(requested_name)?;
 
     let initial = folder.join(format!("{base}.pdf"));
     if !initial.exists() {
@@ -153,6 +148,16 @@ pub fn unique_pdf_path(folder: &Path, requested_name: &str) -> Result<PathBuf, S
         }
     }
     Err("Nie można utworzyć unikalnej nazwy pliku.".to_owned())
+}
+
+pub fn normalized_pdf_stem(requested_name: &str) -> Result<String, String> {
+    let raw = requested_name.trim();
+    let without_extension = raw
+        .get(raw.len().saturating_sub(4)..)
+        .filter(|suffix| suffix.eq_ignore_ascii_case(".pdf"))
+        .and_then(|_| raw.get(..raw.len() - 4))
+        .unwrap_or(raw);
+    validate_windows_name(without_extension, "Nazwa pliku")
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -212,5 +217,12 @@ mod tests {
         assert!(validate_windows_name("CON", "Nazwa").is_err());
         assert!(validate_windows_name("a/b", "Nazwa").is_err());
         assert!(validate_windows_name("poprawna nazwa", "Nazwa").is_ok());
+    }
+
+    #[test]
+    fn normalizes_mixed_case_pdf_extension() {
+        assert_eq!(normalized_pdf_stem("Raport.PdF").unwrap(), "Raport");
+        assert_eq!(normalized_pdf_stem("Raport.pdf").unwrap(), "Raport");
+        assert_eq!(normalized_pdf_stem("Raport").unwrap(), "Raport");
     }
 }

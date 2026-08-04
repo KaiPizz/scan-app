@@ -6,7 +6,6 @@ use printpdf::{
     RawImage, XObjectTransform,
 };
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 
@@ -84,7 +83,7 @@ pub fn detect_document(image: &RgbImage) -> DetectResult {
     let mask: Vec<bool> = gray.pixels().map(|pixel| pixel[0] > threshold).collect();
     let mut labels = vec![0_u32; width * height];
     let mut parents: Vec<u32> = vec![0];
-    fn find(parents: &mut Vec<u32>, mut label: u32) -> u32 {
+    fn find(parents: &mut [u32], mut label: u32) -> u32 {
         while parents[label as usize] != label {
             parents[label as usize] = parents[parents[label as usize] as usize];
             label = parents[label as usize];
@@ -265,15 +264,36 @@ fn expand_corners(corners: [CropPoint; 4], amount: f32) -> [CropPoint; 4] {
 }
 
 pub fn rotate_page_clockwise(page: &ScannedPage) -> Result<ScannedPage, String> {
-    let image = decode_jpeg(&page.jpeg)?;
-    page_from_image(imageops::rotate90(&image))
+    rotate_page_by_quarter_turns(page, 1)
 }
 
-pub fn save_pdf(path: &Path, pages: &[&ScannedPage]) -> Result<(), String> {
+pub fn rotate_page_by_quarter_turns(
+    page: &ScannedPage,
+    quarter_turns: u8,
+) -> Result<ScannedPage, String> {
+    let image = decode_jpeg(&page.jpeg)?;
+    let rotated = match quarter_turns % 4 {
+        0 => image,
+        1 => imageops::rotate90(&image),
+        2 => imageops::rotate180(&image),
+        3 => imageops::rotate270(&image),
+        _ => unreachable!(),
+    };
+    page_from_image(rotated)
+}
+
+pub fn render_pdf(pages: &[&ScannedPage]) -> Result<Vec<u8>, String> {
     if pages.is_empty() {
         return Err("Dokument nie zawiera żadnych stron.".to_owned());
     }
     let mut document = PdfDocument::new("Zeskanowany dokument");
+    document.metadata.info.creator = "Skaner dokumentów".to_owned();
+    document.metadata.info.producer = "Skaner dokumentów".to_owned();
+    document
+        .metadata
+        .info
+        .keywords
+        .push("skaner-dokumentow-editable-v1".to_owned());
     let mut pdf_pages = Vec::with_capacity(pages.len());
     for page in pages {
         let mut warnings = Vec::new();
@@ -308,17 +328,16 @@ pub fn save_pdf(path: &Path, pages: &[&ScannedPage]) -> Result<(), String> {
         }),
         ..PdfSaveOptions::default()
     };
-    let bytes = document
+    Ok(document
         .with_pages(pdf_pages)
-        .save(&save_options, &mut Vec::new());
-    let part_path = path.with_extension("pdf.part");
-    fs::write(&part_path, bytes)
-        .map_err(|error| format!("Nie można zapisać pliku PDF: {error}"))?;
-    if let Err(error) = fs::rename(&part_path, path) {
-        let _ = fs::remove_file(&part_path);
-        return Err(format!("Nie można ukończyć zapisu pliku PDF: {error}"));
-    }
-    Ok(())
+        .save(&save_options, &mut Vec::new()))
+}
+
+#[cfg(test)]
+pub fn save_pdf(path: &Path, pages: &[&ScannedPage]) -> Result<(), String> {
+    let bytes = render_pdf(pages)?;
+    crate::atomic_file::write(path, bytes)
+        .map_err(|error| format!("Nie można ukończyć zapisu pliku PDF: {error}"))
 }
 
 fn page_from_image(image: RgbImage) -> Result<ScannedPage, String> {
@@ -342,12 +361,40 @@ fn page_from_image(image: RgbImage) -> Result<ScannedPage, String> {
 pub fn extract_pdf_pages(path: &Path) -> Result<Vec<Vec<u8>>, String> {
     let document =
         lopdf::Document::load(path).map_err(|error| format!("Nie można odczytać PDF: {error}"))?;
+    let has_marker = has_editable_marker(&document);
+    if !has_marker && !pdf_info_string_equals(&document, b"Title", "Zeskanowany dokument") {
+        return Err(
+            "Ten PDF nie ma bezpiecznego znacznika edycji tej wersji programu. Możesz go otworzyć, ale edycja została zablokowana, aby nie utracić tekstu OCR, adnotacji ani układu strony."
+                .to_owned(),
+        );
+    }
     let page_map = document.get_pages();
     if page_map.is_empty() {
         return Err("Ten PDF nie zawiera stron.".to_owned());
     }
+    let catalog = document
+        .catalog()
+        .map_err(|error| format!("Nie można odczytać katalogu PDF: {error}"))?;
+    if has_meaningful_pdf_entry(&document, catalog, b"AcroForm") {
+        return Err(
+            "Ten PDF zawiera formularz. Edycja mogłaby usunąć jego pola, więc została zablokowana."
+                .to_owned(),
+        );
+    }
     let mut pages = Vec::new();
     for (_number, page_id) in page_map {
+        let page_dictionary = document
+            .get_object(page_id)
+            .and_then(lopdf::Object::as_dict)
+            .map_err(|error| format!("Nie można odczytać strony PDF: {error}"))?;
+        if has_meaningful_pdf_entry(&document, page_dictionary, b"Annots")
+            || has_meaningful_pdf_entry(&document, page_dictionary, b"AA")
+        {
+            return Err(
+                "Ten PDF zawiera adnotacje lub elementy interaktywne. Edycja mogłaby je usunąć, więc została zablokowana."
+                    .to_owned(),
+            );
+        }
         let (resources_dict, resource_ids) = document
             .get_page_resources(page_id)
             .map_err(|error| format!("Nie można odczytać zasobów strony: {error}"))?;
@@ -385,49 +432,273 @@ pub fn extract_pdf_pages(path: &Path) -> Result<Vec<Vec<u8>>, String> {
         let content = document
             .get_and_decode_page_content(page_id)
             .map_err(|error| format!("Nie można odczytać treści strony: {error}"))?;
-        let mut page_jpeg: Option<Vec<u8>> = None;
-        for operation in &content.operations {
-            if operation.operator != "Do" {
-                continue;
-            }
-            let Some(lopdf::Object::Name(name)) = operation.operands.first() else {
-                continue;
-            };
-            let Ok(value) = xobjects.get(name) else {
-                continue;
-            };
-            let stream = match value {
-                lopdf::Object::Reference(id) => match document.get_object(*id) {
-                    Ok(lopdf::Object::Stream(stream)) => stream,
-                    _ => continue,
-                },
-                lopdf::Object::Stream(stream) => stream,
-                _ => continue,
-            };
-            let is_image = stream
-                .dict
-                .get(b"Subtype")
-                .and_then(|subtype| subtype.as_name())
-                .map(|name| name == b"Image")
-                .unwrap_or(false);
-            let is_jpeg = match stream.dict.get(b"Filter") {
-                Ok(lopdf::Object::Name(name)) => name == b"DCTDecode",
-                Ok(lopdf::Object::Array(filters)) => filters.iter().any(
-                    |filter| matches!(filter, lopdf::Object::Name(name) if name == b"DCTDecode"),
-                ),
-                _ => false,
-            };
-            if is_image && is_jpeg {
-                page_jpeg = Some(stream.content.clone());
-                break;
-            }
+        let image_name = editable_page_image_name(&content.operations).ok_or_else(|| {
+            "Ten PDF zawiera dodatkową treść i nie może być bezpiecznie edytowany.".to_owned()
+        })?;
+        let value = xobjects
+            .get(image_name)
+            .map_err(|_| "Ten PDF nie pochodzi z tego programu.".to_owned())?;
+        let stream = match value {
+            lopdf::Object::Reference(id) => match document.get_object(*id) {
+                Ok(lopdf::Object::Stream(stream)) => stream,
+                _ => return Err("Ten PDF nie pochodzi z tego programu.".to_owned()),
+            },
+            lopdf::Object::Stream(stream) => stream,
+            _ => return Err("Ten PDF nie pochodzi z tego programu.".to_owned()),
+        };
+        let is_image = stream
+            .dict
+            .get(b"Subtype")
+            .and_then(|subtype| subtype.as_name())
+            .map(|name| name == b"Image")
+            .unwrap_or(false);
+        let is_jpeg = match stream.dict.get(b"Filter") {
+            Ok(lopdf::Object::Name(name)) => name == b"DCTDecode",
+            Ok(lopdf::Object::Array(filters)) => filters
+                .iter()
+                .any(|filter| matches!(filter, lopdf::Object::Name(name) if name == b"DCTDecode")),
+            _ => false,
+        };
+        if !is_image || !is_jpeg {
+            return Err("Ten PDF nie pochodzi z tego programu.".to_owned());
         }
-        match page_jpeg {
-            Some(jpeg) => pages.push(jpeg),
-            None => return Err("Ten PDF nie pochodzi z tego programu.".to_owned()),
+        if !page_is_safe_to_edit(&document, page_dictionary, stream, &content.operations) {
+            return Err(
+                "Ten PDF nie ma układu pełnej strony rozpoznawanego bezpiecznie przez program. Możesz go otworzyć, ale edycja została zablokowana."
+                    .to_owned(),
+            );
         }
+        pages.push(stream.content.clone());
     }
     Ok(pages)
+}
+
+fn editable_page_image_name(operations: &[lopdf::content::Operation]) -> Option<&[u8]> {
+    let mut image_name = None;
+    for operation in operations {
+        match operation.operator.as_str() {
+            "q" | "Q" if operation.operands.is_empty() => {}
+            "cm" if operation.operands.len() == 6 => {}
+            "Do" if operation.operands.len() == 1 && image_name.is_none() => {
+                let lopdf::Object::Name(name) = &operation.operands[0] else {
+                    return None;
+                };
+                image_name = Some(name.as_slice());
+            }
+            _ => return None,
+        }
+    }
+    image_name
+}
+
+fn has_meaningful_pdf_entry(
+    document: &lopdf::Document,
+    dictionary: &lopdf::Dictionary,
+    key: &[u8],
+) -> bool {
+    let Ok(mut value) = dictionary.get(key) else {
+        return false;
+    };
+    if let lopdf::Object::Reference(id) = value {
+        let Ok(resolved) = document.get_object(*id) else {
+            return true;
+        };
+        value = resolved;
+    }
+    match value {
+        lopdf::Object::Null => false,
+        lopdf::Object::Array(values) => !values.is_empty(),
+        lopdf::Object::Dictionary(values) => !values.is_empty(),
+        _ => true,
+    }
+}
+
+fn has_editable_marker(document: &lopdf::Document) -> bool {
+    pdf_info_string_contains(document, b"Keywords", "skaner-dokumentow-editable-v1")
+}
+
+fn pdf_info_string_contains(document: &lopdf::Document, key: &[u8], needle: &str) -> bool {
+    pdf_info_string(document, key).is_some_and(|value| pdf_string_contains(value, needle))
+}
+
+fn pdf_info_string_equals(document: &lopdf::Document, key: &[u8], expected: &str) -> bool {
+    pdf_info_string(document, key).is_some_and(|value| pdf_string_equals(value, expected))
+}
+
+fn pdf_info_string<'a>(document: &'a lopdf::Document, key: &[u8]) -> Option<&'a [u8]> {
+    let Ok(info) = document.trailer.get(b"Info") else {
+        return None;
+    };
+    let info = match info {
+        lopdf::Object::Reference(id) => match document.get_object(*id) {
+            Ok(info) => info,
+            Err(_) => return None,
+        },
+        info => info,
+    };
+    let Ok(dictionary) = info.as_dict() else {
+        return None;
+    };
+    let Ok(lopdf::Object::String(value, _)) = dictionary.get(key) else {
+        return None;
+    };
+    Some(value)
+}
+
+fn pdf_string_contains(bytes: &[u8], needle: &str) -> bool {
+    if bytes
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+    {
+        return true;
+    }
+    let utf16_be: Vec<u8> = needle.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    bytes
+        .windows(utf16_be.len())
+        .any(|window| window == utf16_be)
+}
+
+fn pdf_string_equals(bytes: &[u8], expected: &str) -> bool {
+    if bytes == expected.as_bytes() {
+        return true;
+    }
+    let utf16_be: Vec<u8> = expected.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    bytes == utf16_be || bytes.strip_prefix(&[0xFE, 0xFF]) == Some(utf16_be.as_slice())
+}
+
+fn page_is_safe_to_edit(
+    document: &lopdf::Document,
+    page: &lopdf::Dictionary,
+    image: &lopdf::Stream,
+    operations: &[lopdf::content::Operation],
+) -> bool {
+    if page.has(b"Rotate")
+        || page.has(b"UserUnit")
+        || image.dict.has(b"Mask")
+        || image.dict.has(b"SMask")
+    {
+        return false;
+    }
+    if inherited_page_options_present(document, page) {
+        return false;
+    }
+    let dimensions = image
+        .dict
+        .get(b"Width")
+        .ok()
+        .and_then(pdf_number)
+        .zip(image.dict.get(b"Height").ok().and_then(pdf_number));
+    let Some((image_width, image_height)) = dimensions else {
+        return false;
+    };
+    let portrait = approx(image_width, A4_WIDTH_PX as f64, 0.1)
+        && approx(image_height, A4_HEIGHT_PX as f64, 0.1);
+    let landscape = approx(image_width, A4_HEIGHT_PX as f64, 0.1)
+        && approx(image_height, A4_WIDTH_PX as f64, 0.1);
+    if !portrait && !landscape {
+        return false;
+    }
+
+    let Ok(lopdf::Object::Array(media_box)) = page.get(b"MediaBox") else {
+        return false;
+    };
+    if media_box.len() != 4 {
+        return false;
+    }
+    let Some(values) = media_box.iter().map(pdf_number).collect::<Option<Vec<_>>>() else {
+        return false;
+    };
+    let page_width = values[2] - values[0];
+    let page_height = values[3] - values[1];
+    if !approx(values[0], 0.0, 0.1) || !approx(values[1], 0.0, 0.1) {
+        return false;
+    }
+    for key in [b"CropBox".as_slice(), b"TrimBox", b"BleedBox", b"ArtBox"] {
+        let Ok(lopdf::Object::Array(other_box)) = page.get(key) else {
+            continue;
+        };
+        let Some(other_values) = other_box.iter().map(pdf_number).collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        if other_values.len() != 4
+            || values
+                .iter()
+                .zip(other_values.iter())
+                .any(|(left, right)| !approx(*left, *right, 0.1))
+        {
+            return false;
+        }
+    }
+    let expected_page = if portrait {
+        (210.0 / 25.4 * 72.0, 297.0 / 25.4 * 72.0)
+    } else {
+        (297.0 / 25.4 * 72.0, 210.0 / 25.4 * 72.0)
+    };
+    if !approx(page_width, expected_page.0, 1.0) || !approx(page_height, expected_page.1, 1.0) {
+        return false;
+    }
+
+    let matrices: Vec<[f64; 6]> = operations
+        .iter()
+        .filter(|operation| operation.operator == "cm")
+        .filter_map(|operation| {
+            let values = operation
+                .operands
+                .iter()
+                .map(pdf_number)
+                .collect::<Option<Vec<_>>>()?;
+            values.try_into().ok()
+        })
+        .collect();
+    let [matrix] = matrices.as_slice() else {
+        return false;
+    };
+    approx(matrix[0], page_width, 1.0)
+        && approx(matrix[1], 0.0, 0.01)
+        && approx(matrix[2], 0.0, 0.01)
+        && approx(matrix[3], page_height, 1.0)
+        && approx(matrix[4], 0.0, 0.1)
+        && approx(matrix[5], 0.0, 0.1)
+}
+
+fn inherited_page_options_present(document: &lopdf::Document, page: &lopdf::Dictionary) -> bool {
+    let mut parent = page.get(b"Parent").ok();
+    for _ in 0..32 {
+        let Some(lopdf::Object::Reference(id)) = parent else {
+            return false;
+        };
+        let Ok(lopdf::Object::Dictionary(dictionary)) = document.get_object(*id) else {
+            return true;
+        };
+        if [
+            b"Rotate".as_slice(),
+            b"UserUnit",
+            b"CropBox",
+            b"TrimBox",
+            b"BleedBox",
+            b"ArtBox",
+        ]
+        .iter()
+        .any(|key| dictionary.has(key))
+        {
+            return true;
+        }
+        parent = dictionary.get(b"Parent").ok();
+    }
+    true
+}
+
+fn pdf_number(value: &lopdf::Object) -> Option<f64> {
+    match value {
+        lopdf::Object::Integer(value) => Some(*value as f64),
+        lopdf::Object::Real(value) => Some(*value as f64),
+        _ => None,
+    }
+}
+
+fn approx(left: f64, right: f64, tolerance: f64) -> bool {
+    (left - right).abs() <= tolerance
 }
 
 pub fn page_from_jpeg_bytes(jpeg: Vec<u8>) -> Result<ScannedPage, String> {
@@ -439,6 +710,20 @@ pub fn page_from_jpeg_bytes(jpeg: Vec<u8>) -> Result<ScannedPage, String> {
         jpeg,
         review_image,
     })
+}
+
+pub fn pages_from_jpeg_bytes(jpegs: Vec<Vec<u8>>) -> Result<Vec<ScannedPage>, String> {
+    if jpegs.is_empty() {
+        return Err("Ten PDF nie zawiera stron.".to_owned());
+    }
+    jpegs
+        .into_iter()
+        .enumerate()
+        .map(|(index, jpeg)| {
+            page_from_jpeg_bytes(jpeg)
+                .map_err(|error| format!("Nie można odczytać strony {}: {error}", index + 1))
+        })
+        .collect()
 }
 
 fn decode_jpeg(bytes: &[u8]) -> Result<RgbImage, String> {
@@ -781,24 +1066,24 @@ mod tests {
 
     #[test]
     fn extracts_pages_from_own_pdf() {
-        let first = page_from_image(RgbImage::from_pixel(400, 566, Rgb([245, 245, 245])))
-            .expect("strona 1");
-        let second = page_from_image(RgbImage::from_pixel(300, 424, Rgb([200, 200, 200])))
-            .expect("strona 2");
+        let first = page_from_image(RgbImage::from_pixel(
+            A4_WIDTH_PX,
+            A4_HEIGHT_PX,
+            Rgb([245, 245, 245]),
+        ))
+        .expect("strona 1");
         let path = std::env::temp_dir().join(format!(
             "skaner-dokumentow-extract-{}.pdf",
             std::process::id()
         ));
-        save_pdf(&path, &[&first, &second]).expect("zapis PDF");
+        save_pdf(&path, &[&first]).expect("zapis PDF");
         let pages = extract_pdf_pages(&path).expect("ekstrakcja");
         std::fs::remove_file(&path).expect("usunięcie testowego PDF");
-        assert_eq!(pages.len(), 2, "oczekiwano dwóch stron");
+        assert_eq!(pages.len(), 1, "oczekiwano jednej strony");
         let decoded_first = image::load_from_memory(&pages[0]).expect("dekodowanie 1");
-        let decoded_second = image::load_from_memory(&pages[1]).expect("dekodowanie 2");
-        assert_eq!((decoded_first.width(), decoded_first.height()), (400, 566));
         assert_eq!(
-            (decoded_second.width(), decoded_second.height()),
-            (300, 424)
+            (decoded_first.width(), decoded_first.height()),
+            (A4_WIDTH_PX, A4_HEIGHT_PX)
         );
     }
 
@@ -819,6 +1104,38 @@ mod tests {
     }
 
     #[test]
+    fn editable_page_rejects_extra_content_or_multiple_images() {
+        use lopdf::Object;
+        use lopdf::content::Operation;
+
+        let base = vec![
+            Operation::new("q", vec![]),
+            Operation::new(
+                "cm",
+                vec![
+                    Object::Integer(1),
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(1),
+                    Object::Integer(0),
+                    Object::Integer(0),
+                ],
+            ),
+            Operation::new("Do", vec![Object::Name(b"X1".to_vec())]),
+            Operation::new("Q", vec![]),
+        ];
+        assert_eq!(editable_page_image_name(&base), Some(b"X1".as_slice()));
+
+        let mut with_text = base.clone();
+        with_text.insert(2, Operation::new("BT", vec![]));
+        assert!(editable_page_image_name(&with_text).is_none());
+
+        let mut with_second_image = base;
+        with_second_image.insert(3, Operation::new("Do", vec![Object::Name(b"X2".to_vec())]));
+        assert!(editable_page_image_name(&with_second_image).is_none());
+    }
+
+    #[test]
     fn flattens_uneven_illumination_keeping_ink_dark() {
         let mut image = RgbImage::new(480, 640);
         for y in 0..640 {
@@ -827,7 +1144,11 @@ mod tests {
                 image.put_pixel(
                     x,
                     y,
-                    Rgb([base as u8, (base * 1.02) as u8, (base * 1.12).min(255.0) as u8]),
+                    Rgb([
+                        base as u8,
+                        (base * 1.02) as u8,
+                        (base * 1.12).min(255.0) as u8,
+                    ]),
                 );
             }
         }
@@ -837,7 +1158,13 @@ mod tests {
             }
         }
         enhance_document(&mut image);
-        for (x, y) in [(40_u32, 40_u32), (440, 40), (40, 600), (440, 600), (240, 470)] {
+        for (x, y) in [
+            (40_u32, 40_u32),
+            (440, 40),
+            (40, 600),
+            (440, 600),
+            (240, 470),
+        ] {
             let sample = image.get_pixel(x, y);
             assert!(
                 sample[0] >= 225 && sample[1] >= 225 && sample[2] >= 225,
@@ -981,6 +1308,26 @@ mod tests {
     }
 
     #[test]
+    fn pdf_page_import_is_all_or_nothing() {
+        let page = page_from_image(RgbImage::from_pixel(80, 120, Rgb([240, 240, 240])))
+            .expect("valid page");
+        let error = pages_from_jpeg_bytes(vec![page.jpeg, b"not-a-jpeg".to_vec()])
+            .err()
+            .expect("second page must fail");
+        assert!(error.contains("strony 2"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn quarter_turn_rotation_preserves_expected_orientation() {
+        let page =
+            page_from_image(RgbImage::from_pixel(80, 120, Rgb([240, 240, 240]))).expect("page");
+        let rotated = rotate_page_by_quarter_turns(&page, 1).expect("rotate once");
+        assert_eq!((rotated.width, rotated.height), (120, 80));
+        let full_turn = rotate_page_by_quarter_turns(&page, 4).expect("full turn");
+        assert_eq!((full_turn.width, full_turn.height), (80, 120));
+    }
+
+    #[test]
     fn saved_pdf_keeps_full_resolution() {
         let image = RgbImage::from_pixel(1000, 1414, Rgb([245, 245, 245]));
         let page = page_from_image(image).expect("strona testowa");
@@ -1004,6 +1351,80 @@ mod tests {
             (1000, 1414),
             "printpdf zmniejszył osadzony obraz"
         );
+    }
+
+    #[test]
+    fn safely_imports_full_page_pdf_from_legacy_app_version() {
+        let page = page_from_image(RgbImage::from_pixel(
+            A4_WIDTH_PX,
+            A4_HEIGHT_PX,
+            Rgb([245, 245, 245]),
+        ))
+        .expect("legacy page");
+        let path = std::env::temp_dir().join(format!(
+            "skaner-dokumentow-legacy-{}.pdf",
+            std::process::id()
+        ));
+        save_pdf(&path, &[&page]).expect("save marked PDF");
+
+        let mut document = lopdf::Document::load(&path).expect("load PDF");
+        let info_id = match document.trailer.get(b"Info").expect("Info") {
+            lopdf::Object::Reference(id) => *id,
+            _ => panic!("Info is not indirect"),
+        };
+        document
+            .get_object_mut(info_id)
+            .expect("Info object")
+            .as_dict_mut()
+            .expect("Info dictionary")
+            .remove(b"Keywords");
+        document.save(&path).expect("save legacy PDF");
+
+        let pages = extract_pdf_pages(&path).expect("safe legacy extraction");
+        assert_eq!(pages.len(), 1);
+        std::fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn rejects_unmarked_pdf_that_is_not_a_full_a4_page() {
+        let page = page_from_image(RgbImage::from_pixel(400, 566, Rgb([245, 245, 245])))
+            .expect("small page");
+        let path = std::env::temp_dir().join(format!(
+            "skaner-dokumentow-unsafe-legacy-{}.pdf",
+            std::process::id()
+        ));
+        save_pdf(&path, &[&page]).expect("save marked PDF");
+
+        let mut document = lopdf::Document::load(&path).expect("load PDF");
+        let info_id = match document.trailer.get(b"Info").expect("Info") {
+            lopdf::Object::Reference(id) => *id,
+            _ => panic!("Info is not indirect"),
+        };
+        document
+            .get_object_mut(info_id)
+            .expect("Info object")
+            .as_dict_mut()
+            .expect("Info dictionary")
+            .remove(b"Keywords");
+        document.save(&path).expect("save unmarked PDF");
+
+        assert!(extract_pdf_pages(&path).is_err());
+        std::fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn saving_pdf_replaces_an_existing_target() {
+        let image = RgbImage::from_pixel(100, 141, Rgb([245, 245, 245]));
+        let page = page_from_image(image).expect("strona testowa");
+        let path = std::env::temp_dir().join(format!(
+            "skaner-dokumentow-replace-{}.pdf",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"poprzednia wersja").expect("stary plik");
+        save_pdf(&path, &[&page]).expect("podmiana PDF");
+        let bytes = std::fs::read(&path).expect("odczyt PDF");
+        assert!(bytes.starts_with(b"%PDF-"));
+        std::fs::remove_file(path).expect("usunięcie testowego PDF");
     }
 
     #[test]

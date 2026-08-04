@@ -1,0 +1,408 @@
+use eframe::egui::{
+    self, Color32, ColorImage, CursorIcon, Pos2, Rect, Sense, Stroke, TextureHandle,
+    TextureOptions, Ui, Vec2,
+};
+
+const MIN_ZOOM: f32 = 0.01;
+const MAX_ZOOM: f32 = 4.0;
+const ZOOM_STEP: f32 = 1.25;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageTextureKey {
+    pub id: u64,
+    pub revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZoomMode {
+    Fit,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ViewCommand {
+    Fit,
+    OneToOne,
+    ZoomBy(f32),
+}
+
+pub struct ReviewViewport {
+    key: Option<PageTextureKey>,
+    texture: Option<TextureHandle>,
+    source_px: Vec2,
+    zoom: f32,
+    pan: Vec2,
+    mode: ZoomMode,
+    pending_command: Option<ViewCommand>,
+    load_error: Option<String>,
+}
+
+impl Default for ReviewViewport {
+    fn default() -> Self {
+        Self {
+            key: None,
+            texture: None,
+            source_px: Vec2::ZERO,
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+            mode: ZoomMode::Fit,
+            pending_command: None,
+            load_error: None,
+        }
+    }
+}
+
+impl ReviewViewport {
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn invalidate(&mut self) {
+        self.key = None;
+        self.texture = None;
+        self.source_px = Vec2::ZERO;
+        self.mode = ZoomMode::Fit;
+        self.zoom = 1.0;
+        self.pan = Vec2::ZERO;
+        self.pending_command = None;
+        self.load_error = None;
+    }
+
+    pub fn ensure_page(&mut self, context: &egui::Context, key: PageTextureKey, jpeg: &[u8]) {
+        if self.key == Some(key) {
+            return;
+        }
+        self.key = Some(key);
+        self.texture = None;
+        self.source_px = Vec2::ZERO;
+        self.mode = ZoomMode::Fit;
+        self.zoom = 1.0;
+        self.pan = Vec2::ZERO;
+        self.pending_command = None;
+        self.load_error = None;
+
+        let image = match image::load_from_memory(jpeg) {
+            Ok(image) => image.to_rgb8(),
+            Err(error) => {
+                self.load_error = Some(format!("Nie można otworzyć pełnego podglądu: {error}"));
+                return;
+            }
+        };
+        let max_texture_side = context.input(|input| input.max_texture_side);
+        if image.width() as usize > max_texture_side || image.height() as usize > max_texture_side {
+            self.load_error = Some(format!(
+                "Pełny podgląd {} × {} px przekracza limit karty graficznej ({max_texture_side} px).",
+                image.width(),
+                image.height()
+            ));
+            return;
+        }
+        self.source_px = Vec2::new(image.width() as f32, image.height() as f32);
+        let color_image = ColorImage::from_rgb(
+            [image.width() as usize, image.height() as usize],
+            image.as_raw(),
+        );
+        self.texture = Some(context.load_texture(
+            format!("review-full-{}-{}", key.id, key.revision),
+            color_image,
+            TextureOptions::LINEAR,
+        ));
+    }
+
+    pub fn show(&mut self, ui: &mut Ui) {
+        self.toolbar(ui);
+        ui.add_space(6.0);
+
+        let canvas_size = ui.available_size().max(Vec2::splat(1.0));
+        let (response, painter) = ui.allocate_painter(canvas_size, Sense::click_and_drag());
+        let viewport = response.rect;
+        let painter = painter.with_clip_rect(viewport);
+        painter.rect_filled(viewport, 10.0, Color32::from_rgb(28, 31, 36));
+
+        let Some(texture) = &self.texture else {
+            self.pending_command = None;
+            let text = self
+                .load_error
+                .as_deref()
+                .unwrap_or("Przygotowywanie pełnego podglądu…");
+            painter.text(
+                viewport.center(),
+                egui::Align2::CENTER_CENTER,
+                text,
+                egui::FontId::proportional(16.0),
+                Color32::from_gray(225),
+            );
+            return;
+        };
+
+        let pixels_per_point = ui.ctx().pixels_per_point().max(0.01);
+        let natural_size = natural_size_points(self.source_px, pixels_per_point);
+        let fit = fit_zoom(self.source_px, viewport.size(), pixels_per_point);
+        if self.mode == ZoomMode::Fit {
+            self.zoom = fit;
+            self.pan = Vec2::ZERO;
+        }
+        if let Some(command) = self.pending_command.take() {
+            match command {
+                ViewCommand::Fit => {
+                    self.mode = ZoomMode::Fit;
+                    self.zoom = fit;
+                    self.pan = Vec2::ZERO;
+                }
+                ViewCommand::OneToOne => {
+                    self.mode = ZoomMode::Manual;
+                    self.zoom = 1.0_f32.clamp(fit, MAX_ZOOM);
+                    self.pan = Vec2::ZERO;
+                }
+                ViewCommand::ZoomBy(factor) => {
+                    let next = (self.zoom * factor).clamp(fit, MAX_ZOOM);
+                    if next <= fit + f32::EPSILON {
+                        self.mode = ZoomMode::Fit;
+                        self.zoom = fit;
+                        self.pan = Vec2::ZERO;
+                    } else if (next - self.zoom).abs() > f32::EPSILON {
+                        self.pan = zoom_pan_anchored(
+                            self.pan,
+                            self.zoom,
+                            next,
+                            viewport.center(),
+                            viewport.center(),
+                        );
+                        self.zoom = next;
+                        self.mode = ZoomMode::Manual;
+                    }
+                }
+            }
+        }
+
+        if response.dragged_by(egui::PointerButton::Primary) {
+            let next = clamp_pan(
+                self.pan + response.drag_delta(),
+                natural_size * self.zoom,
+                viewport.size(),
+            );
+            if (next - self.pan).length_sq() > f32::EPSILON {
+                self.pan = next;
+                self.mode = ZoomMode::Manual;
+            }
+        }
+        if response.hovered() {
+            let (pointer, zoom_delta, scroll_delta) = ui.input(|input| {
+                (
+                    input.pointer.latest_pos(),
+                    input.zoom_delta(),
+                    input.smooth_scroll_delta(),
+                )
+            });
+            if let Some(pointer) = pointer
+                && (zoom_delta - 1.0).abs() > f32::EPSILON
+            {
+                let next = (self.zoom * zoom_delta).clamp(fit, MAX_ZOOM);
+                self.pan = zoom_pan_anchored(self.pan, self.zoom, next, pointer, viewport.center());
+                self.zoom = next;
+                if next <= fit + f32::EPSILON {
+                    self.mode = ZoomMode::Fit;
+                    self.pan = Vec2::ZERO;
+                } else {
+                    self.mode = ZoomMode::Manual;
+                }
+            } else if scroll_delta != Vec2::ZERO {
+                let next = clamp_pan(
+                    self.pan + scroll_delta,
+                    natural_size * self.zoom,
+                    viewport.size(),
+                );
+                if (next - self.pan).length_sq() > f32::EPSILON {
+                    self.pan = next;
+                    self.mode = ZoomMode::Manual;
+                }
+            }
+        }
+        if response.double_clicked() {
+            self.pending_command = Some(if self.zoom < 0.9 {
+                ViewCommand::OneToOne
+            } else {
+                ViewCommand::Fit
+            });
+            ui.ctx().request_repaint();
+        }
+
+        let display_size = natural_size * self.zoom;
+        self.pan = clamp_pan(self.pan, display_size, viewport.size());
+        let page_rect = image_rect(viewport, natural_size, self.zoom, self.pan);
+        if let Some((visible, uv)) = clipped_image(page_rect, viewport) {
+            painter.image(texture.id(), visible, uv, Color32::WHITE);
+            painter.rect_stroke(
+                page_rect,
+                0.0,
+                Stroke::new(1.0, Color32::from_gray(140)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        ui.ctx().set_cursor_icon(if response.dragged() {
+            CursorIcon::Grabbing
+        } else if response.hovered() {
+            CursorIcon::Grab
+        } else {
+            CursorIcon::Default
+        });
+        response.on_hover_text(
+            "Ctrl + kółko: powiększ · kółko: przesuń · przeciągnij: przesuń · podwójne kliknięcie: 100% / dopasuj",
+        );
+    }
+
+    fn toolbar(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("−").on_hover_text("Pomniejsz").clicked() {
+                self.pending_command = Some(ViewCommand::ZoomBy(1.0 / ZOOM_STEP));
+            }
+            if ui
+                .button("100%")
+                .on_hover_text("Jeden piksel obrazu na piksel ekranu")
+                .clicked()
+            {
+                self.pending_command = Some(ViewCommand::OneToOne);
+            }
+            if ui.button("+").on_hover_text("Powiększ").clicked() {
+                self.pending_command = Some(ViewCommand::ZoomBy(ZOOM_STEP));
+            }
+            if ui.button("Dopasuj").clicked() {
+                self.pending_command = Some(ViewCommand::Fit);
+            }
+            let zoom_percent = (self.zoom * 100.0).round();
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} × {} px · 300 DPI · {zoom_percent:.0}%",
+                    self.source_px.x as u32, self.source_px.y as u32
+                ))
+                .small()
+                .color(Color32::from_gray(95)),
+            );
+        });
+    }
+}
+
+fn natural_size_points(source_px: Vec2, pixels_per_point: f32) -> Vec2 {
+    source_px / pixels_per_point.max(0.01)
+}
+
+fn fit_zoom(source_px: Vec2, viewport: Vec2, pixels_per_point: f32) -> f32 {
+    let natural = natural_size_points(source_px, pixels_per_point);
+    if natural.x <= 0.0 || natural.y <= 0.0 || viewport.x <= 0.0 || viewport.y <= 0.0 {
+        return 1.0;
+    }
+    (viewport.x / natural.x)
+        .min(viewport.y / natural.y)
+        .clamp(MIN_ZOOM, 1.0)
+}
+
+fn image_rect(viewport: Rect, natural: Vec2, zoom: f32, pan: Vec2) -> Rect {
+    Rect::from_center_size(viewport.center() + pan, natural * zoom)
+}
+
+fn zoom_pan_anchored(pan: Vec2, old: f32, new: f32, anchor: Pos2, center: Pos2) -> Vec2 {
+    if old <= 0.0 {
+        return pan;
+    }
+    let delta = anchor - center;
+    delta - (delta - pan) * (new / old)
+}
+
+fn clamp_pan(pan: Vec2, display: Vec2, viewport: Vec2) -> Vec2 {
+    let overflow_x = ((display.x - viewport.x) * 0.5).max(0.0);
+    let overflow_y = ((display.y - viewport.y) * 0.5).max(0.0);
+    Vec2::new(
+        pan.x.clamp(-overflow_x, overflow_x),
+        pan.y.clamp(-overflow_y, overflow_y),
+    )
+}
+
+fn clipped_image(image: Rect, viewport: Rect) -> Option<(Rect, Rect)> {
+    if image.width() <= 0.0 || image.height() <= 0.0 {
+        return None;
+    }
+    let visible = image.intersect(viewport);
+    if !visible.is_positive() {
+        return None;
+    }
+    let uv = Rect::from_min_max(
+        Pos2::new(
+            (visible.min.x - image.min.x) / image.width(),
+            (visible.min.y - image.min.y) / image.height(),
+        ),
+        Pos2::new(
+            (visible.max.x - image.min.x) / image.width(),
+            (visible.max.y - image.min.y) / image.height(),
+        ),
+    );
+    Some((visible, uv))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_zoom_uses_limiting_axis_and_never_upscales() {
+        assert!(
+            (fit_zoom(Vec2::new(1000.0, 2000.0), Vec2::new(500.0, 500.0), 1.0) - 0.25).abs()
+                < 0.001
+        );
+        assert_eq!(
+            fit_zoom(Vec2::new(100.0, 100.0), Vec2::new(500.0, 500.0), 1.0),
+            1.0
+        );
+    }
+
+    #[test]
+    fn natural_size_honors_display_scale() {
+        assert_eq!(
+            natural_size_points(Vec2::new(2480.0, 3508.0), 1.25),
+            Vec2::new(1984.0, 2806.4)
+        );
+    }
+
+    #[test]
+    fn anchored_zoom_keeps_pointer_source_position_stable() {
+        let center = Pos2::new(500.0, 400.0);
+        let anchor = Pos2::new(700.0, 500.0);
+        let old_pan = Vec2::new(20.0, -10.0);
+        let new_pan = zoom_pan_anchored(old_pan, 0.5, 1.0, anchor, center);
+        let before = (anchor - center - old_pan) / 0.5;
+        let after = (anchor - center - new_pan) / 1.0;
+        assert!((before - after).length() < 0.001);
+    }
+
+    #[test]
+    fn clamp_pan_centers_small_axis_and_limits_large_axis() {
+        assert_eq!(
+            clamp_pan(
+                Vec2::new(100.0, -500.0),
+                Vec2::new(300.0, 1200.0),
+                Vec2::new(500.0, 600.0),
+            ),
+            Vec2::new(0.0, -300.0)
+        );
+    }
+
+    #[test]
+    fn clipping_produces_matching_uv_coordinates() {
+        let image = Rect::from_min_size(Pos2::new(-50.0, -25.0), Vec2::new(200.0, 100.0));
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 100.0));
+        let (visible, uv) = clipped_image(image, viewport).expect("visible intersection");
+        assert_eq!(
+            visible,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 75.0))
+        );
+        assert_eq!(uv.min, Pos2::new(0.25, 0.25));
+        assert_eq!(uv.max, Pos2::new(0.75, 1.0));
+    }
+
+    #[test]
+    fn clipping_rejects_non_overlapping_image() {
+        let image = Rect::from_min_size(Pos2::new(200.0, 200.0), Vec2::splat(50.0));
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0));
+        assert!(clipped_image(image, viewport).is_none());
+    }
+}

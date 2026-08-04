@@ -12,6 +12,7 @@ enum State {
     Baseline,
     Armed,
     Settling,
+    AwaitingCapacity,
     Cooldown,
 }
 
@@ -54,6 +55,10 @@ impl AutoCapture {
     }
 
     pub fn note_manual_capture(&mut self) {
+        self.note_capture_accepted();
+    }
+
+    pub fn note_capture_accepted(&mut self) {
         if let Some(previous) = &self.previous {
             self.captured = Some(previous.clone());
         }
@@ -69,6 +74,7 @@ impl AutoCapture {
             State::Baseline => "Połóż stronę pod kamerą",
             State::Armed => "Połóż następną stronę",
             State::Settling => "Trzymaj nieruchomo…",
+            State::AwaitingCapacity => "Poczekaj — przetwarzanie poprzednich stron…",
             State::Cooldown => "Zmień stronę",
         }
     }
@@ -121,13 +127,24 @@ impl AutoCapture {
                 }
                 let stable_since = *self.stable_since.get_or_insert(now);
                 if now.duration_since(stable_since) >= Duration::from_millis(STABLE_MS) {
-                    self.captured = Some(sample);
-                    self.state = State::Cooldown;
+                    self.state = State::AwaitingCapacity;
                     self.stable_since = None;
                     FeedResult::Trigger
                 } else {
                     FeedResult::None
                 }
+            }
+            State::AwaitingCapacity => {
+                if !document_present || novelty.unwrap_or(f32::INFINITY) <= NOVELTY_MIN {
+                    self.state = State::Armed;
+                    return FeedResult::None;
+                }
+                if motion.unwrap_or(f32::INFINITY) > MOTION_MAX {
+                    self.state = State::Settling;
+                    self.stable_since = Some(now);
+                    return FeedResult::None;
+                }
+                FeedResult::Trigger
             }
             State::Cooldown => {
                 if motion.unwrap_or(0.0) > MOTION_MAX || novelty.unwrap_or(0.0) > NOVELTY_MIN {
@@ -198,6 +215,7 @@ mod tests {
             auto.feed(&frame(100), t(base, 900), true),
             FeedResult::Trigger
         );
+        auto.note_capture_accepted();
         for step in 10..20 {
             assert_eq!(
                 auto.feed(&frame(100), t(base, step * 100), true),
@@ -220,6 +238,7 @@ mod tests {
             auto.feed(&frame(100), t(base, 1600), true),
             FeedResult::Trigger
         );
+        auto.note_capture_accepted();
     }
 
     #[test]
@@ -233,6 +252,7 @@ mod tests {
             auto.feed(&frame(100), t(base, 900), true),
             FeedResult::Trigger
         );
+        auto.note_capture_accepted();
         auto.feed(&frame(200), t(base, 1000), true);
         auto.feed(&frame(50), t(base, 1100), true);
         assert_eq!(auto.feed(&frame(50), t(base, 1200), true), FeedResult::None);
@@ -240,6 +260,7 @@ mod tests {
             auto.feed(&frame(50), t(base, 1900), true),
             FeedResult::Trigger
         );
+        auto.note_capture_accepted();
     }
 
     #[test]
@@ -268,6 +289,7 @@ mod tests {
             auto.feed(&frame(50), t(base, 2700), true),
             FeedResult::Trigger
         );
+        auto.note_capture_accepted();
     }
 
     #[test]
@@ -287,6 +309,7 @@ mod tests {
             auto.feed(&frame(100), t(base, 1700), true),
             FeedResult::Trigger
         );
+        auto.note_capture_accepted();
     }
 
     #[test]
@@ -303,5 +326,29 @@ mod tests {
                 "po ręcznym zdjęciu ta sama strona nie wyzwala auto"
             );
         }
+    }
+
+    #[test]
+    fn rejected_trigger_retries_until_capture_is_accepted() {
+        let mut auto = AutoCapture::new();
+        let base = Instant::now();
+        auto.feed(&frame(200), t(base, 0), true);
+        auto.feed(&frame(100), t(base, 100), true);
+        auto.feed(&frame(100), t(base, 200), true);
+        assert_eq!(
+            auto.feed(&frame(100), t(base, 900), true),
+            FeedResult::Trigger
+        );
+        assert_eq!(
+            auto.feed(&frame(100), t(base, 1000), true),
+            FeedResult::Trigger,
+            "pełna kolejka nie może zgubić stabilnej strony"
+        );
+        auto.note_capture_accepted();
+        assert_eq!(
+            auto.feed(&frame(100), t(base, 1100), true),
+            FeedResult::None,
+            "po przyjęciu zadania ta sama strona musi wejść w cooldown"
+        );
     }
 }
