@@ -11,6 +11,8 @@ use std::path::Path;
 
 pub const A4_WIDTH_PX: u32 = 2480;
 pub const A4_HEIGHT_PX: u32 = 3508;
+const FLATTEN_COLS: usize = 12;
+const FLATTEN_ROWS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CropPoint {
@@ -73,7 +75,9 @@ pub fn detect_document(image: &RgbImage) -> DetectResult {
     if bright < dark + 50 {
         return fallback;
     }
-    let threshold = ((dark + bright) / 2) as u8;
+    // Bias the cut toward dark so shadowed paper edges stay inside the page
+    // component (the mat is near-black, so plenty of margin remains).
+    let threshold = (dark + (bright - dark) * 35 / 100) as u8;
 
     // Largest connected bright component via two-pass union-find labelling.
     let mask: Vec<bool> = gray.pixels().map(|pixel| pixel[0] > threshold).collect();
@@ -487,12 +491,82 @@ fn enhance_document(image: &mut RgbImage) {
     if (0..3).any(|channel| papers[channel] <= lows[channel] + 60) {
         return;
     }
+
+    // Local paper map (uneven lamp/AWB across the page): per-cell bright mode,
+    // floored to the global paper level so ink-dense cells cannot over-brighten.
+    let mut cell_hist = vec![[[0_u64; 256]; 3]; FLATTEN_COLS * FLATTEN_ROWS];
+    for y in (0..height).step_by(4) {
+        let row = (y as usize * FLATTEN_ROWS / height as usize).min(FLATTEN_ROWS - 1);
+        for x in (0..width).step_by(4) {
+            let col = (x as usize * FLATTEN_COLS / width as usize).min(FLATTEN_COLS - 1);
+            let pixel = image.get_pixel(x, y);
+            let cell = &mut cell_hist[row * FLATTEN_COLS + col];
+            for channel in 0..3 {
+                cell[channel][pixel[channel] as usize] += 1;
+            }
+        }
+    }
+    let mut raw_bg = vec![[0.0_f32; 3]; FLATTEN_COLS * FLATTEN_ROWS];
+    for (index, cell) in cell_hist.iter().enumerate() {
+        for channel in 0..3 {
+            let floor = papers[channel] as f32 * 0.66;
+            raw_bg[index][channel] = (bright_mode(&cell[channel]) as f32).max(floor);
+        }
+    }
+    let mut background = vec![[0.0_f32; 3]; FLATTEN_COLS * FLATTEN_ROWS];
+    for row in 0..FLATTEN_ROWS {
+        for col in 0..FLATTEN_COLS {
+            let mut sums = [0.0_f32; 3];
+            let mut count = 0.0_f32;
+            for delta_row in -1_i32..=1 {
+                for delta_col in -1_i32..=1 {
+                    let neighbor_row = row as i32 + delta_row;
+                    let neighbor_col = col as i32 + delta_col;
+                    if (0..FLATTEN_ROWS as i32).contains(&neighbor_row)
+                        && (0..FLATTEN_COLS as i32).contains(&neighbor_col)
+                    {
+                        let neighbor =
+                            raw_bg[neighbor_row as usize * FLATTEN_COLS + neighbor_col as usize];
+                        for channel in 0..3 {
+                            sums[channel] += neighbor[channel];
+                        }
+                        count += 1.0;
+                    }
+                }
+            }
+            for channel in 0..3 {
+                background[row * FLATTEN_COLS + col][channel] = sums[channel] / count;
+            }
+        }
+    }
+    let cell_w = width as f32 / FLATTEN_COLS as f32;
+    let cell_h = height as f32 / FLATTEN_ROWS as f32;
+    let sample_bg = |fx: f32, fy: f32, channel: usize| -> f32 {
+        let gx = (fx / cell_w - 0.5).clamp(0.0, FLATTEN_COLS as f32 - 1.0);
+        let gy = (fy / cell_h - 0.5).clamp(0.0, FLATTEN_ROWS as f32 - 1.0);
+        let x0 = gx.floor() as usize;
+        let y0 = gy.floor() as usize;
+        let x1 = (x0 + 1).min(FLATTEN_COLS - 1);
+        let y1 = (y0 + 1).min(FLATTEN_ROWS - 1);
+        let tx = gx - x0 as f32;
+        let ty = gy - y0 as f32;
+        let top = background[y0 * FLATTEN_COLS + x0][channel] * (1.0 - tx)
+            + background[y0 * FLATTEN_COLS + x1][channel] * tx;
+        let bottom = background[y1 * FLATTEN_COLS + x0][channel] * (1.0 - tx)
+            + background[y1 * FLATTEN_COLS + x1][channel] * tx;
+        top * (1.0 - ty) + bottom * ty
+    };
+
+    // Multiplicative local white balance (keeps ink dark — QR-safe), then the
+    // global paper→white / ink→dark stretch.
     let scales: [f32; 3] =
         std::array::from_fn(|channel| 242.0 / (papers[channel] - lows[channel]) as f32);
-    for pixel in image.pixels_mut() {
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
         for channel in 0..3 {
-            let adjusted =
-                (pixel[channel] as i32 - lows[channel] as i32) as f32 * scales[channel] + 5.0;
+            let local_bg = sample_bg(x as f32, y as f32, channel).max(1.0);
+            let factor = (papers[channel] as f32 / local_bg).clamp(0.75, 1.5);
+            let balanced = pixel[channel] as f32 * factor;
+            let adjusted = (balanced - lows[channel] as f32) * scales[channel] + 5.0;
             pixel[channel] = adjusted.round().clamp(0.0, 255.0) as u8;
         }
     }
@@ -617,6 +691,73 @@ mod tests {
         let result = extract_pdf_pages(&path);
         std::fs::remove_file(&path).expect("usunięcie atrapy");
         assert!(result.is_err(), "obcy PDF musi zwrócić błąd");
+    }
+
+    #[test]
+    fn flattens_uneven_illumination_keeping_ink_dark() {
+        let mut image = RgbImage::new(480, 640);
+        for y in 0..640 {
+            for x in 0..480 {
+                let base = 150.0 + 80.0 * (x as f32 / 480.0);
+                image.put_pixel(
+                    x,
+                    y,
+                    Rgb([
+                        base as u8,
+                        (base * 1.02) as u8,
+                        (base * 1.12).min(255.0) as u8,
+                    ]),
+                );
+            }
+        }
+        for y in 260..330 {
+            for x in 120..360 {
+                image.put_pixel(x, y, Rgb([35, 40, 60]));
+            }
+        }
+        enhance_document(&mut image);
+        for (x, y) in [
+            (40_u32, 40_u32),
+            (440, 40),
+            (40, 600),
+            (440, 600),
+            (240, 470),
+        ] {
+            let sample = image.get_pixel(x, y);
+            assert!(
+                sample[0] >= 225 && sample[1] >= 225 && sample[2] >= 225,
+                "tło w ({x},{y}) nie jest białe: {:?}",
+                sample
+            );
+        }
+        let ink = image.get_pixel(240, 295);
+        assert!(
+            ink[0] < 90 && ink[1] < 90 && ink[2] < 90,
+            "atrament został rozjaśniony (QR by ucierpiał): {:?}",
+            ink
+        );
+    }
+
+    #[test]
+    fn shadowed_page_edge_stays_inside_the_crop() {
+        let mut image = RgbImage::from_pixel(800, 600, Rgb([25, 25, 25]));
+        for y in 60..540 {
+            for x in 100..700 {
+                image.put_pixel(x, y, Rgb([240, 240, 240]));
+            }
+        }
+        for y in 60..540 {
+            for x in 100..140 {
+                image.put_pixel(x, y, Rgb([105, 105, 105]));
+            }
+        }
+        let result = detect_document(&image);
+        assert!(result.confident);
+        assert!(
+            result.corners[0].x <= 105.0 / 800.0,
+            "zacieniona krawędź wypadła z kadru: {:?}",
+            result.corners[0]
+        );
     }
 
     #[test]

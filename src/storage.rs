@@ -21,6 +21,8 @@ pub struct PdfInfo {
 pub struct Settings {
     pub library_root: Option<PathBuf>,
     pub last_folder: Option<String>,
+    #[serde(default)]
+    pub auto_capture: Option<bool>,
 }
 
 pub fn default_library_root() -> PathBuf {

@@ -242,6 +242,9 @@ impl DocumentScannerApp {
         self.pipeline = Some(ProcessingPipeline::start());
         self.overlay = Some(OverlayDetector::start());
         self.autocapture = AutoCapture::new();
+        if self.settings.auto_capture == Some(false) {
+            self.autocapture.set_enabled(false);
+        }
         self.session_broken = false;
         if let (Some(session), Some(folder)) = (&self.session, &self.selected_folder)
             && let Err(error) = session.begin(&folder.path)
@@ -646,6 +649,9 @@ impl DocumentScannerApp {
         self.pipeline = Some(ProcessingPipeline::start());
         self.overlay = Some(OverlayDetector::start());
         self.autocapture = AutoCapture::new();
+        if self.settings.auto_capture == Some(false) {
+            self.autocapture.set_enabled(false);
+        }
         self.session_broken = false;
         let mut max_id = 0;
         for (id, jpeg) in recovered.pages {
@@ -1076,6 +1082,8 @@ impl DocumentScannerApp {
                         .corner_radius(9.0);
                     if ui.add(toggle).clicked() {
                         self.autocapture.set_enabled(!auto_on);
+                        self.settings.auto_capture = Some(!auto_on);
+                        let _ = save_settings(&self.settings);
                     }
                 },
             );
@@ -1561,8 +1569,8 @@ impl DocumentScannerApp {
                     self.save_dialog_needs_focus = false;
                     response.request_focus();
                 }
-                let submitted =
-                    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                let submitted = enter_pressed && (response.lost_focus() || response.has_focus());
                 if primary_button(ui, "Zapisz PDF (Enter)").clicked() || submitted {
                     save_now = true;
                 }
