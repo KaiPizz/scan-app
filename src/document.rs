@@ -376,25 +376,32 @@ fn resize_to_fit(
 }
 
 fn enhance_document(image: &mut RgbImage) {
-    let mut histogram = [0_u64; 256];
+    let mut histograms = [[0_u64; 256]; 3];
     for pixel in image.pixels().step_by(8) {
-        let luminance = (pixel[0] as u32 * 54 + pixel[1] as u32 * 183 + pixel[2] as u32 * 19) / 256;
-        histogram[luminance as usize] += 1;
+        for channel in 0..3 {
+            histograms[channel][pixel[channel] as usize] += 1;
+        }
     }
-    let sample_count: u64 = histogram.iter().sum();
+    let sample_count: u64 = histograms[0].iter().sum();
     if sample_count == 0 {
         return;
     }
-    let low = percentile(&histogram, sample_count / 200);
-    let high = percentile(&histogram, sample_count * 199 / 200);
-    if high <= low + 60 {
+    let mut lows = [0_usize; 3];
+    let mut highs = [0_usize; 3];
+    for channel in 0..3 {
+        lows[channel] = percentile(&histograms[channel], sample_count / 200);
+        highs[channel] = percentile(&histograms[channel], sample_count * 199 / 200);
+    }
+    if (0..3).any(|channel| highs[channel] <= lows[channel] + 60) {
         return;
     }
-    let scale = 245.0 / (high - low) as f32;
+    let scales: [f32; 3] =
+        std::array::from_fn(|channel| 245.0 / (highs[channel] - lows[channel]) as f32);
     for pixel in image.pixels_mut() {
-        for channel in &mut pixel.0 {
-            let adjusted = (*channel as i32 - low as i32) as f32 * scale + 5.0;
-            *channel = adjusted.round().clamp(0.0, 255.0) as u8;
+        for channel in 0..3 {
+            let adjusted =
+                (pixel[channel] as i32 - lows[channel] as i32) as f32 * scales[channel] + 5.0;
+            pixel[channel] = adjusted.round().clamp(0.0, 255.0) as u8;
         }
     }
 }
@@ -490,6 +497,28 @@ mod tests {
         println!("wykryte narożniki: {corners:?}");
         let page = process_page(&image, corners).expect("przetworzenie strony");
         page.review_image.save(output).expect("zapis podglądu");
+    }
+
+    #[test]
+    fn neutralizes_blue_color_cast() {
+        let mut image = RgbImage::from_pixel(400, 400, Rgb([190, 200, 230]));
+        for y in 150..250 {
+            for x in 150..250 {
+                image.put_pixel(x, y, Rgb([40, 45, 70]));
+            }
+        }
+        enhance_document(&mut image);
+        let corner = image.get_pixel(10, 10);
+        assert!(
+            corner[0] >= 240 && corner[1] >= 240 && corner[2] >= 240,
+            "tło nie zostało rozjaśnione: {:?}",
+            corner
+        );
+        let max_channel_gap = corner[0]
+            .abs_diff(corner[1])
+            .max(corner[1].abs_diff(corner[2]))
+            .max(corner[0].abs_diff(corner[2]));
+        assert!(max_channel_gap <= 6, "tło nie jest neutralne: {:?}", corner);
     }
 
     #[test]
