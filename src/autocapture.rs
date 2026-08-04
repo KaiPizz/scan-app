@@ -194,7 +194,10 @@ mod tests {
         auto.feed(&frame(200), t(base, 0), true);
         assert_eq!(auto.feed(&frame(100), t(base, 100), true), FeedResult::None);
         assert_eq!(auto.feed(&frame(100), t(base, 200), true), FeedResult::None);
-        assert_eq!(auto.feed(&frame(100), t(base, 900), true), FeedResult::Trigger);
+        assert_eq!(
+            auto.feed(&frame(100), t(base, 900), true),
+            FeedResult::Trigger
+        );
         for step in 10..20 {
             assert_eq!(
                 auto.feed(&frame(100), t(base, step * 100), true),
@@ -213,7 +216,10 @@ mod tests {
         auto.feed(&frame(100), t(base, 200), true);
         assert_eq!(auto.feed(&frame(110), t(base, 500), true), FeedResult::None);
         assert_eq!(auto.feed(&frame(100), t(base, 900), true), FeedResult::None);
-        assert_eq!(auto.feed(&frame(100), t(base, 1600), true), FeedResult::Trigger);
+        assert_eq!(
+            auto.feed(&frame(100), t(base, 1600), true),
+            FeedResult::Trigger
+        );
     }
 
     #[test]
@@ -223,11 +229,17 @@ mod tests {
         auto.feed(&frame(200), t(base, 0), true);
         auto.feed(&frame(100), t(base, 100), true);
         auto.feed(&frame(100), t(base, 200), true);
-        assert_eq!(auto.feed(&frame(100), t(base, 900), true), FeedResult::Trigger);
+        assert_eq!(
+            auto.feed(&frame(100), t(base, 900), true),
+            FeedResult::Trigger
+        );
         auto.feed(&frame(200), t(base, 1000), true);
         auto.feed(&frame(50), t(base, 1100), true);
         assert_eq!(auto.feed(&frame(50), t(base, 1200), true), FeedResult::None);
-        assert_eq!(auto.feed(&frame(50), t(base, 1900), true), FeedResult::Trigger);
+        assert_eq!(
+            auto.feed(&frame(50), t(base, 1900), true),
+            FeedResult::Trigger
+        );
     }
 
     #[test]
@@ -239,7 +251,10 @@ mod tests {
         auto.feed(&frame(100), t(base, 100), true);
         assert_eq!(auto.feed(&frame(100), t(base, 900), true), FeedResult::None);
         auto.set_enabled(true);
-        assert_eq!(auto.feed(&frame(100), t(base, 1000), true), FeedResult::None);
+        assert_eq!(
+            auto.feed(&frame(100), t(base, 1000), true),
+            FeedResult::None
+        );
         for step in 11..18 {
             assert_eq!(
                 auto.feed(&frame(100), t(base, step * 100), true),
@@ -249,7 +264,10 @@ mod tests {
         }
         auto.feed(&frame(50), t(base, 1900), true);
         auto.feed(&frame(50), t(base, 2000), true);
-        assert_eq!(auto.feed(&frame(50), t(base, 2700), true), FeedResult::Trigger);
+        assert_eq!(
+            auto.feed(&frame(50), t(base, 2700), true),
+            FeedResult::Trigger
+        );
     }
 
     #[test]
@@ -265,7 +283,10 @@ mod tests {
             "bez wykrytego dokumentu nie wolno wyzwolić"
         );
         auto.feed(&frame(100), t(base, 1000), true);
-        assert_eq!(auto.feed(&frame(100), t(base, 1700), true), FeedResult::Trigger);
+        assert_eq!(
+            auto.feed(&frame(100), t(base, 1700), true),
+            FeedResult::Trigger
+        );
     }
 
     #[test]

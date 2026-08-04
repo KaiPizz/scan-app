@@ -124,10 +124,8 @@ mod tests {
     use super::*;
 
     fn test_store(name: &str) -> SessionStore {
-        let dir = std::env::temp_dir().join(format!(
-            "skaner-sesja-test-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("skaner-sesja-test-{}-{name}", std::process::id()));
         let store = SessionStore::at(dir);
         let _ = store.clear();
         store
@@ -136,7 +134,9 @@ mod tests {
     #[test]
     fn empty_session_loads_as_none() {
         let store = test_store("empty");
-        store.begin(Path::new("D:/dokumenty/faktury")).expect("begin");
+        store
+            .begin(Path::new("D:/dokumenty/faktury"))
+            .expect("begin");
         assert!(store.load_existing().is_none());
         store.clear().expect("clear");
     }
