@@ -3,7 +3,10 @@ use image::{DynamicImage, ImageReader, Rgb, RgbImage, imageops};
 use imageproc::edges::canny;
 use imageproc::geometric_transformations::{Border, Interpolation, Projection, warp_into};
 use imageproc::hough::{LineDetectionOptions, PolarLine, detect_lines};
-use printpdf::{Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, Pt, RawImage, XObjectTransform};
+use printpdf::{
+    ImageCompression, ImageOptimizationOptions, Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, Pt,
+    RawImage, XObjectTransform,
+};
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
@@ -299,7 +302,14 @@ pub fn save_pdf(path: &Path, pages: &[&ScannedPage]) -> Result<(), String> {
         pdf_pages.push(PdfPage::new(page_width, page_height, operations));
     }
     let save_options = PdfSaveOptions {
-        image_optimization: None,
+        image_optimization: Some(ImageOptimizationOptions {
+            quality: Some(0.93),
+            max_image_size: None,
+            dither_greyscale: None,
+            convert_to_greyscale: None,
+            auto_optimize: None,
+            format: Some(ImageCompression::Jpeg),
+        }),
         ..PdfSaveOptions::default()
     };
     let bytes = document

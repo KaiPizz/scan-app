@@ -63,25 +63,30 @@ SYNC + TEST filtered: `... cargo.exe test --release saved_pdf_keeps -- --nocaptu
 
 - [ ] **Step 3: Implement**
 
-In `save_pdf`, replace
-
-```rust
-    let bytes = document
-        .with_pages(pdf_pages)
-        .save(&PdfSaveOptions::default(), &mut Vec::new());
-```
-
-with
+Field-level finding during execution: `image_optimization: None` drops the DCTDecode
+path entirely (images re-encode as Flate — huge files, test fails with "brak strumienia
+JPEG"). The correct fix keeps optimization ON but disables only the size cap
+(`max_image_size` is what calls `resize_to_fit_size`). In `save_pdf`, replace the
+`PdfSaveOptions::default()` save call with:
 
 ```rust
     let save_options = PdfSaveOptions {
-        image_optimization: None,
+        image_optimization: Some(ImageOptimizationOptions {
+            quality: Some(0.93),
+            max_image_size: None,
+            dither_greyscale: None,
+            convert_to_greyscale: None,
+            auto_optimize: None,
+            format: Some(ImageCompression::Jpeg),
+        }),
         ..PdfSaveOptions::default()
     };
     let bytes = document
         .with_pages(pdf_pages)
         .save(&save_options, &mut Vec::new());
 ```
+
+(imports gain `ImageCompression, ImageOptimizationOptions` from `printpdf`).
 
 - [ ] **Step 4: TEST** — new test passes, whole suite green.
 
