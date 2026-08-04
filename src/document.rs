@@ -375,13 +375,16 @@ fn resize_to_fit(
     imageops::resize(image, width, height, filter)
 }
 
+const FLATTEN_COLS: usize = 12;
+const FLATTEN_ROWS: usize = 16;
+
 fn enhance_document(image: &mut RgbImage) {
     let width = image.width();
     let height = image.height();
-    if width < 20 || height < 20 {
+    if width < 60 || height < 60 {
         return;
     }
-    // Sample only the central region: page borders (dark mat) and lamp
+    // Global estimate from the central region: page borders (dark mat) and lamp
     // reflections near the edges must not skew the paper-color estimate.
     let x_range = width / 5..width - width / 5;
     let y_range = height / 5..height - height / 5;
@@ -410,12 +413,79 @@ fn enhance_document(image: &mut RgbImage) {
     if (0..3).any(|channel| papers[channel] <= lows[channel] + 60) {
         return;
     }
-    let scales: [f32; 3] =
-        std::array::from_fn(|channel| 242.0 / (papers[channel] - lows[channel]) as f32);
-    for pixel in image.pixels_mut() {
+
+    // Local background map: per-cell paper estimate, floored to the global
+    // estimate so ink-heavy cells don't over-brighten, then 3×3 smoothed.
+    let mut cell_hist = vec![[[0_u64; 256]; 3]; FLATTEN_COLS * FLATTEN_ROWS];
+    for y in (0..height).step_by(4) {
+        let row = (y as usize * FLATTEN_ROWS / height as usize).min(FLATTEN_ROWS - 1);
+        for x in (0..width).step_by(4) {
+            let col = (x as usize * FLATTEN_COLS / width as usize).min(FLATTEN_COLS - 1);
+            let pixel = image.get_pixel(x, y);
+            let cell = &mut cell_hist[row * FLATTEN_COLS + col];
+            for channel in 0..3 {
+                cell[channel][pixel[channel] as usize] += 1;
+            }
+        }
+    }
+    let mut raw_bg = vec![[0.0_f32; 3]; FLATTEN_COLS * FLATTEN_ROWS];
+    for (index, cell) in cell_hist.iter().enumerate() {
         for channel in 0..3 {
-            let adjusted =
-                (pixel[channel] as i32 - lows[channel] as i32) as f32 * scales[channel] + 5.0;
+            let floor = papers[channel] as f32 * 0.66;
+            raw_bg[index][channel] = (bright_mode(&cell[channel]) as f32).max(floor);
+        }
+    }
+    let mut background = vec![[0.0_f32; 3]; FLATTEN_COLS * FLATTEN_ROWS];
+    for row in 0..FLATTEN_ROWS {
+        for col in 0..FLATTEN_COLS {
+            let mut sums = [0.0_f32; 3];
+            let mut count = 0.0_f32;
+            for dr in -1_i32..=1 {
+                for dc in -1_i32..=1 {
+                    let nr = row as i32 + dr;
+                    let nc = col as i32 + dc;
+                    if (0..FLATTEN_ROWS as i32).contains(&nr)
+                        && (0..FLATTEN_COLS as i32).contains(&nc)
+                    {
+                        let neighbor = raw_bg[nr as usize * FLATTEN_COLS + nc as usize];
+                        for channel in 0..3 {
+                            sums[channel] += neighbor[channel];
+                        }
+                        count += 1.0;
+                    }
+                }
+            }
+            for channel in 0..3 {
+                background[row * FLATTEN_COLS + col][channel] = sums[channel] / count;
+            }
+        }
+    }
+
+    // Bilinear-interpolate the background map and normalize every pixel so the
+    // local paper level maps to 247 and the global ink level stays dark.
+    let cell_w = width as f32 / FLATTEN_COLS as f32;
+    let cell_h = height as f32 / FLATTEN_ROWS as f32;
+    let sample_bg = |fx: f32, fy: f32, channel: usize| -> f32 {
+        let gx = (fx / cell_w - 0.5).clamp(0.0, FLATTEN_COLS as f32 - 1.0);
+        let gy = (fy / cell_h - 0.5).clamp(0.0, FLATTEN_ROWS as f32 - 1.0);
+        let x0 = gx.floor() as usize;
+        let y0 = gy.floor() as usize;
+        let x1 = (x0 + 1).min(FLATTEN_COLS - 1);
+        let y1 = (y0 + 1).min(FLATTEN_ROWS - 1);
+        let tx = gx - x0 as f32;
+        let ty = gy - y0 as f32;
+        let top = background[y0 * FLATTEN_COLS + x0][channel] * (1.0 - tx)
+            + background[y0 * FLATTEN_COLS + x1][channel] * tx;
+        let bottom = background[y1 * FLATTEN_COLS + x0][channel] * (1.0 - tx)
+            + background[y1 * FLATTEN_COLS + x1][channel] * tx;
+        top * (1.0 - ty) + bottom * ty
+    };
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        for channel in 0..3 {
+            let bg = sample_bg(x as f32, y as f32, channel);
+            let low = lows[channel] as f32;
+            let range = (bg - low).max(40.0);
+            let adjusted = (pixel[channel] as f32 - low) * 242.0 / range + 5.0;
             pixel[channel] = adjusted.round().clamp(0.0, 255.0) as u8;
         }
     }
@@ -522,6 +592,35 @@ mod tests {
         println!("wykryte narożniki: {corners:?}");
         let page = process_page(&image, corners).expect("przetworzenie strony");
         page.review_image.save(output).expect("zapis podglądu");
+    }
+
+    #[test]
+    fn flattens_uneven_illumination() {
+        let mut image = RgbImage::new(400, 560);
+        for y in 0..560 {
+            for x in 0..400 {
+                let base = 150.0 + 80.0 * (x as f32 / 400.0);
+                image.put_pixel(
+                    x,
+                    y,
+                    Rgb([base as u8, (base * 1.02) as u8, (base * 1.12).min(255.0) as u8]),
+                );
+            }
+        }
+        for y in 200..240 {
+            for x in 80..320 {
+                image.put_pixel(x, y, Rgb([35, 40, 60]));
+            }
+        }
+        enhance_document(&mut image);
+        for (x, y) in [(30_u32, 30_u32), (370, 30), (30, 530), (370, 530), (200, 400)] {
+            let sample = image.get_pixel(x, y);
+            assert!(
+                sample[0] >= 232 && sample[1] >= 232 && sample[2] >= 232,
+                "tło w ({x},{y}) nie jest białe: {:?}",
+                sample
+            );
+        }
     }
 
     #[test]
