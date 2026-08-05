@@ -376,11 +376,13 @@ impl DocumentScannerApp {
                         }
                     }
                     let recent_count = self.settings.recent_documents.len();
+                    let library_root = self.library_root.clone();
+                    let snapshot = &self.library_snapshot;
                     self.settings.recent_documents.retain(|path| {
-                        self.library_snapshot
-                            .pdfs
-                            .iter()
-                            .any(|pdf| &pdf.path == path)
+                        // Entries under a different library root are kept so
+                        // switching roots back and forth preserves history.
+                        !path.starts_with(&library_root)
+                            || snapshot.pdfs.iter().any(|pdf| &pdf.path == path)
                     });
                     if self.settings.recent_documents.len() != recent_count {
                         let _ = save_settings(&self.settings);
@@ -2799,7 +2801,9 @@ impl DocumentScannerApp {
                                 self.settings.library_root = Some(path.clone());
                                 self.settings.last_folder = None;
                                 self.settings.last_folder_path = None;
-                                self.settings.recent_documents.clear();
+                                // recent_documents stay: entries under other
+                                // roots survive a switch-back, and the prune
+                                // in poll_library only checks the active root.
                                 self.selected_folder = None;
                                 self.folders.clear();
                                 self.pdfs.clear();

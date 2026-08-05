@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub enum CameraEvent {
     Ready {
@@ -37,7 +37,19 @@ impl CameraController {
         let thread_stop = Arc::clone(&stop_requested);
         let worker = thread::spawn(move || {
             if let Err(error) = run_camera(&sender, &thread_image, &thread_stop) {
-                let _ = sender.send(CameraEvent::Error(error));
+                // Bounded, non-blocking delivery: an unbounded send here could
+                // wedge this thread forever against a full channel and turn
+                // `stop()` into a deadlock.
+                let mut event = CameraEvent::Error(error);
+                for _ in 0..20 {
+                    match sender.try_send(event) {
+                        Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+                        Err(TrySendError::Full(rejected)) => {
+                            event = rejected;
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                    }
+                }
             }
         });
         Self {
@@ -66,7 +78,16 @@ impl CameraController {
     pub fn stop(&mut self) {
         self.stop_requested.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            // A wedged MSMF read (dead USB, driver hang) must not freeze the
+            // UI or block app exit: wait briefly, then detach — the thread
+            // exits on its own once the blocking call finally returns.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
         }
     }
 }

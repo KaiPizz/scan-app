@@ -1157,7 +1157,11 @@ fn handle_keyboard(
     if !search_has_focus
         && ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::A))
     {
-        state.selected = documents.iter().map(|pdf| pdf.path.clone()).collect();
+        // Same semantics as the header checkbox: add the visible documents
+        // without silently dropping a selection hidden by the current filter.
+        state
+            .selected
+            .extend(documents.iter().map(|pdf| pdf.path.clone()));
         state.anchor = documents.first().map(|pdf| pdf.path.clone());
     }
     if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
