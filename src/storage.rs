@@ -447,6 +447,62 @@ fn settings_path() -> Option<PathBuf> {
         .map(|dirs| dirs.config_dir().join("ustawienia.ron"))
 }
 
+/// Held for the whole process lifetime. Two instances would share one
+/// crash-recovery session directory and silently race its manifest, so a
+/// second instance must not start.
+pub struct InstanceLock {
+    _file: fs::File,
+}
+
+/// `Ok(Some(_))` — lock acquired. `Ok(None)` — locking unavailable (missing
+/// profile dir, exotic filesystem error): run anyway rather than block the
+/// scanner. `Err(_)` — another instance definitively holds the lock.
+pub fn acquire_instance_lock() -> Result<Option<InstanceLock>, String> {
+    let Some(dirs) = ProjectDirs::from("pl", "SkanerDokumentow", "Skaner dokumentów") else {
+        return Ok(None);
+    };
+    let dir = dirs.data_dir();
+    if fs::create_dir_all(dir).is_err() {
+        return Ok(None);
+    }
+    let path = dir.join("instancja.lock");
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(&path)
+        {
+            Ok(file) => Ok(Some(InstanceLock { _file: file })),
+            Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Err(
+                "Skaner dokumentów jest już uruchomiony na tym komputerze.".to_owned(),
+            ),
+            Err(_) => Ok(None),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        // Non-Windows builds exist only for tests; a plain open keeps the
+        // code path exercised without real exclusivity.
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map(|file| Some(InstanceLock { _file: file }))
+            .or(Ok(None))
+    }
+}
+
 fn is_pdf(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
         && has_pdf_extension(path)
@@ -612,6 +668,22 @@ mod tests {
             "Akta"
         );
         assert_eq!(next_sequence_name(&[], "  Akta klienta  "), "Akta klienta");
+    }
+
+    // Uses the real profile directory: fails if the scanner app itself is
+    // running while the tests execute — close it first.
+    #[cfg(windows)]
+    #[test]
+    fn second_instance_lock_is_rejected() {
+        let first = acquire_instance_lock()
+            .expect("first acquire")
+            .expect("first lock");
+        assert!(
+            acquire_instance_lock().is_err(),
+            "druga instancja musi zostać odrzucona"
+        );
+        drop(first);
+        assert!(acquire_instance_lock().expect("re-acquire").is_some());
     }
 
     #[test]

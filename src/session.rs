@@ -28,6 +28,18 @@ pub struct RecoveredSession {
     pub folder_path: PathBuf,
     pub pages: Vec<RecoveredPage>,
     pub skipped_pages: usize,
+    /// Highest page id the session ever recorded — including pages whose
+    /// files were lost. The next capture must start above it so ids are
+    /// never reused against a stale manifest position.
+    pub highest_page_id: u64,
+}
+
+enum ManifestState {
+    Missing,
+    Parsed(Manifest),
+    /// The file exists but cannot be read or parsed. Page files may still be
+    /// intact, so this state must never lead to a silent wipe.
+    Corrupt,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -97,9 +109,22 @@ impl SessionStore {
         let _ = fs::remove_file(metadata);
     }
 
+    fn manifest_state(&self) -> ManifestState {
+        match fs::read_to_string(self.manifest_path()) {
+            Ok(contents) => match ron::from_str(&contents) {
+                Ok(manifest) => ManifestState::Parsed(manifest),
+                Err(_) => ManifestState::Corrupt,
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ManifestState::Missing,
+            Err(_) => ManifestState::Corrupt,
+        }
+    }
+
     fn read_manifest(&self) -> Option<Manifest> {
-        let contents = fs::read_to_string(self.manifest_path()).ok()?;
-        ron::from_str(&contents).ok()
+        match self.manifest_state() {
+            ManifestState::Parsed(manifest) => Some(manifest),
+            ManifestState::Missing | ManifestState::Corrupt => None,
+        }
     }
 
     fn write_manifest(&self, manifest: &Manifest) -> Result<(), String> {
@@ -175,7 +200,14 @@ impl SessionStore {
     }
 
     pub fn load_existing(&self) -> Option<RecoveredSession> {
-        let manifest = self.read_manifest()?;
+        match self.manifest_state() {
+            ManifestState::Parsed(manifest) => self.load_from_manifest(manifest),
+            ManifestState::Missing => None,
+            ManifestState::Corrupt => self.salvage_orphan_pages(),
+        }
+    }
+
+    fn load_from_manifest(&self, manifest: Manifest) -> Option<RecoveredSession> {
         if manifest.page_ids.is_empty() {
             return None;
         }
@@ -204,11 +236,95 @@ impl SessionStore {
                     .unwrap_or(0),
             });
         }
+        let highest_page_id = manifest.page_ids.iter().copied().max().unwrap_or(0);
         Some(RecoveredSession {
             folder_path: manifest.folder_path,
             pages,
             skipped_pages,
+            highest_page_id,
         })
+    }
+
+    /// Recovers page files next to an unreadable manifest instead of letting
+    /// the next `begin()` wipe them, and writes a fresh manifest so the
+    /// restored session can keep persisting.
+    fn salvage_orphan_pages(&self) -> Option<RecoveredSession> {
+        let mut revisions_by_id: BTreeMap<u64, Vec<Option<u64>>> = BTreeMap::new();
+        for entry in fs::read_dir(&self.dir).ok()?.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Some((id, revision, kind)) = parse_session_file_name(name)
+                && matches!(kind, SessionFileKind::Page | SessionFileKind::Original)
+            {
+                revisions_by_id.entry(id).or_default().push(revision);
+            }
+        }
+
+        let mut pages = Vec::new();
+        let mut manifest = Manifest {
+            folder_path: PathBuf::new(),
+            started_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0),
+            page_ids: Vec::new(),
+            page_revisions: BTreeMap::new(),
+        };
+        for (id, mut revisions) in revisions_by_id {
+            revisions.sort_unstable();
+            let Some(revision) = revisions.pop() else {
+                continue;
+            };
+            let (page_path, original_path, metadata_path) = self.paths_for(id, revision);
+            let jpeg = fs::read(page_path).ok();
+            let original_jpeg = fs::read(original_path).ok();
+            if jpeg.is_none() && original_jpeg.is_none() {
+                continue;
+            }
+            let metadata = fs::read_to_string(metadata_path)
+                .ok()
+                .and_then(|contents| ron::from_str::<PageMetadata>(&contents).ok());
+            manifest.page_ids.push(id);
+            if let Some(revision) = revision {
+                manifest.page_revisions.insert(id, revision);
+            }
+            pages.push(RecoveredPage {
+                id,
+                jpeg,
+                original_jpeg,
+                corners: metadata.as_ref().map(|metadata| metadata.corners),
+                quarter_turns: metadata
+                    .as_ref()
+                    .map(|metadata| metadata.quarter_turns % 4)
+                    .unwrap_or(0),
+            });
+        }
+        if pages.is_empty() {
+            return None;
+        }
+        let highest_page_id = manifest.page_ids.iter().copied().max().unwrap_or(0);
+        // Best effort: a failed rewrite only means later page writes will
+        // surface the same error through the session-broken toast.
+        let _ = self.write_manifest(&manifest);
+        Some(RecoveredSession {
+            folder_path: PathBuf::new(),
+            pages,
+            skipped_pages: 0,
+            highest_page_id,
+        })
+    }
+
+    /// Points the persisted session at a different destination folder, e.g.
+    /// when a recovered session is restored into the library root because its
+    /// original folder no longer exists.
+    pub fn set_folder(&self, folder: &Path) -> Result<(), String> {
+        let Some(mut manifest) = self.read_manifest() else {
+            return Err("Brak manifestu sesji.".to_owned());
+        };
+        manifest.folder_path = folder.to_path_buf();
+        self.write_manifest(&manifest)
     }
 
     pub fn clear(&self) -> Result<(), String> {
@@ -217,6 +333,27 @@ impl SessionStore {
         }
         Ok(())
     }
+}
+
+enum SessionFileKind {
+    Page,
+    Original,
+    Metadata,
+}
+
+fn parse_session_file_name(name: &str) -> Option<(u64, Option<u64>, SessionFileKind)> {
+    let (head, kind) = if let Some(head) = name.strip_suffix(".original.jpg") {
+        (head, SessionFileKind::Original)
+    } else if let Some(head) = name.strip_suffix(".crop.ron") {
+        (head, SessionFileKind::Metadata)
+    } else {
+        (name.strip_suffix(".jpg")?, SessionFileKind::Page)
+    };
+    let (id_part, revision) = match head.split_once(".r") {
+        Some((id_part, revision)) => (id_part, Some(revision.parse::<u64>().ok()?)),
+        None => (head, None),
+    };
+    Some((id_part.parse::<u64>().ok()?, revision, kind))
 }
 
 fn io_error(error: std::io::Error) -> String {
@@ -350,6 +487,53 @@ mod tests {
         assert_eq!(recovered.pages[0].original_jpeg, None);
         assert_eq!(recovered.pages[0].corners, None);
         assert_eq!(recovered.pages[0].quarter_turns, 0);
+        store.clear().expect("clear");
+    }
+
+    #[test]
+    fn corrupt_manifest_salvages_pages_instead_of_discarding() {
+        let store = test_store("corrupt-manifest");
+        store.begin(Path::new("D:/dokumenty")).expect("begin");
+        store
+            .write_page(3, b"trzecia", b"oryginal-3", corners(), 1)
+            .expect("write 3");
+        store
+            .write_page(8, b"osma", b"oryginal-8", corners(), 0)
+            .expect("write 8");
+        fs::write(store.manifest_path(), "###nie-ron###").expect("corrupt manifest");
+
+        let recovered = store.load_existing().expect("salvage");
+        assert_eq!(recovered.folder_path, PathBuf::new());
+        let ids: Vec<u64> = recovered.pages.iter().map(|page| page.id).collect();
+        assert_eq!(ids, vec![3, 8]);
+        assert_eq!(
+            recovered.pages[0].jpeg.as_deref(),
+            Some(b"trzecia".as_slice())
+        );
+        assert_eq!(recovered.pages[0].corners, Some(corners()));
+        assert_eq!(recovered.pages[0].quarter_turns, 1);
+        assert_eq!(recovered.highest_page_id, 8);
+        // Salvage rebuilds the manifest so the restored session keeps persisting.
+        store
+            .write_page(9, b"dziewiata", b"o9", corners(), 0)
+            .expect("write after salvage");
+        store.clear().expect("clear");
+    }
+
+    #[test]
+    fn highest_page_id_includes_pages_with_lost_files() {
+        let store = test_store("highest-id");
+        store.begin(Path::new("D:/dokumenty")).expect("begin");
+        store.write_page(2, b"a", b"oa", corners(), 0).expect("write 2");
+        store.write_page(7, b"b", b"ob", corners(), 0).expect("write 7");
+        let manifest = store.read_manifest().expect("manifest");
+        let revision = manifest.page_revisions.get(&7).copied();
+        store.remove_revision_files(7, revision);
+
+        let recovered = store.load_existing().expect("session");
+        assert_eq!(recovered.pages.len(), 1);
+        assert_eq!(recovered.skipped_pages, 1);
+        assert_eq!(recovered.highest_page_id, 7);
         store.clear().expect("clear");
     }
 

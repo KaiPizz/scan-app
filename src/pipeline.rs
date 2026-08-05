@@ -1,4 +1,6 @@
-use crate::document::{CropPoint, ScannedPage, detect_document_corners, process_page};
+use crate::document::{
+    CropPoint, ScannedPage, detect_document_corners, process_page, process_page_with,
+};
 use image::RgbImage;
 use image::codecs::jpeg::JpegEncoder;
 use std::sync::Arc;
@@ -42,6 +44,8 @@ enum Job {
         frame: Arc<RgbImage>,
         corners: [CropPoint; 4],
     },
+    #[cfg(test)]
+    TestPanic,
 }
 
 pub struct ProcessingPipeline {
@@ -81,6 +85,24 @@ impl ProcessingPipeline {
 
     pub fn try_event(&self) -> Option<PipelineEvent> {
         self.events.try_recv().ok()
+    }
+
+    /// A finished worker while the job channel is still open means the thread
+    /// panicked — its in-flight and queued jobs are gone. The caller must
+    /// resolve pending slots and start a fresh pipeline.
+    pub fn is_dead(&self) -> bool {
+        self.jobs.is_some()
+            && self
+                .worker
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+    }
+
+    #[cfg(test)]
+    pub fn submit_test_panic(&self) -> bool {
+        self.jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.try_send(Job::TestPanic).is_ok())
     }
 
     pub fn shutdown(&mut self) {
@@ -134,7 +156,7 @@ fn process_job(job: &Job) -> PipelineEvent {
                 },
             }
         }
-        Job::Reprocess { id, frame, corners } => match process_page(frame, *corners) {
+        Job::Reprocess { id, frame, corners } => match process_page_with(frame, *corners, false) {
             Ok(page) => PipelineEvent::ReprocessDone {
                 id: *id,
                 page,
@@ -142,6 +164,8 @@ fn process_job(job: &Job) -> PipelineEvent {
             },
             Err(error) => PipelineEvent::ReprocessFailed { id: *id, error },
         },
+        #[cfg(test)]
+        Job::TestPanic => panic!("wymuszona awaria wątku przetwarzania (test)"),
     }
 }
 
@@ -200,12 +224,19 @@ mod tests {
         for event in events {
             match event {
                 PipelineEvent::PageReady {
+                    id,
                     page,
                     original_jpeg,
                     corners,
-                    ..
                 } => {
-                    assert_eq!((page.width, page.height), (A4_WIDTH_PX, A4_HEIGHT_PX));
+                    // Frame 7 is landscape (400x300), frame 9 portrait (300x400);
+                    // the warp canvas must follow the detected orientation.
+                    let expected = if id == 7 {
+                        (A4_HEIGHT_PX, A4_WIDTH_PX)
+                    } else {
+                        (A4_WIDTH_PX, A4_HEIGHT_PX)
+                    };
+                    assert_eq!((page.width, page.height), expected);
                     assert!(
                         original_jpeg.starts_with(&[0xFF, 0xD8]),
                         "oryginał nie jest JPEG"
@@ -241,11 +272,24 @@ mod tests {
                 corners: returned,
             }) => {
                 assert_eq!(*id, 3);
-                assert_eq!((page.width, page.height), (A4_WIDTH_PX, A4_HEIGHT_PX));
+                // The 0.2-0.8 quad on a 400x300 frame is landscape.
+                assert_eq!((page.width, page.height), (A4_HEIGHT_PX, A4_WIDTH_PX));
                 assert_eq!(returned, &corners);
             }
             _ => panic!("oczekiwano ReprocessDone"),
         }
+    }
+
+    #[test]
+    fn panicked_worker_is_reported_as_dead() {
+        let pipeline = ProcessingPipeline::start();
+        assert!(!pipeline.is_dead());
+        assert!(pipeline.submit_test_panic());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pipeline.is_dead() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(pipeline.is_dead(), "awaria wątku nie została wykryta");
     }
 
     #[test]

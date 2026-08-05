@@ -192,30 +192,60 @@ pub fn detect_document(image: &RgbImage) -> DetectResult {
 }
 
 pub fn process_page(image: &RgbImage, corners: [CropPoint; 4]) -> Result<ScannedPage, String> {
-    let mut output = warp_only(image, corners)?;
+    process_page_with(image, corners, true)
+}
+
+/// `expand_detected` grows the quad slightly to swallow the detection shadow.
+/// Hand-placed editor corners must be applied exactly as dragged, so reprocess
+/// jobs pass `false`.
+pub fn process_page_with(
+    image: &RgbImage,
+    corners: [CropPoint; 4],
+    expand_detected: bool,
+) -> Result<ScannedPage, String> {
+    let mut output = warp_only(image, corners, expand_detected)?;
     enhance_document(&mut output);
     page_from_image(output)
 }
 
 /// Geometry only: perspective-corrects the page onto an A4 canvas without any
 /// tone or colour work (used by the version-comparison harness).
-fn warp_only(image: &RgbImage, corners: [CropPoint; 4]) -> Result<RgbImage, String> {
-    let corners = expand_corners(corners, 0.018);
+///
+/// The canvas orientation follows the detected quad: a page lying sideways is
+/// warped onto a landscape A4 canvas instead of being stretched onto portrait.
+fn warp_only(
+    image: &RgbImage,
+    corners: [CropPoint; 4],
+    expand_detected: bool,
+) -> Result<RgbImage, String> {
+    let corners = if expand_detected {
+        expand_corners(corners, 0.018)
+    } else {
+        corners
+    };
     let source = corners.map(|point| {
         (
             point.x.clamp(0.0, 1.0) * (image.width() - 1) as f32,
             point.y.clamp(0.0, 1.0) * (image.height() - 1) as f32,
         )
     });
+    let distance = |left: (f32, f32), right: (f32, f32)| (right.0 - left.0).hypot(right.1 - left.1);
+    let source_width = (distance(source[0], source[1]) + distance(source[3], source[2])) * 0.5;
+    let source_height = (distance(source[0], source[3]) + distance(source[1], source[2])) * 0.5;
+    let (target_width, target_height) = if source_width > source_height {
+        (A4_HEIGHT_PX, A4_WIDTH_PX)
+    } else {
+        (A4_WIDTH_PX, A4_HEIGHT_PX)
+    };
     let target = [
         (0.0, 0.0),
-        ((A4_WIDTH_PX - 1) as f32, 0.0),
-        ((A4_WIDTH_PX - 1) as f32, (A4_HEIGHT_PX - 1) as f32),
-        (0.0, (A4_HEIGHT_PX - 1) as f32),
+        ((target_width - 1) as f32, 0.0),
+        ((target_width - 1) as f32, (target_height - 1) as f32),
+        (0.0, (target_height - 1) as f32),
     ];
     let projection = Projection::from_control_points(source, target)
         .ok_or_else(|| "Nieprawidłowe ustawienie narożników kadrowania.".to_owned())?;
-    let mut output = RgbImage::from_pixel(A4_WIDTH_PX, A4_HEIGHT_PX, Rgb([255, 255, 255]));
+    let mut output = RgbImage::from_pixel(target_width, target_height, Rgb([255, 255, 255]));
     warp_into(
         image,
         projection,
@@ -935,6 +965,29 @@ mod tests {
         assert_eq!(review.dimensions(), (85, 120));
     }
 
+    #[test]
+    fn warp_canvas_follows_quad_orientation() {
+        let image = RgbImage::from_pixel(400, 300, Rgb([245, 245, 245]));
+        let landscape = [
+            CropPoint::new(0.1, 0.2),
+            CropPoint::new(0.9, 0.2),
+            CropPoint::new(0.9, 0.8),
+            CropPoint::new(0.1, 0.8),
+        ];
+        let warped = warp_only(&image, landscape, false).expect("landscape warp");
+        assert_eq!(warped.dimensions(), (A4_HEIGHT_PX, A4_WIDTH_PX));
+
+        let portrait_image = RgbImage::from_pixel(300, 400, Rgb([245, 245, 245]));
+        let portrait = [
+            CropPoint::new(0.2, 0.1),
+            CropPoint::new(0.8, 0.1),
+            CropPoint::new(0.8, 0.9),
+            CropPoint::new(0.2, 0.9),
+        ];
+        let warped = warp_only(&portrait_image, portrait, false).expect("portrait warp");
+        assert_eq!(warped.dimensions(), (A4_WIDTH_PX, A4_HEIGHT_PX));
+    }
+
     /// Renders one raw camera frame through every enhancement generation so the
     /// versions can be compared side by side on identical input.
     /// RAW_FRAME=<in.png> OUT_DIR=<dir> cargo test --release variants -- --ignored
@@ -949,7 +1002,7 @@ mod tests {
             "detect: confident={} corners={:?}",
             detected.confident, detected.corners
         );
-        let warped = warp_only(&image, detected.corners).expect("warp");
+        let warped = warp_only(&image, detected.corners, true).expect("warp");
 
         let mut raw = warped.clone();
         save_variant(&out_dir, "0-bez-korekcji", &raw);

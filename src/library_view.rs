@@ -172,7 +172,7 @@ pub fn show_library_view(
     let documents = std::mem::take(&mut state.visible_documents);
     handle_keyboard(ui, state, input.keyboard_enabled, &documents);
 
-    let mut actions = keyboard_actions(ui, state, input.keyboard_enabled, &documents);
+    let mut actions = keyboard_actions(ui, state, input.keyboard_enabled);
     let available = ui.available_size();
     let show_details = available.x >= DETAILS_BREAKPOINT;
     let details_width = if show_details { DETAILS_WIDTH } else { 0.0 };
@@ -1091,7 +1091,10 @@ fn refresh_visible_cache(state: &mut LibraryViewState, input: LibraryViewInput<'
 
 fn visible_documents_for_key(snapshot: &LibrarySnapshot, key: &VisibleCacheKey) -> Vec<PdfInfo> {
     if !key.query.trim().is_empty() {
-        return search_and_sort(snapshot, &key.query, key.sort, None);
+        // Inside a folder the search stays scoped to that folder — a global
+        // result list would show identically named files from other folders
+        // while the folder column is hidden.
+        return search_and_sort(snapshot, &key.query, key.sort, key.folder_scope.as_deref());
     }
     if let Some(folder) = key.folder_scope.as_deref() {
         return search_and_sort(snapshot, "", key.sort, Some(folder));
@@ -1166,12 +1169,7 @@ fn handle_keyboard(
     }
 }
 
-fn keyboard_actions(
-    ui: &egui::Ui,
-    state: &LibraryViewState,
-    enabled: bool,
-    documents: &[PdfInfo],
-) -> Vec<LibraryAction> {
+fn keyboard_actions(ui: &egui::Ui, state: &LibraryViewState, enabled: bool) -> Vec<LibraryAction> {
     if !enabled {
         return Vec::new();
     }
@@ -1180,14 +1178,12 @@ fn keyboard_actions(
     }
     let selected = state.selected_paths();
     let mut actions = Vec::new();
-    if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-        let target = selected
-            .first()
-            .cloned()
-            .or_else(|| documents.first().map(|pdf| pdf.path.clone()));
-        if let Some(path) = target {
-            actions.push(LibraryAction::Open(path));
-        }
+    // Enter only confirms an explicit selection — with nothing selected it
+    // must not launch whatever happens to sort first.
+    if ui.input(|input| input.key_pressed(egui::Key::Enter))
+        && let Some(path) = selected.first().cloned()
+    {
+        actions.push(LibraryAction::Open(path));
     }
     if selected.len() == 1 && ui.input(|input| input.key_pressed(egui::Key::F2)) {
         actions.push(LibraryAction::Rename(selected[0].clone()));
@@ -1355,6 +1351,35 @@ mod tests {
         let recent = visible_documents_for_key(&snapshot, &key);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].path, old.path);
+    }
+
+    #[test]
+    fn search_inside_a_folder_stays_scoped_to_that_folder() {
+        let folder_a = PathBuf::from("library").join("Klient A");
+        let folder_b = PathBuf::from("library").join("Klient B");
+        let ours = pdf("A01.pdf", &folder_a, 10);
+        let theirs = pdf("A01.pdf", &folder_b, 20);
+        let snapshot = LibrarySnapshot {
+            root: PathBuf::from("library"),
+            folders: Vec::new(),
+            pdfs: vec![ours.clone(), theirs.clone()],
+        };
+        let mut key = VisibleCacheKey {
+            snapshot_revision: 1,
+            query: "A01".to_owned(),
+            sort: SortMode::Name,
+            section: LibrarySection::All,
+            folder_scope: Some(folder_a.clone()),
+            recent_documents: Vec::new(),
+        };
+
+        let scoped = visible_documents_for_key(&snapshot, &key);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].path, ours.path);
+
+        key.folder_scope = None;
+        let global = visible_documents_for_key(&snapshot, &key);
+        assert_eq!(global.len(), 2);
     }
 
     #[test]

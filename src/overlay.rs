@@ -51,6 +51,16 @@ impl OverlayDetector {
     pub fn latest(&self) -> Option<DetectResult> {
         self.output.lock().ok().and_then(|slot| *slot)
     }
+
+    /// A finished worker before `stop` was requested means the detector
+    /// thread panicked; the caller should start a fresh one.
+    pub fn is_dead(&self) -> bool {
+        !self.stop.load(Ordering::Acquire)
+            && self
+                .worker
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+    }
 }
 
 impl Drop for OverlayDetector {

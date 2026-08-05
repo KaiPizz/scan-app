@@ -77,6 +77,15 @@ enum PendingFileOperation {
     Recycle,
 }
 
+#[derive(PartialEq, Eq)]
+struct SaveTargetKey {
+    filename: String,
+    folder: Option<PathBuf>,
+    editing_target: Option<PathBuf>,
+    library_revision: u64,
+}
+
+#[derive(Clone)]
 struct SavePlan {
     path: PathBuf,
     mode: SaveMode,
@@ -121,6 +130,9 @@ pub struct DocumentScannerApp {
     camera: Option<CameraController>,
     camera_status: String,
     camera_ready: bool,
+    camera_failed: bool,
+    save_target_cache: Option<(SaveTargetKey, Result<SavePlan, String>)>,
+    last_overlay_submit: Option<Instant>,
     preview_texture: Option<TextureHandle>,
     preview_size: [usize; 2],
 
@@ -198,6 +210,9 @@ impl DocumentScannerApp {
             camera: None,
             camera_status: String::new(),
             camera_ready: false,
+            camera_failed: false,
+            save_target_cache: None,
+            last_overlay_submit: None,
             preview_texture: None,
             preview_size: [0, 0],
             slots: Vec::new(),
@@ -495,6 +510,7 @@ impl DocumentScannerApp {
         self.stop_camera();
         self.camera_status = "Łączenie z IRIScan Visualizer 7…".to_owned();
         self.camera_ready = false;
+        self.camera_failed = false;
         self.preview_texture = None;
         self.camera = Some(CameraController::start());
         self.screen = Screen::ScanHub;
@@ -527,20 +543,31 @@ impl DocumentScannerApp {
                 CameraEvent::Preview(image) => {
                     if live_preview {
                         self.update_preview_texture(context, &image);
-                        if let Some(overlay) = &self.overlay {
+                        // The detector samples at ~3 Hz; cloning the ~3.7 MB
+                        // preview for every camera frame would be wasted work.
+                        if let Some(overlay) = &self.overlay
+                            && self
+                                .last_overlay_submit
+                                .is_none_or(|at| at.elapsed() >= Duration::from_millis(300))
+                        {
                             overlay.submit(image.clone());
+                            self.last_overlay_submit = Some(Instant::now());
                         }
                         self.pending_preview = Some(image);
                     }
                 }
                 CameraEvent::Error(error) => {
                     self.camera_ready = false;
+                    self.camera_failed = true;
                     self.preview_texture = None;
                     self.camera_status = error;
+                    if let Some(camera) = &self.camera {
+                        camera.clear_latest_frame();
+                    }
                 }
             }
         }
-        if self.screen == Screen::ScanHub && live_preview {
+        if self.screen == Screen::ScanHub && live_preview && !self.camera_failed {
             context.request_repaint_after(Duration::from_millis(35));
         }
     }
@@ -557,6 +584,12 @@ impl DocumentScannerApp {
     }
 
     fn capture(&mut self, manual: bool) -> bool {
+        if !self.camera_ready {
+            if manual {
+                self.message = Some("Poczekaj, aż pojawi się obraz z kamery.".to_owned());
+            }
+            return false;
+        }
         let Some(frame) = self
             .camera
             .as_ref()
@@ -600,7 +633,11 @@ impl DocumentScannerApp {
 
     fn poll_pipeline(&mut self, context: &egui::Context) {
         let mut events = Vec::new();
+        let mut pipeline_dead = false;
         if let Some(pipeline) = &self.pipeline {
+            // Read the death flag before draining: an event arriving between
+            // the drain and the check must not be mistaken for a lost job.
+            pipeline_dead = pipeline.is_dead();
             while let Some(event) = pipeline.try_event() {
                 events.push(event);
             }
@@ -729,9 +766,55 @@ impl DocumentScannerApp {
                 }
             }
         }
+        if pipeline_dead {
+            self.recover_dead_pipeline();
+        }
         if self.pending_jobs > 0 {
             context.request_repaint_after(Duration::from_millis(100));
         }
+    }
+
+    /// The worker thread panicked: its in-flight and queued jobs are gone.
+    /// Turn the affected slots into visible failures and start a fresh worker
+    /// so scanning can continue — the crash-recovery copy stays untouched.
+    fn recover_dead_pipeline(&mut self) {
+        self.pipeline = Some(ProcessingPipeline::start());
+        self.pending_jobs = 0;
+        let mut lost_pages = 0;
+        for entry in &mut self.slots {
+            match std::mem::replace(&mut entry.slot, PageSlot::Processing) {
+                PageSlot::Processing => {
+                    lost_pages += 1;
+                    entry.slot = PageSlot::Failed {
+                        original_jpeg: Vec::new(),
+                        error: "Przetwarzanie tej strony uległo awarii. Usuń ją i zeskanuj ponownie."
+                            .to_owned(),
+                        quarter_turns: 0,
+                    };
+                }
+                PageSlot::Reprocessing {
+                    original_jpeg,
+                    quarter_turns,
+                    previous,
+                } => {
+                    lost_pages += 1;
+                    entry.slot = rollback_reprocessing(
+                        previous,
+                        original_jpeg,
+                        quarter_turns,
+                        "Przetwarzanie kadru uległo awarii.".to_owned(),
+                    );
+                }
+                other => entry.slot = other,
+            }
+        }
+        self.message = Some(if lost_pages > 0 {
+            format!(
+                "Moduł przetwarzania stron uległ awarii i został uruchomiony ponownie. Dotknięte strony ({lost_pages}) oznaczono symbolem ⚠. Wcześniej zeskanowane strony są bezpieczne."
+            )
+        } else {
+            "Moduł przetwarzania stron uległ awarii i został uruchomiony ponownie.".to_owned()
+        });
     }
 
     fn can_save(&self) -> bool {
@@ -743,8 +826,27 @@ impl DocumentScannerApp {
                 .all(|entry| matches!(entry.slot, PageSlot::Ready(_)))
     }
 
-    fn can_submit_save(&self) -> bool {
-        self.can_save() && self.resolve_save_target().is_ok()
+    /// `resolve_save_target` probes the disk (`unique_pdf_path`), so the
+    /// review screen must not call it every frame — the result is cached
+    /// until the filename, folder, edit target or library snapshot changes.
+    fn cached_save_target(&mut self) -> Result<SavePlan, String> {
+        let key = SaveTargetKey {
+            filename: self.filename.clone(),
+            folder: self
+                .selected_folder
+                .as_ref()
+                .map(|folder| folder.path.clone()),
+            editing_target: self.editing_target.clone(),
+            library_revision: self.library_revision,
+        };
+        if let Some((cached_key, result)) = &self.save_target_cache
+            && cached_key == &key
+        {
+            return result.clone();
+        }
+        let result = self.resolve_save_target();
+        self.save_target_cache = Some((key, result.clone()));
+        result
     }
 
     fn has_active_workflow(&self) -> bool {
@@ -1094,6 +1196,11 @@ impl DocumentScannerApp {
             pdf_count: 0,
             modified_secs: 0,
         });
+        // The session may have been redirected (original folder gone → library
+        // root); keep the persisted manifest pointing at the actual target.
+        if let Some(session) = &self.session {
+            let _ = session.set_folder(&recovered.folder_path);
+        }
         self.slots.clear();
         self.selected_slot = None;
         self.pending_jobs = 0;
@@ -1106,7 +1213,7 @@ impl DocumentScannerApp {
             self.autocapture.set_enabled(false);
         }
         self.session_broken = false;
-        let mut max_id = 0;
+        let mut max_id = recovered.highest_page_id;
         for recovered_page in recovered.pages {
             let id = recovered_page.id;
             let processed_jpeg = recovered_page.jpeg;
@@ -1178,9 +1285,13 @@ impl DocumentScannerApp {
         match image::load_from_memory(original_jpeg) {
             Ok(image) => {
                 let original = image.to_rgb8();
+                // The full-resolution original stays as the reprocess source;
+                // only the displayed texture is reduced to the GPU limit.
+                let max_texture_side = context.input(|input| input.max_texture_side);
+                let scaled = crate::review_viewport::fit_texture_image(&original, max_texture_side);
                 let texture = context.load_texture(
                     format!("edytor-{}", entry.id),
-                    rgb_to_color_image(&original),
+                    rgb_to_color_image(scaled.as_ref().unwrap_or(&original)),
                     TextureOptions::LINEAR,
                 );
                 self.editor = Some(EditorState {
@@ -1708,6 +1819,9 @@ impl DocumentScannerApp {
     fn scan_hub_ui(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         self.poll_camera(context);
         self.poll_pipeline(context);
+        if self.overlay.as_ref().is_some_and(OverlayDetector::is_dead) {
+            self.overlay = Some(OverlayDetector::start());
+        }
         let dialog_open = self.reviewing || self.editor.is_some() || self.has_blocking_dialog();
         let document_present = self
             .overlay
@@ -2190,7 +2304,10 @@ impl DocumentScannerApp {
         if redetect && let Some(editor) = &mut self.editor {
             editor.corners = crate::document::detect_document_corners(&editor.original);
         }
-        if close || context.input(|input| input.key_pressed(egui::Key::Escape)) {
+        if close
+            || (!self.has_blocking_dialog()
+                && context.input(|input| input.key_pressed(egui::Key::Escape)))
+        {
             self.editor = None;
         }
         if apply {
@@ -2456,7 +2573,7 @@ impl DocumentScannerApp {
                                 self.edit_dirty = true;
                             }
 
-                            let target = self.resolve_save_target();
+                            let target = self.cached_save_target();
                             match &target {
                                 Ok(plan) => {
                                     ui.label(
@@ -2477,7 +2594,7 @@ impl DocumentScannerApp {
                                 }
                             }
                             ui.add_space(8.0);
-                            let save_enabled = self.can_submit_save();
+                            let save_enabled = self.can_save() && target.is_ok();
                             let save_label = if self.pending_jobs > 0 {
                                 format!("Przetwarzanie {}…", self.pending_jobs)
                             } else {
@@ -2564,7 +2681,9 @@ impl DocumentScannerApp {
                         "Znaleziono niezapisaną sesję ({}).",
                         polish_page_count(count)
                     ));
-                    ui.label(format!("Folder: {folder_display}"));
+                    if !folder_display.is_empty() {
+                        ui.label(format!("Folder: {folder_display}"));
+                    }
                     if skipped > 0 {
                         ui.label(
                             RichText::new(format!(
@@ -2575,8 +2694,10 @@ impl DocumentScannerApp {
                     }
                     if !folder_exists {
                         ui.label(
-                            RichText::new("Ten folder już nie istnieje — przywracanie niemożliwe.")
-                                .color(Color32::DARK_RED),
+                            RichText::new(
+                                "Pierwotny folder nie jest dostępny — strony trafią do głównej lokalizacji biblioteki.",
+                            )
+                            .color(Color32::DARK_RED),
                         );
                     }
                     ui.add_space(12.0);
@@ -2591,10 +2712,10 @@ impl DocumentScannerApp {
                             self.recovered = None;
                             self.show_restore = false;
                         }
-                        if ui
-                            .add_enabled(folder_exists, Button::new("Przywróć"))
-                            .clicked()
-                        {
+                        if primary_button(ui, "Przywróć").clicked() {
+                            if !folder_exists && let Some(recovered) = &mut self.recovered {
+                                recovered.folder_path = self.library_root.clone();
+                            }
                             self.show_restore = false;
                             self.restore_recovered_session(context);
                         }
@@ -3114,7 +3235,11 @@ impl DocumentScannerApp {
 impl eframe::App for DocumentScannerApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         let close_requested = context.input(|input| input.viewport().close_requested());
-        let has_unsaved_scan = !self.slots.is_empty();
+        let has_unsaved_scan = !can_leave_scan_without_confirmation(
+            self.slots.is_empty(),
+            self.editing_target.is_some(),
+            self.edit_dirty,
+        );
         if close_requested && has_unsaved_scan && !self.allow_exit {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.show_exit_confirm = true;

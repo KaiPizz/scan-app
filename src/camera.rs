@@ -56,6 +56,13 @@ impl CameraController {
         self.latest_full.lock().ok()?.clone()
     }
 
+    /// Forgets the last full frame so a dead stream cannot be captured again.
+    pub fn clear_latest_frame(&self) {
+        if let Ok(mut latest) = self.latest_full.lock() {
+            *latest = None;
+        }
+    }
+
     pub fn stop(&mut self) {
         self.stop_requested.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {

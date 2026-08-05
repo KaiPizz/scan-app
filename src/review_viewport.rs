@@ -88,19 +88,18 @@ impl ReviewViewport {
                 return;
             }
         };
-        let max_texture_side = context.input(|input| input.max_texture_side);
-        if image.width() as usize > max_texture_side || image.height() as usize > max_texture_side {
-            self.load_error = Some(format!(
-                "Pełny podgląd {} × {} px przekracza limit karty graficznej ({max_texture_side} px).",
-                image.width(),
-                image.height()
-            ));
-            return;
-        }
+        // Zoom and the pixel readout stay in source coordinates even when the
+        // uploaded texture had to be reduced to the GPU limit.
         self.source_px = Vec2::new(image.width() as f32, image.height() as f32);
+        let max_texture_side = context.input(|input| input.max_texture_side);
+        let scaled = fit_texture_image(&image, max_texture_side);
+        let texture_source = scaled.as_ref().unwrap_or(&image);
         let color_image = ColorImage::from_rgb(
-            [image.width() as usize, image.height() as usize],
-            image.as_raw(),
+            [
+                texture_source.width() as usize,
+                texture_source.height() as usize,
+            ],
+            texture_source.as_raw(),
         );
         self.texture = Some(context.load_texture(
             format!("review-full-{}-{}", key.id, key.revision),
@@ -219,7 +218,10 @@ impl ReviewViewport {
             }
         }
         if response.double_clicked() {
-            self.pending_command = Some(if self.zoom < 0.9 {
+            // Toggle between fit and 100% regardless of how large fit is —
+            // the old `zoom < 0.9` test dead-ended at fit for small pages.
+            let at_fit = self.mode == ZoomMode::Fit || (self.zoom - fit).abs() <= 0.01;
+            self.pending_command = Some(if at_fit {
                 ViewCommand::OneToOne
             } else {
                 ViewCommand::Fit
@@ -271,9 +273,17 @@ impl ReviewViewport {
             }
             let zoom_percent = (self.zoom * 100.0).round();
             ui.separator();
+            // Real density on the A4 canvas, not a hardcoded claim: the short
+            // page edge maps to 210 mm.
+            let dpi = (self.source_px.x.min(self.source_px.y) / (210.0 / 25.4)).round();
+            let density = if dpi > 0.0 {
+                format!(" · {dpi:.0} DPI")
+            } else {
+                String::new()
+            };
             ui.label(
                 egui::RichText::new(format!(
-                    "{} × {} px · 300 DPI · {zoom_percent:.0}%",
+                    "{} × {} px{density} · {zoom_percent:.0}%",
                     self.source_px.x as u32, self.source_px.y as u32
                 ))
                 .small()
@@ -281,6 +291,28 @@ impl ReviewViewport {
             );
         });
     }
+}
+
+/// Returns a copy reduced to the GPU texture limit, or `None` when the image
+/// already fits. Uploading an oversized texture asserts inside the painter.
+pub fn fit_texture_image(
+    image: &image::RgbImage,
+    max_texture_side: usize,
+) -> Option<image::RgbImage> {
+    let max_side = max_texture_side.min(u32::MAX as usize).max(64) as u32;
+    let longest = image.width().max(image.height());
+    if longest <= max_side {
+        return None;
+    }
+    let scale = max_side as f32 / longest as f32;
+    let width = ((image.width() as f32 * scale).floor() as u32).clamp(1, max_side);
+    let height = ((image.height() as f32 * scale).floor() as u32).clamp(1, max_side);
+    Some(image::imageops::resize(
+        image,
+        width,
+        height,
+        image::imageops::FilterType::CatmullRom,
+    ))
 }
 
 fn natural_size_points(source_px: Vec2, pixels_per_point: f32) -> Vec2 {
@@ -342,6 +374,16 @@ fn clipped_image(image: Rect, viewport: Rect) -> Option<(Rect, Rect)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fit_texture_image_only_shrinks_oversized_images() {
+        let image = image::RgbImage::new(4160, 3120);
+        let scaled = fit_texture_image(&image, 4096).expect("must shrink");
+        assert_eq!(scaled.width(), 4096);
+        assert!(scaled.height() <= 4096 && scaled.height() > 0);
+        assert!(fit_texture_image(&image, 4160).is_none());
+        assert!(fit_texture_image(&image, 8192).is_none());
+    }
 
     #[test]
     fn fit_zoom_uses_limiting_axis_and_never_upscales() {
