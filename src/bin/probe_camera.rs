@@ -15,6 +15,11 @@ fn main() {
     if worker.join().is_err() {
         println!("WORKER_PANICKED");
     }
+    // The IRIScan driver access-violates inside MediaFoundation teardown at
+    // process exit (observed 2026-08-05 on the production laptop, after all
+    // output including DONE was printed). Skip the doomed teardown so the
+    // diagnostic reports success when its work succeeded.
+    std::process::exit(0);
 }
 
 fn probe() {
