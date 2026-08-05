@@ -4,13 +4,18 @@ use crate::document::{
     CropPoint, ScannedPage, extract_pdf_pages, page_from_jpeg_bytes, pages_from_jpeg_bytes,
     render_pdf, rotate_page_by_quarter_turns, rotate_page_clockwise,
 };
+use crate::library::{
+    FileActionReport, FileOperationEvent, FileOperationWorker, LibraryEvent, LibrarySnapshot,
+    LibraryWorker, normalize_search_text, rename_pdf,
+};
+use crate::library_view::{LibraryAction, LibraryViewInput, LibraryViewState, show_library_view};
 use crate::overlay::OverlayDetector;
 use crate::pipeline::{PipelineEvent, ProcessingPipeline};
 use crate::review_viewport::{PageTextureKey, ReviewViewport};
 use crate::session::{RecoveredSession, SessionStore};
 use crate::storage::{
     FolderInfo, PdfInfo, Settings, create_folder, default_library_root, ensure_library,
-    list_folders, list_pdfs, load_settings, normalized_pdf_stem, rename_folder, save_settings,
+    load_settings, next_sequence_name, normalized_pdf_stem, pdf_info, rename_folder, save_settings,
     unique_pdf_path,
 };
 use eframe::egui::{
@@ -65,6 +70,12 @@ enum SaveMode {
     Copy,
 }
 
+#[derive(Clone, Copy)]
+enum PendingFileOperation {
+    Move,
+    Recycle,
+}
+
 struct SavePlan {
     path: PathBuf,
     mode: SaveMode,
@@ -96,6 +107,15 @@ pub struct DocumentScannerApp {
     folders: Vec<FolderInfo>,
     selected_folder: Option<FolderInfo>,
     pdfs: Vec<PdfInfo>,
+    library_worker: LibraryWorker,
+    file_operation_worker: FileOperationWorker,
+    pending_file_operation: Option<PendingFileOperation>,
+    library_snapshot: LibrarySnapshot,
+    library_revision: u64,
+    library_loading: bool,
+    library_restore_pending: bool,
+    last_library_refresh: Instant,
+    library_view: LibraryViewState,
 
     camera: Option<CameraController>,
     camera_status: String,
@@ -134,7 +154,12 @@ pub struct DocumentScannerApp {
     save_dialog_needs_focus: bool,
     show_cancel_confirm: bool,
     delete_page_target: Option<u64>,
-    delete_pdf_target: Option<PdfInfo>,
+    rename_pdf_target: Option<PathBuf>,
+    rename_pdf_name: String,
+    move_pdf_targets: Vec<PathBuf>,
+    move_pdf_destination: Option<PathBuf>,
+    move_folder_query: String,
+    delete_pdf_targets: Vec<PathBuf>,
     show_exit_confirm: bool,
     allow_exit: bool,
     message: Option<String>,
@@ -148,13 +173,27 @@ impl DocumentScannerApp {
             .library_root
             .clone()
             .unwrap_or_else(default_library_root);
+        let mut library_worker = LibraryWorker::start();
+        let library_loading = library_worker.request_refresh(library_root.clone()).is_ok();
         let mut app = Self {
             screen: Screen::Library,
             settings,
-            library_root,
+            library_root: library_root.clone(),
             folders: Vec::new(),
             selected_folder: None,
             pdfs: Vec::new(),
+            library_worker,
+            file_operation_worker: FileOperationWorker::start(),
+            pending_file_operation: None,
+            library_snapshot: LibrarySnapshot {
+                root: library_root.clone(),
+                ..LibrarySnapshot::default()
+            },
+            library_revision: 0,
+            library_loading,
+            library_restore_pending: true,
+            last_library_refresh: Instant::now(),
+            library_view: LibraryViewState::default(),
             camera: None,
             camera_status: String::new(),
             camera_ready: false,
@@ -190,7 +229,12 @@ impl DocumentScannerApp {
             save_dialog_needs_focus: false,
             show_cancel_confirm: false,
             delete_page_target: None,
-            delete_pdf_target: None,
+            rename_pdf_target: None,
+            rename_pdf_name: String::new(),
+            move_pdf_targets: Vec::new(),
+            move_pdf_destination: None,
+            move_folder_query: String::new(),
+            delete_pdf_targets: Vec::new(),
             show_exit_confirm: false,
             allow_exit: false,
             message: None,
@@ -198,8 +242,6 @@ impl DocumentScannerApp {
         if let Err(error) = ensure_library(&app.library_root) {
             app.message = Some(error);
         }
-        app.refresh_folders();
-        app.restore_last_folder();
         app.session = SessionStore::open_default();
         if let Some(recovered) = app.session.as_ref().and_then(SessionStore::load_existing) {
             app.recovered = Some(recovered);
@@ -209,13 +251,20 @@ impl DocumentScannerApp {
     }
 
     fn restore_last_folder(&mut self) {
-        let Some(last_name) = self.settings.last_folder.clone() else {
-            return;
-        };
         let Some(folder) = self
             .folders
             .iter()
-            .find(|folder| folder.name == last_name)
+            .find(|folder| {
+                self.settings
+                    .last_folder_path
+                    .as_ref()
+                    .is_some_and(|path| path == &folder.path)
+                    || self
+                        .settings
+                        .last_folder
+                        .as_ref()
+                        .is_some_and(|name| name == &folder.name)
+            })
             .cloned()
         else {
             return;
@@ -224,9 +273,18 @@ impl DocumentScannerApp {
     }
 
     fn refresh_folders(&mut self) {
-        match list_folders(&self.library_root) {
-            Ok(folders) => self.folders = folders,
-            Err(error) => self.message = Some(error),
+        match self
+            .library_worker
+            .request_refresh(self.library_root.clone())
+        {
+            Ok(_) => {
+                self.library_loading = true;
+                self.last_library_refresh = Instant::now();
+            }
+            Err(error) => {
+                self.library_loading = false;
+                self.message = Some(error);
+            }
         }
     }
 
@@ -235,26 +293,121 @@ impl DocumentScannerApp {
             self.pdfs.clear();
             return;
         };
-        match list_pdfs(&folder.path) {
-            Ok(pdfs) => self.pdfs = pdfs,
-            Err(error) => self.message = Some(error),
+        self.pdfs = self
+            .library_snapshot
+            .pdfs
+            .iter()
+            .filter(|pdf| pdf.folder_path == folder.path)
+            .cloned()
+            .collect();
+    }
+
+    fn poll_library(&mut self, context: &egui::Context) {
+        if let Some(event) = self.library_worker.try_recv_latest() {
+            self.library_loading = false;
+            self.last_library_refresh = Instant::now();
+            match event {
+                LibraryEvent::Refreshed { snapshot, .. } => {
+                    if snapshot.root != self.library_root {
+                        self.refresh_folders();
+                        return;
+                    }
+                    self.library_snapshot = snapshot;
+                    self.library_revision = self.library_revision.saturating_add(1);
+                    self.folders = self.library_snapshot.folders.clone();
+                    if let Some(selected_path) = self
+                        .selected_folder
+                        .as_ref()
+                        .map(|folder| folder.path.clone())
+                    {
+                        self.selected_folder = if selected_path == self.library_root {
+                            Some(FolderInfo {
+                                name: "Główna lokalizacja".to_owned(),
+                                path: self.library_root.clone(),
+                                pdf_count: self
+                                    .library_snapshot
+                                    .pdfs
+                                    .iter()
+                                    .filter(|pdf| pdf.folder_path == self.library_root)
+                                    .count(),
+                                modified_secs: 0,
+                            })
+                        } else {
+                            self.folders
+                                .iter()
+                                .find(|folder| folder.path == selected_path)
+                                .cloned()
+                        };
+                    }
+                    self.refresh_pdfs();
+                    if self.library_restore_pending {
+                        self.library_restore_pending = false;
+                        if self.selected_folder.is_none() {
+                            self.restore_last_folder();
+                        }
+                    }
+                    let recent_count = self.settings.recent_documents.len();
+                    self.settings.recent_documents.retain(|path| {
+                        self.library_snapshot
+                            .pdfs
+                            .iter()
+                            .any(|pdf| &pdf.path == path)
+                    });
+                    if self.settings.recent_documents.len() != recent_count {
+                        let _ = save_settings(&self.settings);
+                    }
+                }
+                LibraryEvent::Failed { error, .. } => self.message = Some(error),
+            }
+        }
+
+        if self.screen != Screen::ScanHub
+            && !self.library_loading
+            && self.last_library_refresh.elapsed() >= Duration::from_secs(30)
+        {
+            self.refresh_folders();
+        }
+        if self.library_loading {
+            context.request_repaint_after(Duration::from_millis(150));
         }
     }
 
     fn open_folder(&mut self, folder: FolderInfo) {
-        self.settings.last_folder = Some(folder.name.clone());
+        let remember_as_scan_destination = folder.path != self.library_root;
+        if remember_as_scan_destination {
+            self.settings.last_folder = Some(folder.name.clone());
+            self.settings.last_folder_path = Some(folder.path.clone());
+        }
         self.selected_folder = Some(folder);
+        self.library_view.section = crate::library_view::LibrarySection::All;
+        self.library_view.query.clear();
         self.screen = Screen::Folder;
         self.refresh_pdfs();
+        if remember_as_scan_destination {
+            let _ = save_settings(&self.settings);
+        }
+    }
+
+    fn remember_recent_document(&mut self, path: &std::path::Path) {
+        self.settings
+            .recent_documents
+            .retain(|recent| recent != path);
+        self.settings.recent_documents.insert(0, path.to_path_buf());
+        self.settings.recent_documents.truncate(50);
         let _ = save_settings(&self.settings);
     }
 
-    fn back_to_library(&mut self) {
-        self.selected_folder = None;
-        self.settings.last_folder = None;
-        self.screen = Screen::Library;
-        self.refresh_folders();
-        let _ = save_settings(&self.settings);
+    fn replace_recent_document_path(&mut self, source: &std::path::Path, target: &std::path::Path) {
+        let mut changed = false;
+        for recent in &mut self.settings.recent_documents {
+            if recent == source {
+                *recent = target.to_path_buf();
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = save_settings(&self.settings);
+        }
     }
 
     fn begin_scan(&mut self) {
@@ -264,7 +417,7 @@ impl DocumentScannerApp {
         self.filename = self
             .selected_folder
             .as_ref()
-            .map(|folder| folder.name.clone())
+            .map(|folder| next_sequence_name(&self.pdfs, &folder.name))
             .unwrap_or_default();
         self.editing_target = None;
         self.editing_source_fingerprint = None;
@@ -611,7 +764,10 @@ impl DocumentScannerApp {
             || self.show_cancel_confirm
             || self.delete_page_target.is_some()
             || self.show_exit_confirm
-            || self.delete_pdf_target.is_some()
+            || self.rename_pdf_target.is_some()
+            || !self.move_pdf_targets.is_empty()
+            || !self.delete_pdf_targets.is_empty()
+            || self.pending_file_operation.is_some()
             || self.message.is_some()
     }
 
@@ -798,28 +954,107 @@ impl DocumentScannerApp {
                     shown_at: Instant::now(),
                     pdf_path: Some(path.clone()),
                 });
+                self.remember_recent_document(&path);
                 self.filename.clear();
-                self.refresh_folders();
                 self.abandon_scan();
+                self.upsert_saved_pdf(&path);
+                self.refresh_folders();
             }
             Err(error) => self.message = Some(error),
         }
     }
 
+    fn upsert_saved_pdf(&mut self, path: &std::path::Path) {
+        self.update_snapshot_files(&[path.to_path_buf()], &[path.to_path_buf()]);
+    }
+
+    fn update_snapshot_files(&mut self, removed: &[PathBuf], added: &[PathBuf]) {
+        if removed.is_empty() && added.is_empty() {
+            return;
+        }
+        let removed: std::collections::HashSet<&std::path::Path> =
+            removed.iter().map(PathBuf::as_path).collect();
+        self.library_snapshot
+            .pdfs
+            .retain(|existing| !removed.contains(existing.path.as_path()));
+        for path in added {
+            if let Ok(pdf) = pdf_info(path) {
+                self.library_snapshot
+                    .pdfs
+                    .retain(|existing| existing.path != pdf.path);
+                self.library_snapshot.pdfs.push(pdf);
+            }
+        }
+        for folder in &mut self.library_snapshot.folders {
+            folder.pdf_count = self
+                .library_snapshot
+                .pdfs
+                .iter()
+                .filter(|item| item.folder_path == folder.path)
+                .count();
+        }
+        self.library_revision = self.library_revision.saturating_add(1);
+        self.refresh_pdfs();
+    }
+
+    fn update_snapshot_folder(&mut self, previous: &FolderInfo, renamed: &FolderInfo) {
+        for folder in &mut self.library_snapshot.folders {
+            if folder.path == previous.path {
+                *folder = renamed.clone();
+            }
+        }
+        for pdf in &mut self.library_snapshot.pdfs {
+            if pdf.folder_path == previous.path {
+                if let Ok(suffix) = pdf.path.strip_prefix(&previous.path) {
+                    pdf.path = renamed.path.join(suffix);
+                }
+                pdf.folder_path = renamed.path.clone();
+                pdf.folder_name = renamed.name.clone();
+            }
+        }
+        self.folders = self.library_snapshot.folders.clone();
+        self.library_revision = self.library_revision.saturating_add(1);
+        self.refresh_pdfs();
+    }
+
+    fn upsert_snapshot_folder(&mut self, folder: &FolderInfo) {
+        self.library_snapshot
+            .folders
+            .retain(|existing| existing.path != folder.path);
+        self.library_snapshot.folders.push(folder.clone());
+        self.library_snapshot
+            .folders
+            .sort_by_key(|item| item.name.to_lowercase());
+        self.folders = self.library_snapshot.folders.clone();
+        self.library_revision = self.library_revision.saturating_add(1);
+    }
+
     fn commit_pdf_update(&self, path: PathBuf, bytes: &[u8]) -> Result<PathBuf, String> {
-        let prepared = crate::atomic_file::prepare(&path, bytes).map_err(pdf_io_error)?;
         let source = self
             .editing_target
             .as_ref()
             .ok_or_else(|| "Brak pliku źródłowego do aktualizacji.".to_owned())?;
+        // Rendering and fsync can take noticeable time for a large PDF. Finish
+        // that work before the short critical section below.
+        let prepared = crate::atomic_file::prepare(&path, bytes).map_err(pdf_io_error)?;
+        let _update_lock = crate::atomic_file::try_lock_for_update(source).map_err(|error| {
+            format!(
+                "Ten PDF jest właśnie zapisywany w innej sesji programu. Spróbuj ponownie za chwilę. Błąd: {error}"
+            )
+        })?;
         let current_fingerprint = file_fingerprint(source)?;
-        if self.editing_source_fingerprint != Some(current_fingerprint) {
+        let expected_fingerprint = self
+            .editing_source_fingerprint
+            .ok_or_else(|| "Brak odcisku pliku źródłowego.".to_owned())?;
+        if expected_fingerprint != current_fingerprint {
             return Err(
                 "Plik źródłowy zmienił się poza programem. Zapisz dokument pod inną nazwą, aby nie nadpisać cudzych zmian."
                     .to_owned(),
             );
         }
-        prepared.commit_replace(&path).map_err(pdf_io_error)?;
+        prepared
+            .commit_replace_if_unchanged(&path, expected_fingerprint)
+            .map_err(pdf_io_error)?;
         Ok(path)
     }
 
@@ -856,6 +1091,7 @@ impl DocumentScannerApp {
             name: folder_name.clone(),
             path: recovered.folder_path.clone(),
             pdf_count: 0,
+            modified_secs: 0,
         });
         self.slots.clear();
         self.selected_slot = None;
@@ -1132,172 +1368,329 @@ impl DocumentScannerApp {
     }
 
     fn library_ui(&mut self, ui: &mut egui::Ui) {
-        page_container(ui, |ui| {
-            two_sided(
-                ui,
-                58.0,
-                |ui| {
-                    ui.vertical(|ui| {
-                        ui.heading("Foldery dokumentów");
-                        ui.label("Wybierz folder lub utwórz nowy.");
-                    });
-                },
-                |ui| {
-                    if primary_button(ui, "Nowy folder").clicked() {
-                        self.new_folder_name.clear();
-                        self.show_new_folder = true;
-                    }
-                },
-            );
-            ui.add_space(22.0);
-            if self.folders.is_empty() {
-                empty_card(
-                    ui,
-                    "Nie ma jeszcze żadnych folderów.",
-                    "Kliknij „Nowy folder”, aby rozpocząć.",
-                );
-                return;
-            }
-            let tile_width = 235.0;
-            let columns = ((ui.available_width() / (tile_width + 14.0)).floor() as usize).max(1);
-            let mut clicked_folder = None;
-            egui::Grid::new("foldery")
-                .num_columns(columns)
-                .spacing([14.0, 14.0])
-                .show(ui, |ui| {
-                    for (index, folder) in self.folders.iter().enumerate() {
-                        let label = format!("{}\n\n{} plików PDF", folder.name, folder.pdf_count);
-                        if ui
-                            .add_sized(
-                                [tile_width, 125.0],
-                                Button::new(RichText::new(label).size(17.0))
-                                    .fill(Color32::WHITE)
-                                    .stroke(Stroke::new(1.0, Color32::from_gray(215)))
-                                    .corner_radius(12.0),
-                            )
-                            .clicked()
-                        {
-                            clicked_folder = Some(folder.clone());
-                        }
-                        if (index + 1) % columns == 0 {
-                            ui.end_row();
-                        }
-                    }
-                });
-            if let Some(folder) = clicked_folder {
-                self.open_folder(folder);
-            }
-        });
+        self.document_library_ui(ui);
     }
 
     fn folder_ui(&mut self, ui: &mut egui::Ui) {
-        page_container(ui, |ui| {
-            let folder_name = self
-                .selected_folder
-                .as_ref()
-                .map(|folder| folder.name.clone())
-                .unwrap_or_default();
-            let folder_path = self
-                .selected_folder
-                .as_ref()
-                .map(|folder| folder.path.clone());
-            let (go_back, (new_scan, rename, open_in_explorer)) = two_sided(
-                ui,
-                48.0,
-                |ui| {
-                    let mut go_back = false;
-                    ui.horizontal(|ui| {
-                        go_back = ui.button("Wróć do folderów").clicked();
-                        ui.add_space(8.0);
-                        ui.heading(&folder_name);
-                    });
-                    go_back
-                },
-                |ui| {
-                    let new_scan = primary_button(ui, "Nowy skan").clicked();
-                    let rename = ui.button("Zmień nazwę folderu").clicked();
-                    let open_in_explorer = ui.button("Otwórz w Eksploratorze").clicked();
-                    (new_scan, rename, open_in_explorer)
-                },
-            );
-            if go_back {
-                self.back_to_library();
-                return;
+        self.document_library_ui(ui);
+    }
+
+    fn document_library_ui(&mut self, ui: &mut egui::Ui) {
+        let selected_folder = self
+            .selected_folder
+            .as_ref()
+            .map(|folder| folder.path.as_path());
+        let keyboard_enabled = !self.has_blocking_dialog();
+        let actions = Frame::new()
+            .inner_margin(Margin::symmetric(20, 18))
+            .show(ui, |ui| {
+                show_library_view(
+                    ui,
+                    &mut self.library_view,
+                    LibraryViewInput {
+                        snapshot: &self.library_snapshot,
+                        snapshot_revision: self.library_revision,
+                        recent_documents: &self.settings.recent_documents,
+                        selected_folder,
+                        preferred_scan_folder: self.settings.last_folder_path.as_deref(),
+                        library_root: &self.library_root,
+                        loading: self.library_loading,
+                        keyboard_enabled,
+                    },
+                )
+            })
+            .inner;
+
+        for action in actions {
+            self.handle_library_action(action, ui.ctx());
+        }
+    }
+
+    fn handle_library_action(&mut self, action: LibraryAction, context: &egui::Context) {
+        match action {
+            LibraryAction::ChangeSection(section) => {
+                self.selected_folder = None;
+                self.screen = Screen::Library;
+                self.library_view.section = section;
+                self.refresh_pdfs();
             }
-            if new_scan {
-                self.begin_scan();
-                return;
+            LibraryAction::SelectFolder(path) => {
+                if let Some(folder) = self
+                    .library_snapshot
+                    .folders
+                    .iter()
+                    .find(|folder| folder.path == path)
+                    .cloned()
+                {
+                    self.open_folder(folder);
+                } else {
+                    self.message = Some("Ten folder już nie istnieje.".to_owned());
+                    self.refresh_folders();
+                }
             }
-            if rename {
-                self.rename_folder_name = folder_name;
+            LibraryAction::RenameFolder(path) => {
+                let Some(folder) = self
+                    .library_snapshot
+                    .folders
+                    .iter()
+                    .find(|folder| folder.path == path)
+                    .cloned()
+                else {
+                    self.message = Some("Ten folder już nie istnieje.".to_owned());
+                    self.refresh_folders();
+                    return;
+                };
+                self.open_folder(folder.clone());
+                self.rename_folder_name = folder.name;
                 self.show_rename_folder = true;
             }
-            if open_in_explorer
-                && let Some(path) = folder_path
-                && let Err(error) = open::that_detached(path)
-            {
-                self.message = Some(format!("Nie można otworzyć folderu: {error}"));
+            LibraryAction::NewFolder => {
+                self.new_folder_name.clear();
+                self.show_new_folder = true;
             }
-            ui.add_space(20.0);
-            if self.pdfs.is_empty() {
-                empty_card(
-                    ui,
-                    "Ten folder jest pusty.",
-                    "Kliknij „Nowy skan”, aby dodać pierwszy dokument.",
-                );
-            } else {
-                let mut open_target: Option<PathBuf> = None;
-                let mut delete_target: Option<PdfInfo> = None;
-                let mut edit_target: Option<PdfInfo> = None;
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for pdf in &self.pdfs {
-                        Frame::new()
-                            .fill(Color32::WHITE)
-                            .corner_radius(10.0)
-                            .stroke(Stroke::new(1.0, Color32::from_gray(222)))
-                            .inner_margin(Margin::symmetric(18, 14))
-                            .show(ui, |ui| {
-                                let (_, (open_pdf, edit_pdf, delete_pdf)) = two_sided(
-                                    ui,
-                                    38.0,
-                                    |ui| {
-                                        ui.label(RichText::new(&pdf.name).size(16.0));
-                                    },
-                                    |ui| {
-                                        let open_pdf = ui.button("Otwórz PDF").clicked();
-                                        let edit_pdf = ui.button("Edytuj").clicked();
-                                        let delete_pdf = ui
-                                            .button(RichText::new("Usuń").color(Color32::DARK_RED))
-                                            .clicked();
-                                        (open_pdf, edit_pdf, delete_pdf)
-                                    },
-                                );
-                                if open_pdf {
-                                    open_target = Some(pdf.path.clone());
-                                }
-                                if edit_pdf {
-                                    edit_target = Some(pdf.clone());
-                                }
-                                if delete_pdf {
-                                    delete_target = Some(pdf.clone());
-                                }
-                            });
-                        ui.add_space(8.0);
-                    }
-                });
-                if let Some(path) = open_target
-                    && let Err(error) = open::that_detached(&path)
+            LibraryAction::NewScan(destination) => {
+                if let Some(path) = destination
+                    && let Some(folder) = self
+                        .library_snapshot
+                        .folders
+                        .iter()
+                        .find(|folder| folder.path == path)
+                        .cloned()
                 {
-                    self.message = Some(format!("Nie można otworzyć PDF: {error}"));
+                    self.open_folder(folder);
                 }
-                if delete_target.is_some() {
-                    self.delete_pdf_target = delete_target;
-                }
-                if let Some(pdf) = edit_target {
-                    self.open_pdf_for_edit(&pdf, ui.ctx());
+                if self.selected_folder.is_some() {
+                    self.begin_scan();
+                } else {
+                    self.message =
+                        Some("Wybierz folder docelowy przed rozpoczęciem skanowania.".to_owned());
                 }
             }
-        });
+            LibraryAction::Refresh => self.refresh_folders(),
+            LibraryAction::Open(path) => {
+                if let Err(error) = open::that_detached(&path) {
+                    self.message = Some(format!("Nie można otworzyć PDF: {error}"));
+                } else {
+                    self.remember_recent_document(&path);
+                }
+            }
+            LibraryAction::Edit(path) => {
+                let Some(pdf) = self.pdf_by_path(&path) else {
+                    self.message = Some("Ten dokument już nie istnieje.".to_owned());
+                    self.refresh_folders();
+                    return;
+                };
+                self.select_document_folder(&pdf);
+                self.remember_recent_document(&pdf.path);
+                self.open_pdf_for_edit(&pdf, context);
+            }
+            LibraryAction::Rename(path) => {
+                let Some(pdf) = self.pdf_by_path(&path) else {
+                    self.message = Some("Ten dokument już nie istnieje.".to_owned());
+                    self.refresh_folders();
+                    return;
+                };
+                self.rename_pdf_name = pdf
+                    .path
+                    .file_stem()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or(pdf.name);
+                self.rename_pdf_target = Some(path);
+            }
+            LibraryAction::Move(paths) => {
+                self.move_pdf_targets = paths;
+                self.move_pdf_destination = None;
+                self.move_folder_query.clear();
+            }
+            LibraryAction::Recycle(paths) => self.delete_pdf_targets = paths,
+            LibraryAction::OpenFolderInExplorer(path) => {
+                if let Err(error) = open::that_detached(path) {
+                    self.message = Some(format!("Nie można otworzyć folderu: {error}"));
+                }
+            }
+        }
+    }
+
+    fn pdf_by_path(&self, path: &std::path::Path) -> Option<PdfInfo> {
+        self.library_snapshot
+            .pdfs
+            .iter()
+            .find(|pdf| pdf.path == path)
+            .cloned()
+    }
+
+    fn select_document_folder(&mut self, pdf: &PdfInfo) {
+        let folder = if pdf.folder_path == self.library_root {
+            FolderInfo {
+                name: "Główna lokalizacja".to_owned(),
+                path: self.library_root.clone(),
+                pdf_count: self
+                    .library_snapshot
+                    .pdfs
+                    .iter()
+                    .filter(|item| item.folder_path == self.library_root)
+                    .count(),
+                modified_secs: pdf.modified_secs,
+            }
+        } else {
+            self.library_snapshot
+                .folders
+                .iter()
+                .find(|folder| folder.path == pdf.folder_path)
+                .cloned()
+                .unwrap_or_else(|| FolderInfo {
+                    name: pdf.folder_name.clone(),
+                    path: pdf.folder_path.clone(),
+                    pdf_count: 0,
+                    modified_secs: pdf.modified_secs,
+                })
+        };
+        self.open_folder(folder);
+    }
+
+    fn apply_pdf_rename(&mut self, source: PathBuf) {
+        match rename_pdf(&source, &self.rename_pdf_name) {
+            Ok(destination) => {
+                self.rename_pdf_target = None;
+                self.replace_recent_document_path(&source, &destination);
+                self.library_view.replace_path(&source, &destination);
+                self.update_snapshot_files(
+                    std::slice::from_ref(&source),
+                    std::slice::from_ref(&destination),
+                );
+                self.toast = Some(Toast {
+                    text: "Zmieniono nazwę dokumentu.".to_owned(),
+                    shown_at: Instant::now(),
+                    pdf_path: Some(destination),
+                });
+                self.refresh_folders();
+            }
+            Err(error) => self.message = Some(error),
+        }
+    }
+
+    fn start_pdf_move(&mut self, target_folder: PathBuf) {
+        let sources = std::mem::take(&mut self.move_pdf_targets);
+        self.move_pdf_destination = None;
+        self.move_folder_query.clear();
+        match self
+            .file_operation_worker
+            .request_move(sources, target_folder)
+        {
+            Ok(()) => self.pending_file_operation = Some(PendingFileOperation::Move),
+            Err(error) => self.message = Some(error),
+        }
+    }
+
+    fn finish_pdf_move(&mut self, report: FileActionReport) {
+        let moved_sources: Vec<PathBuf> = report
+            .successes
+            .iter()
+            .map(|success| success.source.clone())
+            .collect();
+        let mut recent_changed = false;
+        for success in &report.successes {
+            if let Some(destination) = &success.destination {
+                for recent in &mut self.settings.recent_documents {
+                    if recent == &success.source {
+                        *recent = destination.clone();
+                        recent_changed = true;
+                    }
+                }
+            }
+        }
+        if recent_changed {
+            let _ = save_settings(&self.settings);
+        }
+        let destinations: Vec<PathBuf> = report
+            .successes
+            .iter()
+            .filter_map(|success| success.destination.clone())
+            .collect();
+        self.update_snapshot_files(&moved_sources, &destinations);
+        self.library_view.remove_paths(moved_sources.iter());
+        if report.completed_count() > 0 {
+            let skipped = if report.skipped_count() > 0 {
+                format!(" ({} już było w folderze)", report.skipped_count())
+            } else {
+                String::new()
+            };
+            self.toast = Some(Toast {
+                text: format!(
+                    "Przeniesiono {}{}.",
+                    polish_file_count(report.completed_count()),
+                    skipped
+                ),
+                shown_at: Instant::now(),
+                pdf_path: None,
+            });
+        } else if report.skipped_count() > 0 && report.failed_count() == 0 {
+            self.toast = Some(Toast {
+                text: "Wybrane pliki są już w tym folderze.".to_owned(),
+                shown_at: Instant::now(),
+                pdf_path: None,
+            });
+        }
+        if let Some(message) = file_action_failure_message("przenieść", &report) {
+            self.message = Some(message);
+        }
+        self.refresh_folders();
+    }
+
+    fn start_pdf_recycle(&mut self) {
+        let sources = std::mem::take(&mut self.delete_pdf_targets);
+        match self.file_operation_worker.request_recycle(sources) {
+            Ok(()) => self.pending_file_operation = Some(PendingFileOperation::Recycle),
+            Err(error) => self.message = Some(error),
+        }
+    }
+
+    fn finish_pdf_recycle(&mut self, report: FileActionReport) {
+        let removed: Vec<PathBuf> = report
+            .successes
+            .iter()
+            .map(|success| success.source.clone())
+            .collect();
+        self.update_snapshot_files(&removed, &[]);
+        self.library_view.remove_paths(removed.iter());
+        if !removed.is_empty() {
+            self.settings
+                .recent_documents
+                .retain(|path| !removed.contains(path));
+            let _ = save_settings(&self.settings);
+            self.toast = Some(Toast {
+                text: format!(
+                    "Przeniesiono do Kosza: {}.",
+                    polish_file_count(removed.len())
+                ),
+                shown_at: Instant::now(),
+                pdf_path: None,
+            });
+        }
+        if let Some(message) = file_action_failure_message("przenieść do Kosza", &report) {
+            self.message = Some(message);
+        }
+        self.refresh_folders();
+    }
+
+    fn poll_file_operation(&mut self, context: &egui::Context) {
+        if self.pending_file_operation.is_none() {
+            return;
+        }
+        match self.file_operation_worker.try_recv() {
+            Ok(Some(event)) => {
+                self.pending_file_operation = None;
+                match event {
+                    FileOperationEvent::Moved(report) => self.finish_pdf_move(report),
+                    FileOperationEvent::Recycled(report) => self.finish_pdf_recycle(report),
+                }
+            }
+            Ok(None) => context.request_repaint_after(Duration::from_millis(100)),
+            Err(error) => {
+                self.pending_file_operation = None;
+                self.message = Some(error);
+            }
+        }
     }
 
     fn scan_hub_ui(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
@@ -2209,8 +2602,9 @@ impl DocumentScannerApp {
                         match create_folder(&self.library_root, &self.new_folder_name) {
                             Ok(folder) => {
                                 self.show_new_folder = false;
-                                self.refresh_folders();
+                                self.upsert_snapshot_folder(&folder);
                                 self.open_folder(folder);
+                                self.refresh_folders();
                             }
                             Err(error) => self.message = Some(error),
                         }
@@ -2237,9 +2631,18 @@ impl DocumentScannerApp {
                         && let Some(folder) = self.selected_folder.clone()
                     {
                         match rename_folder(&folder, &self.rename_folder_name) {
-                            Ok(folder) => {
-                                self.selected_folder = Some(folder.clone());
-                                self.settings.last_folder = Some(folder.name.clone());
+                            Ok(renamed_folder) => {
+                                for recent in &mut self.settings.recent_documents {
+                                    if let Ok(suffix) = recent.strip_prefix(&folder.path) {
+                                        *recent = renamed_folder.path.join(suffix);
+                                    }
+                                }
+                                self.library_view
+                                    .replace_prefix(&folder.path, &renamed_folder.path);
+                                self.selected_folder = Some(renamed_folder.clone());
+                                self.settings.last_folder = Some(renamed_folder.name.clone());
+                                self.settings.last_folder_path = Some(renamed_folder.path.clone());
+                                self.update_snapshot_folder(&folder, &renamed_folder);
                                 let _ = save_settings(&self.settings);
                                 self.show_rename_folder = false;
                                 self.refresh_folders();
@@ -2259,27 +2662,45 @@ impl DocumentScannerApp {
                 ui.label(RichText::new("Folder biblioteki").strong());
                 ui.label(self.library_root.display().to_string());
                 ui.add_space(10.0);
-                if ui.button("Zmień lokalizację").clicked() {
-                    if self.has_active_workflow() {
-                        self.show_settings = false;
-                        self.message =
-                            Some("Najpierw zapisz albo anuluj bieżący dokument.".to_owned());
-                    } else if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        if let Err(error) = ensure_library(&path) {
-                            self.message = Some(error);
-                        } else {
-                            self.library_root = path.clone();
-                            self.settings.library_root = Some(path);
-                            self.settings.last_folder = None;
-                            self.selected_folder = None;
-                            self.screen = Screen::Library;
-                            if let Err(error) = save_settings(&self.settings) {
+                ui.horizontal(|ui| {
+                    if ui.button("Otwórz lokalizację").clicked()
+                        && let Err(error) = open::that_detached(&self.library_root)
+                    {
+                        self.message = Some(format!("Nie można otworzyć folderu: {error}"));
+                    }
+                    if ui.button("Zmień lokalizację").clicked() {
+                        if self.has_active_workflow() {
+                            self.show_settings = false;
+                            self.message =
+                                Some("Najpierw zapisz albo anuluj bieżący dokument.".to_owned());
+                        } else if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            if let Err(error) = ensure_library(&path) {
                                 self.message = Some(error);
+                            } else {
+                                self.library_root = path.clone();
+                                self.settings.library_root = Some(path.clone());
+                                self.settings.last_folder = None;
+                                self.settings.last_folder_path = None;
+                                self.settings.recent_documents.clear();
+                                self.selected_folder = None;
+                                self.folders.clear();
+                                self.pdfs.clear();
+                                self.library_snapshot = LibrarySnapshot {
+                                    root: path,
+                                    ..LibrarySnapshot::default()
+                                };
+                                self.library_revision = self.library_revision.saturating_add(1);
+                                self.library_view.clear_selection();
+                                self.library_restore_pending = false;
+                                self.screen = Screen::Library;
+                                if let Err(error) = save_settings(&self.settings) {
+                                    self.message = Some(error);
+                                }
+                                self.refresh_folders();
                             }
-                            self.refresh_folders();
                         }
                     }
-                }
+                });
                 ui.add_space(12.0);
                 if primary_button(ui, "Gotowe").clicked() {
                     self.show_settings = false;
@@ -2287,33 +2708,190 @@ impl DocumentScannerApp {
             });
         }
 
-        if let Some(pdf) = self.delete_pdf_target.clone() {
-            egui::Modal::new(Id::new("delete-document-modal")).show(context, |ui| {
-                ui.heading("Usunąć dokument?");
+        if let Some(source) = self.rename_pdf_target.clone() {
+            egui::Modal::new(Id::new("rename-document-modal")).show(context, |ui| {
+                ui.heading("Zmień nazwę dokumentu");
                 ui.add_space(8.0);
                 ui.set_max_width(480.0);
-                ui.label(format!("Plik „{}” zostanie trwale usunięty.", pdf.name));
+                ui.label("Nowa nazwa:");
+                let response = ui.add_sized(
+                    [420.0, 34.0],
+                    egui::TextEdit::singleline(&mut self.rename_pdf_name),
+                );
+                if context.memory(|memory| memory.focused().is_none()) {
+                    response.request_focus();
+                }
+                ui.label(
+                    RichText::new("Rozszerzenie .pdf zostanie dodane automatycznie.")
+                        .small()
+                        .color(Color32::GRAY),
+                );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui.button("Anuluj").clicked() {
-                        self.delete_pdf_target = None;
+                        self.rename_pdf_target = None;
                     }
-                    if ui
-                        .button(RichText::new("Usuń dokument").color(Color32::DARK_RED))
-                        .clicked()
-                    {
-                        self.delete_pdf_target = None;
-                        match std::fs::remove_file(&pdf.path) {
-                            Ok(()) => {
-                                self.refresh_pdfs();
-                                self.refresh_folders();
-                            }
-                            Err(error) => {
-                                self.message = Some(format!("Nie można usunąć pliku: {error}"));
-                            }
-                        }
+                    let enter = response.has_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    if primary_button(ui, "Zapisz nazwę").clicked() || enter {
+                        self.apply_pdf_rename(source.clone());
                     }
                 });
+            });
+        }
+
+        if !self.move_pdf_targets.is_empty() {
+            let targets = self.move_pdf_targets.clone();
+            let folders = self.library_snapshot.folders.clone();
+            egui::Modal::new(Id::new("move-documents-modal")).show(context, |ui| {
+                ui.heading("Przenieś dokumenty");
+                ui.add_space(6.0);
+                ui.set_min_width(440.0);
+                ui.label(format!("Wybrano: {}", polish_file_count(targets.len())));
+                for path in targets.iter().take(3) {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_else(|| path.to_string_lossy());
+                    ui.label(RichText::new(format!("• {name}")).small());
+                }
+                if targets.len() > 3 {
+                    ui.label(
+                        RichText::new(format!("• …oraz {} kolejnych", targets.len() - 3)).small(),
+                    );
+                }
+                ui.add_space(10.0);
+                ui.label(RichText::new("Folder docelowy").strong());
+                if folders.is_empty() {
+                    ui.label("Brak folderów docelowych. Najpierw utwórz folder.");
+                } else {
+                    ui.add_sized(
+                        [ui.available_width(), 34.0],
+                        egui::TextEdit::singleline(&mut self.move_folder_query)
+                            .hint_text("Szukaj folderu docelowego…"),
+                    );
+                    let normalized_query = normalize_search_text(&self.move_folder_query);
+                    let query_tokens: Vec<&str> = normalized_query.split_whitespace().collect();
+                    let mut shown_folders = 0;
+                    egui::ScrollArea::vertical()
+                        .id_salt("move-document-destinations")
+                        .max_height(240.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for folder in &folders {
+                                let normalized_name = normalize_search_text(&folder.name);
+                                if !query_tokens
+                                    .iter()
+                                    .all(|token| normalized_name.contains(token))
+                                {
+                                    continue;
+                                }
+                                shown_folders += 1;
+                                let all_already_here = targets
+                                    .iter()
+                                    .all(|source| source.parent() == Some(folder.path.as_path()));
+                                let selected =
+                                    self.move_pdf_destination.as_ref() == Some(&folder.path);
+                                let label = format!("{}  ({} PDF)", folder.name, folder.pdf_count);
+                                let response = ui
+                                    .add_enabled_ui(!all_already_here, |ui| {
+                                        ui.selectable_label(selected, label)
+                                    })
+                                    .inner;
+                                if response.clicked() {
+                                    self.move_pdf_destination = Some(folder.path.clone());
+                                }
+                                if all_already_here {
+                                    response.on_disabled_hover_text("Pliki są już w tym folderze.");
+                                }
+                            }
+                        });
+                    if shown_folders == 0 {
+                        ui.label(
+                            RichText::new("Brak pasujących folderów.")
+                                .small()
+                                .color(Color32::GRAY),
+                        );
+                    }
+                }
+                ui.label(
+                    RichText::new("Jeśli nazwa już istnieje, aplikacja zachowa oba pliki.")
+                        .small()
+                        .color(Color32::GRAY),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Anuluj").clicked() {
+                        self.move_pdf_targets.clear();
+                        self.move_pdf_destination = None;
+                        self.move_folder_query.clear();
+                    }
+                    let destination = self.move_pdf_destination.clone();
+                    if ui
+                        .add_enabled_ui(destination.is_some(), |ui| primary_button(ui, "Przenieś"))
+                        .inner
+                        .clicked()
+                        && let Some(destination) = destination
+                    {
+                        self.start_pdf_move(destination);
+                    }
+                });
+            });
+        }
+
+        if !self.delete_pdf_targets.is_empty() {
+            let targets = self.delete_pdf_targets.clone();
+            egui::Modal::new(Id::new("delete-document-modal")).show(context, |ui| {
+                ui.heading("Przenieść do Kosza?");
+                ui.add_space(8.0);
+                ui.set_max_width(480.0);
+                ui.label(format!("Wybrano: {}", polish_file_count(targets.len())));
+                for path in targets.iter().take(3) {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_else(|| path.to_string_lossy());
+                    ui.label(RichText::new(format!("• {name}")).small());
+                }
+                if targets.len() > 3 {
+                    ui.label(
+                        RichText::new(format!("• …oraz {} kolejnych", targets.len() - 3)).small(),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.label("Pliki będzie można odzyskać z systemowego Kosza.");
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Anuluj").clicked() {
+                        self.delete_pdf_targets.clear();
+                    }
+                    if ui
+                        .button(RichText::new("Przenieś do Kosza").color(Color32::DARK_RED))
+                        .clicked()
+                    {
+                        self.start_pdf_recycle();
+                    }
+                });
+            });
+        }
+
+        if let Some(operation) = self.pending_file_operation {
+            let (title, detail) = match operation {
+                PendingFileOperation::Move => (
+                    "Przenoszenie dokumentów…",
+                    "Zachowywanie obu plików przy zbieżnych nazwach.",
+                ),
+                PendingFileOperation::Recycle => (
+                    "Przenoszenie do Kosza…",
+                    "Pliki pozostaną możliwe do odzyskania.",
+                ),
+            };
+            egui::Modal::new(Id::new("library-file-operation-modal")).show(context, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.heading(title);
+                });
+                ui.label(detail);
             });
         }
 
@@ -2503,6 +3081,8 @@ impl eframe::App for DocumentScannerApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        self.poll_file_operation(&context);
+        self.poll_library(&context);
         let dialog_open = self.reviewing || self.editor.is_some() || self.has_blocking_dialog();
         let focus_free = context.memory(|memory| memory.focused().is_none());
         if self.screen == Screen::ScanHub && !dialog_open && focus_free {
@@ -2600,18 +3180,30 @@ fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     )
 }
 
-fn empty_card(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    Frame::new()
-        .fill(Color32::WHITE)
-        .stroke(Stroke::new(1.0, Color32::from_gray(222)))
-        .corner_radius(12.0)
-        .inner_margin(36)
-        .show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new(title).size(20.0).strong());
-                ui.label(RichText::new(subtitle).color(Color32::GRAY));
-            });
-        });
+fn file_action_failure_message(action: &str, report: &FileActionReport) -> Option<String> {
+    if report.failures.is_empty() {
+        return None;
+    }
+    let mut message = format!(
+        "Nie udało się {action} {} z {} plików.",
+        report.failed_count(),
+        report.completed_count() + report.failed_count() + report.skipped_count()
+    );
+    for failure in report.failures.iter().take(3) {
+        let name = failure
+            .source
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| failure.source.to_string_lossy());
+        message.push_str(&format!("\n• {name}: {}", failure.error));
+    }
+    if report.failures.len() > 3 {
+        message.push_str(&format!(
+            "\n• …oraz {} kolejnych.",
+            report.failures.len() - 3
+        ));
+    }
+    Some(message)
 }
 
 fn review_status_card(ui: &mut egui::Ui, title: &str, detail: &str, failed: bool) {
@@ -2682,13 +3274,8 @@ fn slot_has_editable_original(slot: Option<&PageSlot>) -> bool {
 }
 
 fn file_fingerprint(path: &std::path::Path) -> Result<u64, String> {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-
-    let bytes = std::fs::read(path)
-        .map_err(|error| format!("Nie można sprawdzić pliku źródłowego: {error}"))?;
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    Ok(hasher.finish())
+    crate::atomic_file::content_fingerprint(path)
+        .map_err(|error| format!("Nie można sprawdzić pliku źródłowego: {error}"))
 }
 
 fn pdf_io_error(error: std::io::Error) -> String {
@@ -2795,6 +3382,17 @@ fn polish_page_count(count: usize) -> String {
         "strony"
     } else {
         "stron"
+    };
+    format!("{count} {word}")
+}
+
+fn polish_file_count(count: usize) -> String {
+    let word = if count == 1 {
+        "plik"
+    } else if (2..=4).contains(&(count % 10)) && !(12..=14).contains(&(count % 100)) {
+        "pliki"
+    } else {
+        "plików"
     };
     format!("{count} {word}")
 }

@@ -5,6 +5,8 @@ mod atomic_file;
 mod autocapture;
 mod camera;
 mod document;
+mod library;
+mod library_view;
 mod overlay;
 mod pipeline;
 mod review_viewport;

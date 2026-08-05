@@ -1,0 +1,1095 @@
+use crate::library::{LibrarySnapshot, SortMode, normalize_search_text, search_and_sort};
+use crate::storage::PdfInfo;
+use eframe::egui::{
+    self, Align, Button, Color32, Frame, Id, Layout, Margin, RichText, Sense, Stroke, UiBuilder,
+    Vec2,
+};
+use std::collections::{BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const SIDEBAR_WIDTH: f32 = 214.0;
+const DETAILS_WIDTH: f32 = 286.0;
+const DETAILS_BREAKPOINT: f32 = 1_250.0;
+const ROW_HEIGHT: f32 = 62.0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LibrarySection {
+    #[default]
+    Home,
+    All,
+    Recent,
+}
+
+#[derive(Debug)]
+pub struct LibraryViewState {
+    pub section: LibrarySection,
+    pub query: String,
+    pub sort: SortMode,
+    selected: BTreeSet<PathBuf>,
+    anchor: Option<PathBuf>,
+    search_focus_requested: bool,
+    selection_revision: u64,
+    visible_cache_key: Option<VisibleCacheKey>,
+    visible_documents: Vec<PdfInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VisibleCacheKey {
+    snapshot_revision: u64,
+    query: String,
+    sort: SortMode,
+    section: LibrarySection,
+    folder_scope: Option<PathBuf>,
+    recent_documents: Vec<PathBuf>,
+}
+
+impl Default for LibraryViewState {
+    fn default() -> Self {
+        Self {
+            section: LibrarySection::Home,
+            query: String::new(),
+            sort: SortMode::Newest,
+            selected: BTreeSet::new(),
+            anchor: None,
+            search_focus_requested: false,
+            selection_revision: 0,
+            visible_cache_key: None,
+            visible_documents: Vec::new(),
+        }
+    }
+}
+
+impl LibraryViewState {
+    pub fn selected_paths(&self) -> Vec<PathBuf> {
+        self.selected.iter().cloned().collect()
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.anchor = None;
+    }
+
+    pub fn select_only(&mut self, path: PathBuf) {
+        self.selected.clear();
+        self.selected.insert(path.clone());
+        self.anchor = Some(path);
+    }
+
+    pub fn replace_path(&mut self, source: &Path, destination: &Path) {
+        if self.selected.remove(source) {
+            self.selected.insert(destination.to_path_buf());
+        }
+        if self.anchor.as_deref() == Some(source) {
+            self.anchor = Some(destination.to_path_buf());
+        }
+    }
+
+    pub fn remove_paths<'a>(&mut self, paths: impl IntoIterator<Item = &'a PathBuf>) {
+        for path in paths {
+            self.selected.remove(path);
+            if self.anchor.as_ref() == Some(path) {
+                self.anchor = None;
+            }
+        }
+    }
+
+    pub fn replace_prefix(&mut self, source: &Path, destination: &Path) {
+        let replacements: Vec<(PathBuf, PathBuf)> = self
+            .selected
+            .iter()
+            .filter_map(|path| {
+                path.strip_prefix(source)
+                    .ok()
+                    .map(|suffix| (path.clone(), destination.join(suffix)))
+            })
+            .collect();
+        for (source_path, destination_path) in replacements {
+            self.replace_path(&source_path, &destination_path);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum LibraryAction {
+    ChangeSection(LibrarySection),
+    SelectFolder(PathBuf),
+    RenameFolder(PathBuf),
+    NewFolder,
+    NewScan(Option<PathBuf>),
+    Refresh,
+    Open(PathBuf),
+    Edit(PathBuf),
+    Rename(PathBuf),
+    Move(Vec<PathBuf>),
+    Recycle(Vec<PathBuf>),
+    OpenFolderInExplorer(PathBuf),
+}
+
+#[derive(Clone, Copy)]
+pub struct LibraryViewInput<'a> {
+    pub snapshot: &'a LibrarySnapshot,
+    pub snapshot_revision: u64,
+    pub recent_documents: &'a [PathBuf],
+    pub selected_folder: Option<&'a Path>,
+    pub preferred_scan_folder: Option<&'a Path>,
+    pub library_root: &'a Path,
+    pub loading: bool,
+    pub keyboard_enabled: bool,
+}
+
+pub fn show_library_view(
+    ui: &mut egui::Ui,
+    state: &mut LibraryViewState,
+    input: LibraryViewInput<'_>,
+) -> Vec<LibraryAction> {
+    if state.selection_revision != input.snapshot_revision {
+        let valid_paths: HashSet<&Path> = input
+            .snapshot
+            .pdfs
+            .iter()
+            .map(|pdf| pdf.path.as_path())
+            .collect();
+        state
+            .selected
+            .retain(|path| valid_paths.contains(path.as_path()));
+        if state
+            .anchor
+            .as_ref()
+            .is_some_and(|path| !state.selected.contains(path))
+        {
+            state.anchor = None;
+        }
+        state.selection_revision = input.snapshot_revision;
+    }
+
+    refresh_visible_cache(state, input);
+    let documents = std::mem::take(&mut state.visible_documents);
+    handle_keyboard(ui, state, input.keyboard_enabled, &documents);
+
+    let mut actions = keyboard_actions(ui, state, input.keyboard_enabled, &documents);
+    let available = ui.available_size();
+    let show_details = available.x >= DETAILS_BREAKPOINT;
+    let details_width = if show_details { DETAILS_WIDTH } else { 0.0 };
+    let center_width = (available.x - SIDEBAR_WIDTH - details_width - 24.0).max(360.0);
+
+    ui.horizontal_top(|ui| {
+        ui.allocate_ui_with_layout(
+            Vec2::new(SIDEBAR_WIDTH, available.y),
+            Layout::top_down(Align::Min),
+            |ui| show_sidebar(ui, state, input, &mut actions),
+        );
+        ui.separator();
+        ui.allocate_ui_with_layout(
+            Vec2::new(center_width, available.y),
+            Layout::top_down(Align::Min),
+            |ui| show_document_list(ui, state, input, &documents, &mut actions),
+        );
+        if show_details {
+            ui.separator();
+            ui.allocate_ui_with_layout(
+                Vec2::new(DETAILS_WIDTH, available.y),
+                Layout::top_down(Align::Min),
+                |ui| show_details_panel(ui, state, input, &mut actions),
+            );
+        }
+    });
+
+    state.visible_documents = documents;
+    actions
+}
+
+fn show_sidebar(
+    ui: &mut egui::Ui,
+    state: &mut LibraryViewState,
+    input: LibraryViewInput<'_>,
+    actions: &mut Vec<LibraryAction>,
+) {
+    ui.set_width(SIDEBAR_WIDTH);
+    ui.label(RichText::new("Biblioteka").size(20.0).strong());
+    ui.add_space(8.0);
+
+    if section_button(
+        ui,
+        "Strona główna",
+        state.section == LibrarySection::Home && input.selected_folder.is_none(),
+    )
+    .clicked()
+    {
+        state.section = LibrarySection::Home;
+        state.query.clear();
+        state.clear_selection();
+        actions.push(LibraryAction::ChangeSection(LibrarySection::Home));
+    }
+    if section_button(
+        ui,
+        "Ostatnie",
+        state.section == LibrarySection::Recent && input.selected_folder.is_none(),
+    )
+    .clicked()
+    {
+        state.section = LibrarySection::Recent;
+        state.query.clear();
+        state.clear_selection();
+        actions.push(LibraryAction::ChangeSection(LibrarySection::Recent));
+    }
+    if section_button(
+        ui,
+        &format!("Wszystkie dokumenty  {}", input.snapshot.pdfs.len()),
+        state.section == LibrarySection::All && input.selected_folder.is_none(),
+    )
+    .clicked()
+    {
+        state.section = LibrarySection::All;
+        state.query.clear();
+        state.clear_selection();
+        actions.push(LibraryAction::ChangeSection(LibrarySection::All));
+    }
+
+    ui.add_space(18.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Foldery").strong());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.small_button("+").on_hover_text("Nowy folder").clicked() {
+                actions.push(LibraryAction::NewFolder);
+            }
+        });
+    });
+
+    egui::ScrollArea::vertical()
+        .id_salt("library-folders")
+        .auto_shrink([false, false])
+        .max_height((ui.available_height() - 118.0).max(90.0))
+        .show(ui, |ui| {
+            let normalized_query = normalize_search_text(&state.query);
+            let query_tokens: Vec<&str> = normalized_query.split_whitespace().collect();
+            let mut shown = 0;
+            for folder in &input.snapshot.folders {
+                let normalized_name = normalize_search_text(&folder.name);
+                if !query_tokens
+                    .iter()
+                    .all(|token| normalized_name.contains(token))
+                {
+                    continue;
+                }
+                shown += 1;
+                let selected = input.selected_folder == Some(folder.path.as_path());
+                let label = format!("{}  ({})", folder.name, folder.pdf_count);
+                if ui.selectable_label(selected, label).clicked() {
+                    state.section = LibrarySection::All;
+                    state.query.clear();
+                    state.clear_selection();
+                    actions.push(LibraryAction::SelectFolder(folder.path.clone()));
+                }
+            }
+            if shown == 0 && !state.query.trim().is_empty() {
+                ui.label(
+                    RichText::new("Brak pasujących folderów")
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            }
+        });
+
+    ui.add_space(8.0);
+    if ui.button("Nowy folder").clicked() {
+        actions.push(LibraryAction::NewFolder);
+    }
+    ui.separator();
+    ui.label(RichText::new("Lokalizacja").small().color(Color32::GRAY));
+    ui.label(
+        RichText::new(input.library_root.display().to_string())
+            .small()
+            .color(Color32::DARK_GRAY),
+    );
+}
+
+fn section_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    ui.add_sized(
+        [SIDEBAR_WIDTH, 36.0],
+        Button::selectable(selected, RichText::new(text).size(15.0)),
+    )
+}
+
+fn show_document_list(
+    ui: &mut egui::Ui,
+    state: &mut LibraryViewState,
+    input: LibraryViewInput<'_>,
+    documents: &[PdfInfo],
+    actions: &mut Vec<LibraryAction>,
+) {
+    let title = if !state.query.trim().is_empty() {
+        format!("Wyniki wyszukiwania ({})", documents.len())
+    } else if let Some(folder) = input.selected_folder {
+        if folder == input.library_root {
+            "Główna lokalizacja".to_owned()
+        } else {
+            folder
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Folder".to_owned())
+        }
+    } else {
+        match state.section {
+            LibrarySection::Home => "Ostatnio dodane".to_owned(),
+            LibrarySection::All => "Wszystkie dokumenty".to_owned(),
+            LibrarySection::Recent => "Ostatnio otwierane".to_owned(),
+        }
+    };
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).size(20.0).strong());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let destination = scan_destination(input);
+            let has_destination = destination.is_some();
+            let scan_button = ui.add_enabled(
+                has_destination,
+                Button::new(RichText::new("Nowy skan").color(Color32::WHITE).strong())
+                    .fill(Color32::from_rgb(38, 101, 180)),
+            );
+            if scan_button.clicked() {
+                actions.push(LibraryAction::NewScan(destination));
+            }
+            if !has_destination {
+                scan_button.on_disabled_hover_text("Najpierw wybierz albo utwórz folder.");
+            }
+            if ui.button("Odśwież").clicked() {
+                actions.push(LibraryAction::Refresh);
+            }
+        });
+    });
+    if let Some(folder) = input.selected_folder {
+        ui.horizontal(|ui| {
+            if folder != input.library_root && ui.button("Zmień nazwę folderu").clicked() {
+                actions.push(LibraryAction::RenameFolder(folder.to_path_buf()));
+            }
+            if ui.button("Otwórz folder").clicked() {
+                actions.push(LibraryAction::OpenFolderInExplorer(folder.to_path_buf()));
+            }
+        });
+    }
+
+    ui.horizontal(|ui| {
+        let show_sort = !state.query.trim().is_empty()
+            || input.selected_folder.is_some()
+            || state.section == LibrarySection::All;
+        let search_width = if show_sort {
+            (ui.available_width() - 176.0).max(180.0)
+        } else {
+            ui.available_width()
+        };
+        let search = ui.add_sized(
+            [search_width, 38.0],
+            egui::TextEdit::singleline(&mut state.query)
+                .id(Id::new("library-search"))
+                .hint_text("Szukaj po nazwie pliku lub folderu…"),
+        );
+        if state.search_focus_requested {
+            search.request_focus();
+            state.search_focus_requested = false;
+        }
+        if show_sort {
+            egui::ComboBox::from_id_salt("library-sort")
+                .selected_text(sort_label(state.sort))
+                .width(160.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut state.sort, SortMode::Newest, "Najnowsze");
+                    ui.selectable_value(&mut state.sort, SortMode::Name, "Nazwa A–Z");
+                    ui.selectable_value(&mut state.sort, SortMode::Folder, "Folder");
+                    ui.selectable_value(&mut state.sort, SortMode::Size, "Największe");
+                });
+        }
+    });
+
+    if !state.selected.is_empty() {
+        selected_action_bar(ui, state, input, documents, actions);
+    } else {
+        ui.add_space(2.0);
+    }
+
+    if input.loading && input.snapshot.pdfs.is_empty() {
+        ui.vertical_centered(|ui| {
+            ui.add_space(50.0);
+            ui.spinner();
+            ui.label("Wczytywanie biblioteki…");
+        });
+        return;
+    }
+    if documents.is_empty() {
+        let (title, detail) = if state.query.trim().is_empty()
+            && state.section == LibrarySection::Recent
+            && input.selected_folder.is_none()
+        {
+            (
+                "Brak ostatnio otwieranych dokumentów",
+                "Tutaj pojawią się pliki otwarte z biblioteki.",
+            )
+        } else if state.query.trim().is_empty() {
+            (
+                "Brak dokumentów",
+                "Zeskanuj dokument albo wybierz inny folder.",
+            )
+        } else {
+            (
+                "Brak wyników",
+                "Zmień wyszukiwaną frazę lub wyczyść pole wyszukiwania.",
+            )
+        };
+        empty_state(ui, title, detail);
+        return;
+    }
+
+    Frame::new()
+        .fill(Color32::from_rgb(238, 242, 247))
+        .inner_margin(Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(32.0, 18.0),
+                    Layout::centered_and_justified(egui::Direction::LeftToRight),
+                    |ui| {
+                        let all_selected = documents
+                            .iter()
+                            .all(|pdf| state.selected.contains(&pdf.path));
+                        let mut checked = all_selected;
+                        let response =
+                            ui.checkbox(&mut checked, "")
+                                .on_hover_text(if all_selected {
+                                    "Odznacz wszystkie widoczne dokumenty"
+                                } else {
+                                    "Zaznacz wszystkie widoczne dokumenty"
+                                });
+                        if response.changed() {
+                            set_visible_selection(state, documents, checked);
+                        }
+                    },
+                );
+                ui.add_sized(
+                    [210.0, 18.0],
+                    egui::Label::new(RichText::new("Nazwa").strong()),
+                );
+                ui.add_sized(
+                    [130.0, 18.0],
+                    egui::Label::new(RichText::new("Folder").strong()),
+                );
+                ui.add_sized(
+                    [100.0, 18.0],
+                    egui::Label::new(RichText::new("Zmodyfikowano").strong()),
+                );
+                ui.add_sized(
+                    [75.0, 18.0],
+                    egui::Label::new(RichText::new("Rozmiar").strong()),
+                );
+            });
+        });
+
+    let list_height = ui.available_height().max(80.0);
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), list_height),
+        Layout::top_down(Align::Min),
+        |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("library-documents")
+                .auto_shrink([false, false])
+                .show_rows(ui, ROW_HEIGHT, documents.len(), |ui, rows| {
+                    for index in rows {
+                        document_row(ui, state, documents, index, actions);
+                    }
+                });
+        },
+    );
+}
+
+fn set_visible_selection(state: &mut LibraryViewState, documents: &[PdfInfo], selected: bool) {
+    if selected {
+        for pdf in documents {
+            state.selected.insert(pdf.path.clone());
+        }
+        state.anchor = documents.first().map(|pdf| pdf.path.clone());
+    } else {
+        for pdf in documents {
+            state.selected.remove(&pdf.path);
+        }
+        if state
+            .anchor
+            .as_ref()
+            .is_some_and(|path| documents.iter().any(|pdf| &pdf.path == path))
+        {
+            state.anchor = None;
+        }
+    }
+}
+
+fn selected_action_bar(
+    ui: &mut egui::Ui,
+    state: &mut LibraryViewState,
+    input: LibraryViewInput<'_>,
+    documents: &[PdfInfo],
+    actions: &mut Vec<LibraryAction>,
+) {
+    let paths = state.selected_paths();
+    Frame::new()
+        .fill(Color32::from_rgb(231, 241, 252))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(176, 207, 239)))
+        .corner_radius(8.0)
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let visible_paths: HashSet<&Path> =
+                    documents.iter().map(|pdf| pdf.path.as_path()).collect();
+                let visible_count = paths
+                    .iter()
+                    .filter(|path| visible_paths.contains(path.as_path()))
+                    .count();
+                let hidden_count = paths.len().saturating_sub(visible_count);
+                let selected_label = if hidden_count == 0 {
+                    format!("Wybrano: {}", paths.len())
+                } else {
+                    format!("Wybrano: {} (poza widokiem: {hidden_count})", paths.len())
+                };
+                ui.label(RichText::new(selected_label).strong());
+                if paths.len() == 1 {
+                    let path = paths[0].clone();
+                    if ui.button("Otwórz").clicked() {
+                        actions.push(LibraryAction::Open(path.clone()));
+                    }
+                    if ui.button("Edytuj").clicked() {
+                        actions.push(LibraryAction::Edit(path.clone()));
+                    }
+                    if ui.button("Zmień nazwę").clicked() {
+                        actions.push(LibraryAction::Rename(path));
+                    }
+                }
+                if ui.button("Przenieś do…").clicked() {
+                    actions.push(LibraryAction::Move(paths.clone()));
+                }
+                if ui
+                    .button(RichText::new("Do Kosza").color(Color32::DARK_RED))
+                    .clicked()
+                {
+                    actions.push(LibraryAction::Recycle(paths.clone()));
+                }
+                if ui.button("Wyczyść zaznaczenie").clicked() {
+                    state.clear_selection();
+                }
+                if paths.len() == 1
+                    && let Some(pdf) = find_pdf(input.snapshot, &paths[0])
+                    && ui.button("Folder w Eksploratorze").clicked()
+                {
+                    actions.push(LibraryAction::OpenFolderInExplorer(pdf.folder_path.clone()));
+                }
+            });
+        });
+}
+
+fn document_row(
+    ui: &mut egui::Ui,
+    state: &mut LibraryViewState,
+    documents: &[PdfInfo],
+    index: usize,
+    actions: &mut Vec<LibraryAction>,
+) {
+    let pdf = &documents[index];
+    let selected = state.selected.contains(&pdf.path);
+    let fill = if selected {
+        Color32::from_rgb(231, 241, 252)
+    } else if index.is_multiple_of(2) {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(250, 251, 253)
+    };
+    let row = Frame::new()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, Color32::from_gray(228)))
+        .inner_margin(Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.scope_builder(UiBuilder::new().sense(Sense::click()), |ui| {
+                ui.set_height(ROW_HEIGHT - 14.0);
+                ui.horizontal(|ui| {
+                    let mut checked = selected;
+                    if ui.checkbox(&mut checked, "").changed() {
+                        if checked {
+                            state.selected.insert(pdf.path.clone());
+                            state.anchor = Some(pdf.path.clone());
+                        } else {
+                            state.selected.remove(&pdf.path);
+                        }
+                    }
+                    ui.add_sized(
+                        [210.0, 32.0],
+                        egui::Label::new(RichText::new(&pdf.name).strong()),
+                    );
+                    ui.add_sized([130.0, 32.0], egui::Label::new(&pdf.folder_name));
+                    ui.add_sized(
+                        [100.0, 32.0],
+                        egui::Label::new(format_relative_time(pdf.modified_secs)),
+                    );
+                    ui.add_sized([75.0, 32.0], egui::Label::new(format_size(pdf.size_bytes)));
+                });
+            })
+            .response
+        });
+    let response = row.inner;
+    if response.double_clicked() {
+        state.select_only(pdf.path.clone());
+        actions.push(LibraryAction::Open(pdf.path.clone()));
+    } else if response.clicked() {
+        let modifiers = ui.input(|input| input.modifiers);
+        if modifiers.shift {
+            select_range(state, documents, index);
+        } else if modifiers.command || modifiers.ctrl {
+            if !state.selected.remove(&pdf.path) {
+                state.selected.insert(pdf.path.clone());
+            }
+            state.anchor = Some(pdf.path.clone());
+        } else {
+            state.select_only(pdf.path.clone());
+        }
+    }
+}
+
+fn select_range(state: &mut LibraryViewState, documents: &[PdfInfo], clicked: usize) {
+    let anchor = state
+        .anchor
+        .as_ref()
+        .and_then(|path| documents.iter().position(|pdf| &pdf.path == path))
+        .unwrap_or(clicked);
+    let (start, end) = if anchor <= clicked {
+        (anchor, clicked)
+    } else {
+        (clicked, anchor)
+    };
+    state.selected.clear();
+    for pdf in &documents[start..=end] {
+        state.selected.insert(pdf.path.clone());
+    }
+    state.anchor = Some(documents[anchor].path.clone());
+}
+
+fn show_details_panel(
+    ui: &mut egui::Ui,
+    state: &LibraryViewState,
+    input: LibraryViewInput<'_>,
+    actions: &mut Vec<LibraryAction>,
+) {
+    ui.set_width(DETAILS_WIDTH);
+    ui.label(RichText::new("Szczegóły").size(20.0).strong());
+    ui.add_space(12.0);
+    let Some(path) = state.selected.iter().next() else {
+        ui.label(RichText::new("Wybierz dokument, aby zobaczyć szczegóły.").color(Color32::GRAY));
+        return;
+    };
+    if state.selected.len() > 1 {
+        ui.label(RichText::new(format!("Wybrano {} dokumentów.", state.selected.len())).strong());
+        ui.label("Użyj paska działań nad listą, aby przenieść je albo wysłać do Kosza.");
+        return;
+    }
+    let Some(pdf) = find_pdf(input.snapshot, path) else {
+        return;
+    };
+    Frame::new()
+        .fill(Color32::WHITE)
+        .stroke(Stroke::new(1.0, Color32::from_gray(220)))
+        .corner_radius(10.0)
+        .inner_margin(16)
+        .show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("PDF")
+                        .size(24.0)
+                        .strong()
+                        .color(Color32::from_rgb(38, 101, 180)),
+                );
+            });
+            ui.add_space(10.0);
+            ui.label(RichText::new(&pdf.name).strong());
+            ui.label(format!("Folder: {}", pdf.folder_name));
+            ui.label(format!("Rozmiar: {}", format_size(pdf.size_bytes)));
+            ui.label(format!(
+                "Zmodyfikowano: {}",
+                format_relative_time(pdf.modified_secs)
+            ));
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(pdf.path.display().to_string())
+                    .small()
+                    .color(Color32::GRAY),
+            );
+            ui.add_space(12.0);
+            if ui.button("Otwórz PDF").clicked() {
+                actions.push(LibraryAction::Open(pdf.path.clone()));
+            }
+            if ui.button("Edytuj skan").clicked() {
+                actions.push(LibraryAction::Edit(pdf.path.clone()));
+            }
+            if ui.button("Zmień nazwę").clicked() {
+                actions.push(LibraryAction::Rename(pdf.path.clone()));
+            }
+            if ui.button("Przenieś do…").clicked() {
+                actions.push(LibraryAction::Move(vec![pdf.path.clone()]));
+            }
+            if ui.button("Otwórz folder").clicked() {
+                actions.push(LibraryAction::OpenFolderInExplorer(pdf.folder_path.clone()));
+            }
+            if ui
+                .button(RichText::new("Przenieś do Kosza").color(Color32::DARK_RED))
+                .clicked()
+            {
+                actions.push(LibraryAction::Recycle(vec![pdf.path.clone()]));
+            }
+        });
+}
+
+fn refresh_visible_cache(state: &mut LibraryViewState, input: LibraryViewInput<'_>) {
+    let key = VisibleCacheKey {
+        snapshot_revision: input.snapshot_revision,
+        query: state.query.clone(),
+        sort: state.sort,
+        section: state.section,
+        folder_scope: input.selected_folder.map(Path::to_path_buf),
+        recent_documents: input.recent_documents.to_vec(),
+    };
+    if state.visible_cache_key.as_ref() == Some(&key) {
+        return;
+    }
+    state.visible_documents = visible_documents_for_key(input.snapshot, &key);
+    state.visible_cache_key = Some(key);
+}
+
+fn visible_documents_for_key(snapshot: &LibrarySnapshot, key: &VisibleCacheKey) -> Vec<PdfInfo> {
+    if !key.query.trim().is_empty() {
+        return search_and_sort(snapshot, &key.query, key.sort, None);
+    }
+    if let Some(folder) = key.folder_scope.as_deref() {
+        return search_and_sort(snapshot, "", key.sort, Some(folder));
+    }
+    match key.section {
+        LibrarySection::All => search_and_sort(snapshot, "", key.sort, None),
+        LibrarySection::Home => {
+            let mut newest = search_and_sort(snapshot, "", SortMode::Newest, None);
+            newest.truncate(12);
+            newest
+        }
+        LibrarySection::Recent => key
+            .recent_documents
+            .iter()
+            .filter_map(|path| find_pdf(snapshot, path).cloned())
+            .take(50)
+            .collect(),
+    }
+}
+
+fn scan_destination(input: LibraryViewInput<'_>) -> Option<PathBuf> {
+    input
+        .selected_folder
+        .filter(|selected| {
+            *selected != input.library_root
+                && input
+                    .snapshot
+                    .folders
+                    .iter()
+                    .any(|folder| folder.path.as_path() == *selected)
+        })
+        .or(input.preferred_scan_folder.filter(|preferred| {
+            input
+                .snapshot
+                .folders
+                .iter()
+                .any(|folder| folder.path.as_path() == *preferred)
+        }))
+        .or_else(|| {
+            (input.selected_folder.is_none() && input.snapshot.folders.len() == 1)
+                .then(|| input.snapshot.folders[0].path.as_path())
+        })
+        .map(Path::to_path_buf)
+}
+
+fn handle_keyboard(
+    ui: &egui::Ui,
+    state: &mut LibraryViewState,
+    enabled: bool,
+    documents: &[PdfInfo],
+) {
+    if !enabled {
+        return;
+    }
+    let search_has_focus = ui.memory(|memory| memory.focused() == Some(Id::new("library-search")));
+    let focus_search = ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::F));
+    if focus_search {
+        state.search_focus_requested = true;
+    }
+    if !search_has_focus
+        && ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::A))
+    {
+        state.selected = documents.iter().map(|pdf| pdf.path.clone()).collect();
+        state.anchor = documents.first().map(|pdf| pdf.path.clone());
+    }
+    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        if !state.query.is_empty() {
+            state.query.clear();
+        } else {
+            state.clear_selection();
+        }
+    }
+}
+
+fn keyboard_actions(
+    ui: &egui::Ui,
+    state: &LibraryViewState,
+    enabled: bool,
+    documents: &[PdfInfo],
+) -> Vec<LibraryAction> {
+    if !enabled {
+        return Vec::new();
+    }
+    if ui.memory(|memory| memory.focused().is_some()) {
+        return Vec::new();
+    }
+    let selected = state.selected_paths();
+    let mut actions = Vec::new();
+    if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+        let target = selected
+            .first()
+            .cloned()
+            .or_else(|| documents.first().map(|pdf| pdf.path.clone()));
+        if let Some(path) = target {
+            actions.push(LibraryAction::Open(path));
+        }
+    }
+    if selected.len() == 1 && ui.input(|input| input.key_pressed(egui::Key::F2)) {
+        actions.push(LibraryAction::Rename(selected[0].clone()));
+    }
+    if !selected.is_empty() && ui.input(|input| input.key_pressed(egui::Key::Delete)) {
+        actions.push(LibraryAction::Recycle(selected));
+    }
+    actions
+}
+
+fn find_pdf<'a>(snapshot: &'a LibrarySnapshot, path: &Path) -> Option<&'a PdfInfo> {
+    snapshot.pdfs.iter().find(|pdf| pdf.path == path)
+}
+
+fn sort_label(sort: SortMode) -> &'static str {
+    match sort {
+        SortMode::Newest => "Najnowsze",
+        SortMode::Name => "Nazwa A–Z",
+        SortMode::Folder => "Folder",
+        SortMode::Size => "Największe",
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.1} GB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.0} KB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as u64)
+    }
+}
+
+fn format_relative_time(modified_secs: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format_relative_time_at(modified_secs, now)
+}
+
+fn format_relative_time_at(modified_secs: u64, now_secs: u64) -> String {
+    if modified_secs == 0 {
+        return "—".to_owned();
+    }
+    let age = now_secs.saturating_sub(modified_secs);
+    match age {
+        0..=59 => "przed chwilą".to_owned(),
+        60..=3_599 => format!("{} min temu", age / 60),
+        3_600..=86_399 => format!("{} godz. temu", age / 3_600),
+        86_400..=172_799 => "1 dzień temu".to_owned(),
+        _ => format!("{} dni temu", age / 86_400),
+    }
+}
+
+fn empty_state(ui: &mut egui::Ui, title: &str, detail: &str) {
+    Frame::new()
+        .fill(Color32::WHITE)
+        .stroke(Stroke::new(1.0, Color32::from_gray(222)))
+        .corner_radius(10.0)
+        .inner_margin(28)
+        .show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(title).size(19.0).strong());
+                ui.label(RichText::new(detail).color(Color32::GRAY));
+            });
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::FolderInfo;
+
+    fn pdf(name: &str, folder: &Path, modified_secs: u64) -> PdfInfo {
+        PdfInfo {
+            name: name.to_owned(),
+            path: folder.join(name),
+            folder_name: folder
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            folder_path: folder.to_path_buf(),
+            size_bytes: 100,
+            modified_secs,
+        }
+    }
+
+    #[test]
+    fn formats_document_sizes_for_office_lists() {
+        assert_eq!(format_size(999), "999 B");
+        assert_eq!(format_size(2 * 1024), "2 KB");
+        assert_eq!(format_size(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn formats_relative_time_without_clock_dependency() {
+        assert_eq!(format_relative_time_at(1_000, 1_010), "przed chwilą");
+        assert_eq!(format_relative_time_at(1_000, 1_120), "2 min temu");
+        assert_eq!(format_relative_time_at(0, 1_120), "—");
+        assert_eq!(format_relative_time_at(1_000, 87_400), "1 dzień temu");
+    }
+
+    #[test]
+    fn home_is_newest_while_recent_preserves_open_order() {
+        let folder = PathBuf::from("Akta");
+        let old = pdf("A01.pdf", &folder, 10);
+        let new = pdf("A02.pdf", &folder, 20);
+        let snapshot = LibrarySnapshot {
+            root: PathBuf::from("library"),
+            folders: Vec::new(),
+            pdfs: vec![old.clone(), new.clone()],
+        };
+        let mut key = VisibleCacheKey {
+            snapshot_revision: 1,
+            query: String::new(),
+            sort: SortMode::Name,
+            section: LibrarySection::Home,
+            folder_scope: None,
+            recent_documents: vec![old.path.clone()],
+        };
+
+        let home = visible_documents_for_key(&snapshot, &key);
+        assert_eq!(home[0].path, new.path);
+        key.section = LibrarySection::Recent;
+        let recent = visible_documents_for_key(&snapshot, &key);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].path, old.path);
+    }
+
+    #[test]
+    fn preferred_scan_folder_is_used_outside_folder_view() {
+        let folder_path = PathBuf::from("library").join("Akta");
+        let snapshot = LibrarySnapshot {
+            root: PathBuf::from("library"),
+            folders: vec![FolderInfo {
+                name: "Akta".to_owned(),
+                path: folder_path.clone(),
+                pdf_count: 0,
+                modified_secs: 0,
+            }],
+            pdfs: Vec::new(),
+        };
+        let input = LibraryViewInput {
+            snapshot: &snapshot,
+            snapshot_revision: 1,
+            recent_documents: &[],
+            selected_folder: None,
+            preferred_scan_folder: Some(&folder_path),
+            library_root: &snapshot.root,
+            loading: false,
+            keyboard_enabled: true,
+        };
+
+        assert_eq!(scan_destination(input), Some(folder_path));
+    }
+
+    #[test]
+    fn library_root_scope_never_becomes_a_new_scan_destination() {
+        let root = PathBuf::from("library");
+        let preferred = root.join("Akta");
+        let snapshot = LibrarySnapshot {
+            root: root.clone(),
+            folders: vec![FolderInfo {
+                name: "Akta".to_owned(),
+                path: preferred.clone(),
+                pdf_count: 0,
+                modified_secs: 0,
+            }],
+            pdfs: Vec::new(),
+        };
+        let input = LibraryViewInput {
+            snapshot: &snapshot,
+            snapshot_revision: 1,
+            recent_documents: &[],
+            selected_folder: Some(&root),
+            preferred_scan_folder: Some(&preferred),
+            library_root: &root,
+            loading: false,
+            keyboard_enabled: true,
+        };
+
+        assert_eq!(scan_destination(input), Some(preferred));
+    }
+
+    #[test]
+    fn invalid_selected_folder_never_falls_back_to_a_different_folder() {
+        let root = PathBuf::from("library");
+        let existing = root.join("Stary");
+        let selected = root.join("Nowy");
+        let snapshot = LibrarySnapshot {
+            root: root.clone(),
+            folders: vec![FolderInfo {
+                name: "Stary".to_owned(),
+                path: existing,
+                pdf_count: 0,
+                modified_secs: 0,
+            }],
+            pdfs: Vec::new(),
+        };
+        let input = LibraryViewInput {
+            snapshot: &snapshot,
+            snapshot_revision: 1,
+            recent_documents: &[],
+            selected_folder: Some(&selected),
+            preferred_scan_folder: None,
+            library_root: &root,
+            loading: true,
+            keyboard_enabled: true,
+        };
+
+        assert_eq!(scan_destination(input), None);
+    }
+
+    #[test]
+    fn visible_select_all_keeps_hidden_selection() {
+        let folder = PathBuf::from("Akta");
+        let visible = vec![pdf("A01.pdf", &folder, 10), pdf("A02.pdf", &folder, 20)];
+        let hidden = folder.join("Ukryty.pdf");
+        let mut state = LibraryViewState::default();
+        state.selected.insert(hidden.clone());
+
+        set_visible_selection(&mut state, &visible, true);
+        assert_eq!(state.selected.len(), 3);
+        assert!(state.selected.contains(&hidden));
+
+        set_visible_selection(&mut state, &visible, false);
+        assert_eq!(state.selected, BTreeSet::from([hidden]));
+        assert!(state.anchor.is_none());
+    }
+}
