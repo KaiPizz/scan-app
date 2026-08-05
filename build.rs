@@ -8,6 +8,16 @@ fn main() {
             .set("FileDescription", "Skaner dokumentów")
             .set("ProductName", "Skaner dokumentów")
             .set("OriginalFilename", "skaner-dokumentow.exe");
-        resource.compile().expect("kompilacja zasobów Windows");
+        match resource.compile() {
+            Ok(()) => {}
+            // A non-Windows host cross-checking the code has no usable rc; the
+            // icon/version info only matters for real Windows builds.
+            Err(error)
+                if std::env::var("HOST").is_ok_and(|host| !host.contains("windows")) =>
+            {
+                println!("cargo:warning=pominięto zasoby Windows w cross-check: {error}");
+            }
+            Err(error) => panic!("kompilacja zasobów Windows: {error}"),
+        }
     }
 }
