@@ -135,6 +135,9 @@ pub fn scan_library_metadata(root: &Path) -> Result<(Vec<FolderInfo>, Vec<PdfInf
         let entry = entry.map_err(display_io_error)?;
         let file_type = entry.file_type().map_err(display_io_error)?;
         if file_type.is_dir() {
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
             let path = entry.path();
             let folder_pdfs = list_pdfs(&path)?;
             folders.push(FolderInfo {
@@ -180,6 +183,12 @@ fn pdf_info_from_entry(
     let file_type = entry.file_type().map_err(display_io_error)?;
     let path = entry.path();
     if !file_type.is_file() || !has_pdf_extension(&path) {
+        return Ok(None);
+    }
+    // Dot-prefixed files are this app's own recovery/lock artifacts
+    // (`.X.replace-recovery-*.pdf`, `.X.scan-save-conflict-*.pdf`, locks) —
+    // never documents. The startup sweep surfaces or removes them.
+    if entry.file_name().to_string_lossy().starts_with('.') {
         return Ok(None);
     }
     let metadata = entry.metadata().ok();
@@ -639,6 +648,21 @@ mod tests {
         assert_eq!(pdfs[0].folder_path, folder);
         assert_eq!(pdfs[0].size_bytes, 16);
         assert!(pdfs[0].modified_secs > 0);
+    }
+
+    #[test]
+    fn recovery_artifacts_are_not_indexed_as_documents() {
+        let root = TestDirectory::create("dotfiles");
+        let folder = root.0.join("Akta");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("Umowa.pdf"), b"pdf").unwrap();
+        fs::write(folder.join(".Umowa.replace-recovery-1-2.pdf"), b"backup").unwrap();
+        fs::create_dir(root.0.join(".skaner-folder-rename-recovery-1-3")).unwrap();
+
+        let (folders, pdfs) = scan_library_metadata(&root.0).unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(pdfs.len(), 1);
+        assert_eq!(pdfs[0].name, "Umowa.pdf");
     }
 
     #[test]

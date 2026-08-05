@@ -258,6 +258,17 @@ impl DocumentScannerApp {
         if let Err(error) = ensure_library(&app.library_root) {
             app.message = Some(error);
         }
+        {
+            // Housekeeping for crash leftovers of the atomic save machinery;
+            // results show up through the normal library refresh.
+            let root = app.library_root.clone();
+            std::thread::spawn(move || {
+                let _ = crate::library::sweep_recovery_artifacts(
+                    &root,
+                    Duration::from_secs(24 * 60 * 60),
+                );
+            });
+        }
         if let Some(store) = SessionStore::open_default() {
             if let Some(recovered) = store.load_existing() {
                 app.recovered = Some(recovered);

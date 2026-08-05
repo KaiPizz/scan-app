@@ -726,6 +726,133 @@ fn move_no_clobber(source: &Path, target: &Path) -> std::io::Result<()> {
     crate::atomic_file::move_new(source, target)
 }
 
+enum RecoveryArtifact {
+    /// `X.pdf.part-<pid>-<n>` — an interrupted atomic write; pure garbage.
+    PartFile,
+    /// `.X.pdf.skaner-edit.lock` — a lock sidecar left by a crashed process.
+    StaleLock,
+    /// `.X.replace-recovery-*.pdf` — the pre-save version preserved when a
+    /// crash hit between ReplaceFileW and cleanup; superseded but recoverable.
+    ReplaceBackup,
+    /// `.X.scan-save-conflict-*.pdf` — OUR version that lost a save race;
+    /// genuinely valuable user data that must become visible.
+    Conflict,
+    /// `.skaner-rename-recovery-*.pdf` — a document stranded mid-rename.
+    RenameLeftover,
+}
+
+fn classify_recovery_artifact(name: &str) -> Option<RecoveryArtifact> {
+    if !name.starts_with('.') {
+        return name
+            .contains(".part-")
+            .then_some(RecoveryArtifact::PartFile);
+    }
+    if name.ends_with(".skaner-edit.lock") {
+        return Some(RecoveryArtifact::StaleLock);
+    }
+    if name.to_lowercase().ends_with(".pdf") {
+        if name.contains(".scan-save-conflict-") {
+            return Some(RecoveryArtifact::Conflict);
+        }
+        if name.contains(".replace-recovery-") {
+            return Some(RecoveryArtifact::ReplaceBackup);
+        }
+        if name.starts_with(".skaner-rename-recovery-") {
+            return Some(RecoveryArtifact::RenameLeftover);
+        }
+    }
+    None
+}
+
+/// Startup housekeeping over the library root and its direct child folders.
+///
+/// Crash leftovers from the atomic save machinery otherwise accumulate
+/// forever (and, before dot-files were filtered from the index, even showed
+/// up as documents). Valuable artifacts are surfaced, not deleted: conflict
+/// and rename leftovers become visible PDFs, replace-backups go to the
+/// recycle bin, and only `.part` fragments and stale locks are removed —
+/// each of those only after `min_age`, so an operation that is literally in
+/// flight is never touched.
+pub fn sweep_recovery_artifacts(root: &Path, min_age: std::time::Duration) -> FileActionReport {
+    let mut report = FileActionReport::default();
+    let Ok(entries) = fs::read_dir(root) else {
+        return report;
+    };
+    let mut folders = vec![root.to_path_buf()];
+    for entry in entries.filter_map(Result::ok) {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && !entry.file_name().to_string_lossy().starts_with('.')
+        {
+            folders.push(entry.path());
+        }
+    }
+    for folder in folders {
+        let Ok(entries) = fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(artifact) = classify_recovery_artifact(name) else {
+                continue;
+            };
+            let path = entry.path();
+            let old_enough = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= min_age);
+            match artifact {
+                RecoveryArtifact::PartFile | RecoveryArtifact::StaleLock => {
+                    if old_enough {
+                        match fs::remove_file(&path) {
+                            Ok(()) => report.success(path, None),
+                            Err(error) => report.failure(path, error.to_string()),
+                        }
+                    }
+                }
+                RecoveryArtifact::ReplaceBackup => {
+                    if old_enough {
+                        match recycle_pdf(&path) {
+                            Ok(()) => report.success(path, None),
+                            Err(error) => report.failure(path, error),
+                        }
+                    }
+                }
+                RecoveryArtifact::Conflict | RecoveryArtifact::RenameLeftover => {
+                    let stem = match artifact {
+                        RecoveryArtifact::Conflict => name
+                            .strip_prefix('.')
+                            .and_then(|rest| rest.split(".scan-save-conflict-").next())
+                            .filter(|stem| !stem.is_empty())
+                            .map(|stem| format!("{stem} (konflikt zapisu)"))
+                            .unwrap_or_else(|| "Odzyskany dokument (konflikt zapisu)".to_owned()),
+                        _ => "Odzyskany dokument".to_owned(),
+                    };
+                    let target = match unique_pdf_path(&folder, &stem) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            report.failure(path, error);
+                            continue;
+                        }
+                    };
+                    match move_no_clobber(&path, &target) {
+                        Ok(()) => report.success(path, Some(target)),
+                        Err(error) => report.failure(path, error.to_string()),
+                    }
+                }
+            }
+        }
+    }
+    report
+}
+
 fn display_io_error(error: std::io::Error) -> String {
     format!("Błąd systemu plików: {error}")
 }
@@ -926,6 +1053,47 @@ mod tests {
         };
         assert_eq!(report.completed_count(), 1);
         assert!(target_folder.join("A01.pdf").is_file());
+    }
+
+    #[test]
+    fn sweep_surfaces_conflicts_and_removes_fragments() {
+        let root = TestDir::new("sweep");
+        let folder = root.path().join("Akta");
+        fs::create_dir(&folder).expect("create folder");
+        fs::write(folder.join("Umowa.pdf"), b"dokument").expect("document");
+        fs::write(folder.join("Umowa.pdf.part-999-1"), b"czesc").expect("part");
+        fs::write(folder.join(".Umowa.scan-save-conflict-999-2.pdf"), b"konflikt")
+            .expect("conflict");
+        fs::write(
+            root.path().join(".skaner-rename-recovery-999-3.pdf"),
+            b"po-rename",
+        )
+        .expect("rename leftover");
+        fs::write(folder.join(".Umowa.pdf.skaner-edit.lock"), b"").expect("stale lock");
+
+        let report = sweep_recovery_artifacts(root.path(), std::time::Duration::ZERO);
+
+        assert!(!folder.join("Umowa.pdf.part-999-1").exists());
+        assert!(!folder.join(".Umowa.scan-save-conflict-999-2.pdf").exists());
+        assert_eq!(
+            fs::read(folder.join("Umowa (konflikt zapisu).pdf")).expect("surfaced conflict"),
+            b"konflikt"
+        );
+        assert_eq!(
+            fs::read(root.path().join("Odzyskany dokument.pdf")).expect("surfaced leftover"),
+            b"po-rename"
+        );
+        assert!(!folder.join(".Umowa.pdf.skaner-edit.lock").exists());
+        assert!(folder.join("Umowa.pdf").exists(), "zwykły dokument nietknięty");
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+    }
+
+    #[test]
+    fn sweep_never_deletes_fresh_in_flight_files() {
+        let root = TestDir::new("sweep-age");
+        fs::write(root.path().join("Doc.pdf.part-1-1"), b"czesc").expect("part");
+        sweep_recovery_artifacts(root.path(), std::time::Duration::from_secs(3600));
+        assert!(root.path().join("Doc.pdf.part-1-1").exists());
     }
 
     #[test]
