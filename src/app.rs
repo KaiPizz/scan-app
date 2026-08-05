@@ -1,8 +1,8 @@
 use crate::autocapture::{AutoCapture, FeedResult};
 use crate::camera::{CameraController, CameraEvent};
 use crate::document::{
-    CropPoint, ScannedPage, extract_pdf_pages, page_from_jpeg_bytes, pages_from_jpeg_bytes,
-    render_pdf, rotate_page_by_quarter_turns, rotate_page_clockwise,
+    CropPoint, ScannedPage, extract_pdf_pages, page_from_jpeg_bytes, pages_from_extracted,
+    render_pdf, rotate_rgb,
 };
 use crate::library::{
     FileActionReport, FileOperationEvent, FileOperationWorker, LibraryEvent, LibrarySnapshot,
@@ -657,11 +657,7 @@ impl DocumentScannerApp {
                         continue;
                     };
                     self.session_write_page(id, &page.jpeg, &original_jpeg, corners, 0);
-                    let texture = context.load_texture(
-                        format!("strona-{id}"),
-                        rgb_to_color_image(&page.review_image),
-                        TextureOptions::LINEAR,
-                    );
+                    let texture = strip_texture(context, id, 0, &page, 0);
                     self.slots[index].slot = PageSlot::Ready(Box::new(PageData {
                         page,
                         original_jpeg,
@@ -685,57 +681,33 @@ impl DocumentScannerApp {
                 }
                 PipelineEvent::ReprocessDone { id, page, corners } => {
                     let mut persisted = None;
-                    let mut feedback = None;
                     if let Some(entry) = self.slots.iter_mut().find(|entry| entry.id == id) {
                         let current = std::mem::replace(&mut entry.slot, PageSlot::Processing);
-                        let (original_jpeg, quarter_turns, previous) = match current {
+                        let (original_jpeg, quarter_turns) = match current {
                             PageSlot::Reprocessing {
                                 original_jpeg,
                                 quarter_turns,
-                                previous,
-                            } => (original_jpeg, quarter_turns, previous),
+                                previous: _,
+                            } => (original_jpeg, quarter_turns),
                             other => {
                                 entry.slot = other;
                                 continue;
                             }
                         };
-                        let processed = if quarter_turns > 0 {
-                            rotate_page_by_quarter_turns(&page, quarter_turns)
-                        } else {
-                            Ok(page)
-                        };
-                        match processed {
-                            Ok(page) => {
-                                let texture = context.load_texture(
-                                    format!("strona-{id}-kadr-{}", entry.revision + 1),
-                                    rgb_to_color_image(&page.review_image),
-                                    TextureOptions::LINEAR,
-                                );
-                                let persisted_jpeg = page.jpeg.clone();
-                                entry.revision += 1;
-                                entry.slot = PageSlot::Ready(Box::new(PageData {
-                                    page,
-                                    original_jpeg: original_jpeg.clone(),
-                                    corners,
-                                    quarter_turns,
-                                    texture,
-                                }));
-                                persisted = Some((persisted_jpeg, original_jpeg, quarter_turns));
-                            }
-                            Err(error) => {
-                                feedback =
-                                    Some(reprocess_failure_message(previous.is_some(), &error));
-                                entry.slot = rollback_reprocessing(
-                                    previous,
-                                    original_jpeg,
-                                    quarter_turns,
-                                    error,
-                                );
-                            }
-                        }
-                    }
-                    if let Some(message) = feedback {
-                        self.message = Some(message);
+                        // Rotation stays metadata: the reprocessed JPEG is kept
+                        // unrotated and only the strip texture is rotated.
+                        let texture =
+                            strip_texture(context, entry.id, entry.revision + 1, &page, quarter_turns);
+                        let persisted_jpeg = page.jpeg.clone();
+                        entry.revision += 1;
+                        entry.slot = PageSlot::Ready(Box::new(PageData {
+                            page,
+                            original_jpeg: original_jpeg.clone(),
+                            corners,
+                            quarter_turns,
+                            texture,
+                        }));
+                        persisted = Some((persisted_jpeg, original_jpeg, quarter_turns));
                     }
                     if let Some((jpeg, original_jpeg, quarter_turns)) = persisted {
                         self.session_write_page(id, &jpeg, &original_jpeg, corners, quarter_turns);
@@ -902,6 +874,8 @@ impl DocumentScannerApp {
         })
     }
 
+    /// Instant and lossless: bumps the metadata quarter turn and rebuilds only
+    /// the small strip texture — the page JPEG is never re-encoded.
     fn rotate_selected_page(&mut self, context: &egui::Context) {
         let Some(index) = self.selected_slot else {
             return;
@@ -912,41 +886,21 @@ impl DocumentScannerApp {
         let PageSlot::Ready(data) = &mut entry.slot else {
             return;
         };
-        match rotate_page_clockwise(&data.page) {
-            Ok(rotated) => {
-                entry.revision += 1;
-                data.texture = context.load_texture(
-                    format!("strona-{}-obrot-{}", entry.id, entry.revision),
-                    rgb_to_color_image(&rotated.review_image),
-                    TextureOptions::LINEAR,
-                );
-                data.page = rotated;
-                data.quarter_turns = (data.quarter_turns + 1) % 4;
-                if self.editing_target.is_some() {
-                    self.edit_dirty = true;
-                }
-            }
-            Err(error) => {
-                self.message = Some(error);
-                return;
-            }
+        entry.revision += 1;
+        data.quarter_turns = (data.quarter_turns + 1) % 4;
+        data.texture = strip_texture(context, entry.id, entry.revision, &data.page, data.quarter_turns);
+        if self.editing_target.is_some() {
+            self.edit_dirty = true;
         }
-        let written = match self.slots.get(index) {
-            Some(entry) => match &entry.slot {
-                PageSlot::Ready(data) => Some((
-                    entry.id,
-                    data.page.jpeg.clone(),
-                    data.original_jpeg.clone(),
-                    data.corners,
-                    data.quarter_turns,
-                )),
-                _ => None,
-            },
-            None => None,
-        };
-        if let Some((id, jpeg, original_jpeg, corners, quarter_turns)) = written {
-            self.session_write_page(id, &jpeg, &original_jpeg, corners, quarter_turns);
-        }
+        let written = (
+            entry.id,
+            data.page.jpeg.clone(),
+            data.original_jpeg.clone(),
+            data.corners,
+            data.quarter_turns,
+        );
+        let (id, jpeg, original_jpeg, corners, quarter_turns) = written;
+        self.session_write_page(id, &jpeg, &original_jpeg, corners, quarter_turns);
         self.review_viewport.invalidate();
     }
 
@@ -1010,7 +964,7 @@ impl DocumentScannerApp {
         let mut pages = Vec::with_capacity(self.slots.len());
         for entry in &self.slots {
             match &entry.slot {
-                PageSlot::Ready(data) => pages.push(&data.page),
+                PageSlot::Ready(data) => pages.push((&data.page, data.quarter_turns)),
                 _ => {
                     self.message = Some("Usuń strony z błędem (⚠) przed zapisem.".to_owned());
                     return;
@@ -1228,11 +1182,7 @@ impl DocumentScannerApp {
                 .and_then(page_from_jpeg_bytes);
             match recovered_page {
                 Ok(page) => {
-                    let texture = context.load_texture(
-                        format!("strona-{id}"),
-                        rgb_to_color_image(&page.review_image),
-                        TextureOptions::LINEAR,
-                    );
+                    let texture = strip_texture(context, id, 0, &page, quarter_turns);
                     self.slots.push(SlotEntry {
                         id,
                         revision: 0,
@@ -1396,7 +1346,7 @@ impl DocumentScannerApp {
                 return;
             }
         };
-        let pages = match pages_from_jpeg_bytes(jpegs) {
+        let pages = match pages_from_extracted(jpegs) {
             Ok(pages) => pages,
             Err(error) => {
                 self.message = Some(error);
@@ -1410,7 +1360,7 @@ impl DocumentScannerApp {
             .unwrap_or_else(|| pdf.name.clone());
         let target = pdf.path.clone();
         self.begin_scan();
-        for page in pages {
+        for (page, quarter_turns) in pages {
             let id = self.next_page_id;
             self.next_page_id += 1;
             // An imported PDF only contains the already processed page, not the
@@ -1418,12 +1368,8 @@ impl DocumentScannerApp {
             // apply perspective correction and JPEG compression a second time.
             let original_jpeg = Vec::new();
             let corners = full_frame_editor_corners();
-            self.session_write_page(id, &page.jpeg, &original_jpeg, corners, 0);
-            let texture = context.load_texture(
-                format!("strona-{id}"),
-                rgb_to_color_image(&page.review_image),
-                TextureOptions::LINEAR,
-            );
+            self.session_write_page(id, &page.jpeg, &original_jpeg, corners, quarter_turns);
+            let texture = strip_texture(context, id, 0, &page, quarter_turns);
             self.slots.push(SlotEntry {
                 id,
                 revision: 0,
@@ -1431,7 +1377,7 @@ impl DocumentScannerApp {
                     page,
                     original_jpeg,
                     corners,
-                    quarter_turns: 0,
+                    quarter_turns,
                     texture,
                 })),
             });
@@ -2373,6 +2319,7 @@ impl DocumentScannerApp {
                 PageTextureKey {
                     id: *id,
                     revision: *revision,
+                    quarter_turns: data.quarter_turns,
                 },
                 &data.page.jpeg,
             ),
@@ -3444,6 +3391,28 @@ fn rgb_to_color_image(image: &RgbImage) -> ColorImage {
     ColorImage::from_rgb(
         [image.width() as usize, image.height() as usize],
         image.as_raw(),
+    )
+}
+
+/// Film-strip texture for a page, rotated for display by its quarter turns.
+fn strip_texture(
+    context: &egui::Context,
+    id: u64,
+    revision: u64,
+    page: &ScannedPage,
+    quarter_turns: u8,
+) -> egui::TextureHandle {
+    let rotated;
+    let source = if quarter_turns.is_multiple_of(4) {
+        &page.review_image
+    } else {
+        rotated = rotate_rgb(&page.review_image, quarter_turns);
+        &rotated
+    };
+    context.load_texture(
+        format!("strona-{id}-r{revision}-t{quarter_turns}"),
+        rgb_to_color_image(source),
+        TextureOptions::LINEAR,
     )
 }
 

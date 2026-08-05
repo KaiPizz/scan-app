@@ -289,23 +289,16 @@ fn expand_corners(corners: [CropPoint; 4], amount: f32) -> [CropPoint; 4] {
     })
 }
 
-pub fn rotate_page_clockwise(page: &ScannedPage) -> Result<ScannedPage, String> {
-    rotate_page_by_quarter_turns(page, 1)
-}
-
-pub fn rotate_page_by_quarter_turns(
-    page: &ScannedPage,
-    quarter_turns: u8,
-) -> Result<ScannedPage, String> {
-    let image = decode_jpeg(&page.jpeg)?;
-    let rotated = match quarter_turns % 4 {
-        0 => image,
-        1 => imageops::rotate90(&image),
-        2 => imageops::rotate180(&image),
-        3 => imageops::rotate270(&image),
-        _ => unreachable!(),
-    };
-    page_from_image(rotated)
+/// Display-time rotation. Page JPEGs are never re-encoded for rotation any
+/// more — `quarter_turns` travels as metadata (session + PDF `/Rotate`) and
+/// only rasters headed for the screen are rotated.
+pub fn rotate_rgb(image: &RgbImage, quarter_turns: u8) -> RgbImage {
+    match quarter_turns % 4 {
+        1 => imageops::rotate90(image),
+        2 => imageops::rotate180(image),
+        3 => imageops::rotate270(image),
+        _ => image.clone(),
+    }
 }
 
 const PDF_TITLE: &str = "Zeskanowany dokument";
@@ -316,9 +309,10 @@ const A4_PORTRAIT_PT: (f32, f32) = (210.0 / 25.4 * 72.0, 297.0 / 25.4 * 72.0);
 ///
 /// No decode or re-encode happens here: the PDF carries the exact q91 bytes
 /// held in RAM, so saving is fast, needs no per-page raster buffers, and
-/// repeated edit → save cycles add no generational JPEG loss. The layout
-/// mirrors exactly what `extract_pdf_pages` accepts back.
-pub fn render_pdf(pages: &[&ScannedPage]) -> Result<Vec<u8>, String> {
+/// repeated edit → save cycles add no generational JPEG loss. Rotation is
+/// expressed through the page's `/Rotate` entry instead of touching pixels.
+/// The layout mirrors exactly what `extract_pdf_pages` accepts back.
+pub fn render_pdf(pages: &[(&ScannedPage, u8)]) -> Result<Vec<u8>, String> {
     use lopdf::content::{Content, Operation};
     use lopdf::{Object, Stream, dictionary};
 
@@ -328,7 +322,7 @@ pub fn render_pdf(pages: &[&ScannedPage]) -> Result<Vec<u8>, String> {
     let mut document = lopdf::Document::with_version("1.5");
     let pages_id = document.new_object_id();
     let mut kids = Vec::with_capacity(pages.len());
-    for page in pages {
+    for (page, quarter_turns) in pages {
         let landscape = page.width > page.height;
         let (page_width, page_height) = if landscape {
             (A4_PORTRAIT_PT.1, A4_PORTRAIT_PT.0)
@@ -371,7 +365,7 @@ pub fn render_pdf(pages: &[&ScannedPage]) -> Result<Vec<u8>, String> {
             .encode()
             .map_err(|error| format!("Nie można przygotować treści strony PDF: {error}"))?;
         let content_id = document.add_object(Stream::new(dictionary! {}, encoded));
-        let page_id = document.add_object(dictionary! {
+        let mut page_dictionary = dictionary! {
             "Type" => "Page",
             "Parent" => Object::Reference(pages_id),
             "MediaBox" => vec![0.into(), 0.into(), page_width.into(), page_height.into()],
@@ -379,7 +373,12 @@ pub fn render_pdf(pages: &[&ScannedPage]) -> Result<Vec<u8>, String> {
                 "XObject" => dictionary! { "Im0" => Object::Reference(image_id) },
             },
             "Contents" => Object::Reference(content_id),
-        });
+        };
+        let rotation = i64::from(quarter_turns % 4) * 90;
+        if rotation != 0 {
+            page_dictionary.set("Rotate", rotation);
+        }
+        let page_id = document.add_object(page_dictionary);
         kids.push(Object::Reference(page_id));
     }
     let count = kids.len() as i64;
@@ -411,7 +410,7 @@ pub fn render_pdf(pages: &[&ScannedPage]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(test)]
-pub fn save_pdf(path: &Path, pages: &[&ScannedPage]) -> Result<(), String> {
+pub fn save_pdf(path: &Path, pages: &[(&ScannedPage, u8)]) -> Result<(), String> {
     let bytes = render_pdf(pages)?;
     crate::atomic_file::write(path, bytes)
         .map_err(|error| format!("Nie można ukończyć zapisu pliku PDF: {error}"))
@@ -434,8 +433,10 @@ fn page_from_image(image: RgbImage) -> Result<ScannedPage, String> {
 }
 
 /// Reads back the pages of a PDF produced by this app: every page is exactly
-/// one full-page JPEG XObject (DCTDecode). Foreign PDFs yield an error.
-pub fn extract_pdf_pages(path: &Path) -> Result<Vec<Vec<u8>>, String> {
+/// one full-page JPEG XObject (DCTDecode), optionally with a `/Rotate` entry.
+/// Returns each page's JPEG bytes with its rotation in quarter turns.
+/// Foreign PDFs yield an error.
+pub fn extract_pdf_pages(path: &Path) -> Result<Vec<(Vec<u8>, u8)>, String> {
     let document =
         lopdf::Document::load(path).map_err(|error| format!("Nie można odczytać PDF: {error}"))?;
     let has_marker = has_editable_marker(&document);
@@ -472,6 +473,9 @@ pub fn extract_pdf_pages(path: &Path) -> Result<Vec<Vec<u8>>, String> {
                     .to_owned(),
             );
         }
+        let quarter_turns = page_quarter_turns(&document, page_dictionary).ok_or_else(|| {
+            "Ten PDF ma nietypowy obrót strony i nie może być bezpiecznie edytowany.".to_owned()
+        })?;
         let (resources_dict, resource_ids) = document
             .get_page_resources(page_id)
             .map_err(|error| format!("Nie można odczytać zasobów strony: {error}"))?;
@@ -551,9 +555,27 @@ pub fn extract_pdf_pages(path: &Path) -> Result<Vec<Vec<u8>>, String> {
                     .to_owned(),
             );
         }
-        pages.push(stream.content.clone());
+        pages.push((stream.content.clone(), quarter_turns));
     }
     Ok(pages)
+}
+
+/// `None` for a rotation the app cannot represent (not a multiple of 90°).
+fn page_quarter_turns(document: &lopdf::Document, page: &lopdf::Dictionary) -> Option<u8> {
+    let value = match page.get(b"Rotate") {
+        Ok(lopdf::Object::Reference(id)) => document.get_object(*id).ok()?,
+        Ok(value) => value,
+        Err(_) => return Some(0),
+    };
+    let rotation = pdf_number(value)?;
+    if rotation.fract() != 0.0 {
+        return None;
+    }
+    let rotation = rotation as i64;
+    if rotation % 90 != 0 {
+        return None;
+    }
+    Some((((rotation % 360) + 360) % 360 / 90) as u8)
 }
 
 fn editable_page_image_name(operations: &[lopdf::content::Operation]) -> Option<&[u8]> {
@@ -655,11 +677,9 @@ fn page_is_safe_to_edit(
     image: &lopdf::Stream,
     operations: &[lopdf::content::Operation],
 ) -> bool {
-    if page.has(b"Rotate")
-        || page.has(b"UserUnit")
-        || image.dict.has(b"Mask")
-        || image.dict.has(b"SMask")
-    {
+    // Page-level /Rotate written by this app is handled by the caller;
+    // anything the caller could not normalize was already rejected there.
+    if page.has(b"UserUnit") || image.dict.has(b"Mask") || image.dict.has(b"SMask") {
         return false;
     }
     if inherited_page_options_present(document, page) {
@@ -795,15 +815,18 @@ pub fn page_from_jpeg_bytes(jpeg: Vec<u8>) -> Result<ScannedPage, String> {
     })
 }
 
-pub fn pages_from_jpeg_bytes(jpegs: Vec<Vec<u8>>) -> Result<Vec<ScannedPage>, String> {
+pub fn pages_from_extracted(
+    jpegs: Vec<(Vec<u8>, u8)>,
+) -> Result<Vec<(ScannedPage, u8)>, String> {
     if jpegs.is_empty() {
         return Err("Ten PDF nie zawiera stron.".to_owned());
     }
     jpegs
         .into_iter()
         .enumerate()
-        .map(|(index, jpeg)| {
+        .map(|(index, (jpeg, quarter_turns))| {
             page_from_jpeg_bytes(jpeg)
+                .map(|page| (page, quarter_turns))
                 .map_err(|error| format!("Nie można odczytać strony {}: {error}", index + 1))
         })
         .collect()
@@ -1182,15 +1205,48 @@ mod tests {
             "skaner-dokumentow-extract-{}.pdf",
             std::process::id()
         ));
-        save_pdf(&path, &[&first]).expect("zapis PDF");
+        save_pdf(&path, &[(&first, 0)]).expect("zapis PDF");
         let pages = extract_pdf_pages(&path).expect("ekstrakcja");
         std::fs::remove_file(&path).expect("usunięcie testowego PDF");
         assert_eq!(pages.len(), 1, "oczekiwano jednej strony");
-        let decoded_first = image::load_from_memory(&pages[0]).expect("dekodowanie 1");
+        assert_eq!(pages[0].1, 0);
+        let decoded_first = image::load_from_memory(&pages[0].0).expect("dekodowanie 1");
         assert_eq!(
             (decoded_first.width(), decoded_first.height()),
             (A4_WIDTH_PX, A4_HEIGHT_PX)
         );
+    }
+
+    #[test]
+    fn rotation_round_trips_as_metadata_without_touching_bytes() {
+        let page = page_from_image(RgbImage::from_pixel(
+            A4_WIDTH_PX,
+            A4_HEIGHT_PX,
+            Rgb([245, 245, 245]),
+        ))
+        .expect("strona");
+        let path = std::env::temp_dir().join(format!(
+            "skaner-dokumentow-rotate-{}.pdf",
+            std::process::id()
+        ));
+        save_pdf(&path, &[(&page, 3)]).expect("zapis PDF");
+        let pages = extract_pdf_pages(&path).expect("ekstrakcja");
+        std::fs::remove_file(&path).expect("usunięcie testowego PDF");
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].1, 3, "obrót musi wrócić z /Rotate");
+        assert_eq!(pages[0].0, page.jpeg, "bajty JPEG nie mogą się zmienić");
+    }
+
+    #[test]
+    fn rotate_rgb_turns_quarters() {
+        let mut image = RgbImage::from_pixel(2, 1, Rgb([10, 10, 10]));
+        image.put_pixel(0, 0, Rgb([200, 0, 0]));
+        let once = rotate_rgb(&image, 1);
+        assert_eq!(once.dimensions(), (1, 2));
+        assert_eq!(once.get_pixel(0, 0), &Rgb([200, 0, 0]));
+        let full = rotate_rgb(&image, 4);
+        assert_eq!(full.dimensions(), (2, 1));
+        assert_eq!(full.get_pixel(0, 0), &Rgb([200, 0, 0]));
     }
 
     #[test]
@@ -1417,20 +1473,10 @@ mod tests {
     fn pdf_page_import_is_all_or_nothing() {
         let page = page_from_image(RgbImage::from_pixel(80, 120, Rgb([240, 240, 240])))
             .expect("valid page");
-        let error = pages_from_jpeg_bytes(vec![page.jpeg, b"not-a-jpeg".to_vec()])
+        let error = pages_from_extracted(vec![(page.jpeg, 0), (b"not-a-jpeg".to_vec(), 1)])
             .err()
             .expect("second page must fail");
         assert!(error.contains("strony 2"), "unexpected error: {error}");
-    }
-
-    #[test]
-    fn quarter_turn_rotation_preserves_expected_orientation() {
-        let page =
-            page_from_image(RgbImage::from_pixel(80, 120, Rgb([240, 240, 240]))).expect("page");
-        let rotated = rotate_page_by_quarter_turns(&page, 1).expect("rotate once");
-        assert_eq!((rotated.width, rotated.height), (120, 80));
-        let full_turn = rotate_page_by_quarter_turns(&page, 4).expect("full turn");
-        assert_eq!((full_turn.width, full_turn.height), (80, 120));
     }
 
     #[test]
@@ -1439,7 +1485,7 @@ mod tests {
         let page = page_from_image(image).expect("strona testowa");
         let path =
             std::env::temp_dir().join(format!("skaner-dokumentow-res-{}.pdf", std::process::id()));
-        save_pdf(&path, &[&page]).expect("zapis PDF");
+        save_pdf(&path, &[(&page, 0)]).expect("zapis PDF");
         let bytes = std::fs::read(&path).expect("odczyt PDF");
         assert!(
             bytes
@@ -1450,8 +1496,9 @@ mod tests {
         let extracted = extract_pdf_pages(&path).expect("ekstrakcja");
         std::fs::remove_file(&path).expect("usunięcie testowego PDF");
         assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].1, 0);
         assert_eq!(
-            extracted[0], page.jpeg,
+            extracted[0].0, page.jpeg,
             "wyodrębniona strona nie jest bajtowo identyczna z zapisaną"
         );
     }
@@ -1468,7 +1515,7 @@ mod tests {
             "skaner-dokumentow-legacy-{}.pdf",
             std::process::id()
         ));
-        save_pdf(&path, &[&page]).expect("save marked PDF");
+        save_pdf(&path, &[(&page, 0)]).expect("save marked PDF");
 
         let mut document = lopdf::Document::load(&path).expect("load PDF");
         let info_id = match document.trailer.get(b"Info").expect("Info") {
@@ -1496,7 +1543,7 @@ mod tests {
             "skaner-dokumentow-unsafe-legacy-{}.pdf",
             std::process::id()
         ));
-        save_pdf(&path, &[&page]).expect("save marked PDF");
+        save_pdf(&path, &[(&page, 0)]).expect("save marked PDF");
 
         let mut document = lopdf::Document::load(&path).expect("load PDF");
         let info_id = match document.trailer.get(b"Info").expect("Info") {
@@ -1524,7 +1571,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&path, b"poprzednia wersja").expect("stary plik");
-        save_pdf(&path, &[&page]).expect("podmiana PDF");
+        save_pdf(&path, &[(&page, 0)]).expect("podmiana PDF");
         let bytes = std::fs::read(&path).expect("odczyt PDF");
         assert!(bytes.starts_with(b"%PDF-"));
         std::fs::remove_file(path).expect("usunięcie testowego PDF");
@@ -1536,7 +1583,7 @@ mod tests {
         let page = page_from_image(image).expect("strona testowa");
         let path =
             std::env::temp_dir().join(format!("skaner-dokumentow-test-{}.pdf", std::process::id()));
-        save_pdf(&path, &[&page]).expect("zapis PDF");
+        save_pdf(&path, &[(&page, 0)]).expect("zapis PDF");
         let bytes = std::fs::read(&path).expect("odczyt PDF");
         assert!(bytes.starts_with(b"%PDF-"));
         std::fs::remove_file(path).expect("usunięcie testowego PDF");

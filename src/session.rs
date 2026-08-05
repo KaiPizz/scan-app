@@ -42,11 +42,16 @@ enum ManifestState {
     Corrupt,
 }
 
+/// `format` 0 (legacy) stored the page JPEG already rotated, so its
+/// `quarter_turns` must not be applied again at display time. Format 1 keeps
+/// the JPEG unrotated and treats `quarter_turns` as display metadata.
 #[derive(Serialize, Deserialize)]
 struct PageMetadata {
     corners: [CropPoint; 4],
     #[serde(default)]
     quarter_turns: u8,
+    #[serde(default)]
+    format: u8,
 }
 
 pub struct SessionStore {
@@ -165,6 +170,7 @@ impl SessionStore {
         let metadata = ron::to_string(&PageMetadata {
             corners,
             quarter_turns: quarter_turns % 4,
+            format: 1,
         })
         .map_err(|error| error.to_string())?;
         crate::atomic_file::write(&metadata_path, metadata).map_err(io_error)?;
@@ -232,6 +238,8 @@ impl SessionStore {
                 corners: metadata.as_ref().map(|metadata| metadata.corners),
                 quarter_turns: metadata
                     .as_ref()
+                    // Legacy (format 0) JPEGs are already rotated on disk.
+                    .filter(|metadata| metadata.format >= 1)
                     .map(|metadata| metadata.quarter_turns % 4)
                     .unwrap_or(0),
             });
@@ -297,6 +305,8 @@ impl SessionStore {
                 corners: metadata.as_ref().map(|metadata| metadata.corners),
                 quarter_turns: metadata
                     .as_ref()
+                    // Legacy (format 0) JPEGs are already rotated on disk.
+                    .filter(|metadata| metadata.format >= 1)
                     .map(|metadata| metadata.quarter_turns % 4)
                     .unwrap_or(0),
             });
@@ -487,6 +497,29 @@ mod tests {
         assert_eq!(recovered.pages[0].original_jpeg, None);
         assert_eq!(recovered.pages[0].corners, None);
         assert_eq!(recovered.pages[0].quarter_turns, 0);
+        store.clear().expect("clear");
+    }
+
+    #[test]
+    fn legacy_format_zero_metadata_never_reapplies_rotation() {
+        let store = test_store("legacy-format");
+        store.begin(Path::new("D:/dokumenty")).expect("begin");
+        fs::write(store.page_path(4), b"obrocony-jpeg").expect("legacy page");
+        // Legacy metadata (no `format` field): the stored JPEG already
+        // contains the rotation.
+        fs::write(
+            store.metadata_path(4),
+            "(corners:((x:0.1,y:0.2),(x:0.9,y:0.2),(x:0.9,y:0.8),(x:0.1,y:0.8)),quarter_turns:3)",
+        )
+        .expect("legacy metadata");
+        let mut manifest = store.read_manifest().expect("manifest");
+        manifest.page_ids.push(4);
+        store.write_manifest(&manifest).expect("manifest update");
+
+        let recovered = store.load_existing().expect("session");
+        assert_eq!(recovered.pages.len(), 1);
+        assert_eq!(recovered.pages[0].quarter_turns, 0);
+        assert!(recovered.pages[0].corners.is_some());
         store.clear().expect("clear");
     }
 

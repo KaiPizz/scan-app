@@ -11,6 +11,7 @@ const ZOOM_STEP: f32 = 1.25;
 pub struct PageTextureKey {
     pub id: u64,
     pub revision: u64,
+    pub quarter_turns: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +89,11 @@ impl ReviewViewport {
                 return;
             }
         };
+        let image = if key.quarter_turns.is_multiple_of(4) {
+            image
+        } else {
+            crate::document::rotate_rgb(&image, key.quarter_turns)
+        };
         // Zoom and the pixel readout stay in source coordinates even when the
         // uploaded texture had to be reduced to the GPU limit.
         self.source_px = Vec2::new(image.width() as f32, image.height() as f32);
@@ -102,7 +108,7 @@ impl ReviewViewport {
             texture_source.as_raw(),
         );
         self.texture = Some(context.load_texture(
-            format!("review-full-{}-{}", key.id, key.revision),
+            format!("review-full-{}-{}-t{}", key.id, key.revision, key.quarter_turns),
             color_image,
             TextureOptions::LINEAR,
         ));
