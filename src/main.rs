@@ -20,8 +20,9 @@ fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Skaner dokumentów")
-            .with_inner_size([1180.0, 780.0])
-            .with_min_inner_size([900.0, 640.0]),
+            .with_inner_size([1000.0, 440.0])
+            .with_min_inner_size([720.0, 420.0])
+            .with_maximized(true),
         ..Default::default()
     };
 

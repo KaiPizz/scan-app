@@ -1,17 +1,21 @@
 use crate::library::{LibrarySnapshot, SortMode, normalize_search_text, search_and_sort};
 use crate::storage::PdfInfo;
 use eframe::egui::{
-    self, Align, Button, Color32, Frame, Id, Layout, Margin, RichText, Sense, Stroke, UiBuilder,
-    Vec2,
+    self, Align, Align2, Button, Color32, CornerRadius, FontId, Frame, Id, Layout, Margin,
+    RichText, Sense, Stroke, UiBuilder, Vec2,
 };
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SIDEBAR_WIDTH: f32 = 214.0;
+const SIDEBAR_WIDTH: f32 = 240.0;
 const DETAILS_WIDTH: f32 = 286.0;
-const DETAILS_BREAKPOINT: f32 = 1_250.0;
+const DETAILS_BREAKPOINT: f32 = 1_350.0;
 const ROW_HEIGHT: f32 = 62.0;
+const CONTROL_HEIGHT: f32 = 44.0;
+const MUTED_TEXT: Color32 = Color32::from_rgb(65, 69, 77);
+const BLUE: Color32 = Color32::from_rgb(38, 101, 180);
+const PALE_BLUE: Color32 = Color32::from_rgb(231, 241, 252);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LibrarySection {
@@ -124,6 +128,7 @@ pub enum LibraryAction {
     Move(Vec<PathBuf>),
     Recycle(Vec<PathBuf>),
     OpenFolderInExplorer(PathBuf),
+    OpenSettings,
 }
 
 #[derive(Clone, Copy)]
@@ -206,13 +211,20 @@ fn show_sidebar(
     actions: &mut Vec<LibraryAction>,
 ) {
     ui.set_width(SIDEBAR_WIDTH);
-    ui.label(RichText::new("Biblioteka").size(20.0).strong());
-    ui.add_space(8.0);
+    ui.spacing_mut().item_spacing.y = 4.0;
+    let compact_height = ui.available_height() < 430.0;
+    let row_height = if compact_height { 40.0 } else { CONTROL_HEIGHT };
+    if !compact_height {
+        ui.label(RichText::new("Biblioteka").size(22.0).strong());
+        ui.add_space(10.0);
+    }
 
     if section_button(
         ui,
         "Strona główna",
+        None,
         state.section == LibrarySection::Home && input.selected_folder.is_none(),
+        row_height,
     )
     .clicked()
     {
@@ -224,7 +236,9 @@ fn show_sidebar(
     if section_button(
         ui,
         "Ostatnie",
+        None,
         state.section == LibrarySection::Recent && input.selected_folder.is_none(),
+        row_height,
     )
     .clicked()
     {
@@ -235,8 +249,10 @@ fn show_sidebar(
     }
     if section_button(
         ui,
-        &format!("Wszystkie dokumenty  {}", input.snapshot.pdfs.len()),
+        "Wszystkie dokumenty",
+        Some(input.snapshot.pdfs.len()),
         state.section == LibrarySection::All && input.selected_folder.is_none(),
+        row_height,
     )
     .clicked()
     {
@@ -246,69 +262,246 @@ fn show_sidebar(
         actions.push(LibraryAction::ChangeSection(LibrarySection::All));
     }
 
-    ui.add_space(18.0);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Foldery").strong());
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.small_button("+").on_hover_text("Nowy folder").clicked() {
-                actions.push(LibraryAction::NewFolder);
-            }
-        });
-    });
-
-    egui::ScrollArea::vertical()
-        .id_salt("library-folders")
-        .auto_shrink([false, false])
-        .max_height((ui.available_height() - 118.0).max(90.0))
-        .show(ui, |ui| {
-            let normalized_query = normalize_search_text(&state.query);
-            let query_tokens: Vec<&str> = normalized_query.split_whitespace().collect();
-            let mut shown = 0;
-            for folder in &input.snapshot.folders {
-                let normalized_name = normalize_search_text(&folder.name);
-                if !query_tokens
-                    .iter()
-                    .all(|token| normalized_name.contains(token))
+    ui.add_space(if compact_height { 8.0 } else { 16.0 });
+    egui::containers::Sides::new()
+        .height(row_height)
+        .shrink_left()
+        .show(
+            ui,
+            |ui| {
+                ui.label(RichText::new("Foldery").size(15.0).strong());
+            },
+            |ui| {
+                ui.spacing_mut().interact_size.y = row_height;
+                if ui
+                    .add_sized([112.0, row_height], Button::new("+ Nowy"))
+                    .on_hover_text("Utwórz nowy folder")
+                    .clicked()
                 {
-                    continue;
+                    actions.push(LibraryAction::NewFolder);
                 }
-                shown += 1;
-                let selected = input.selected_folder == Some(folder.path.as_path());
-                let label = format!("{}  ({})", folder.name, folder.pdf_count);
-                if ui.selectable_label(selected, label).clicked() {
-                    state.section = LibrarySection::All;
-                    state.query.clear();
-                    state.clear_selection();
-                    actions.push(LibraryAction::SelectFolder(folder.path.clone()));
-                }
-            }
-            if shown == 0 && !state.query.trim().is_empty() {
-                ui.label(
-                    RichText::new("Brak pasujących folderów")
-                        .small()
-                        .color(Color32::GRAY),
-                );
-            }
-        });
+            },
+        );
 
-    ui.add_space(8.0);
-    if ui.button("Nowy folder").clicked() {
-        actions.push(LibraryAction::NewFolder);
+    let remaining = ui.available_rect_before_wrap();
+    let location_height: f32 = if compact_height { 92.0 } else { 126.0 };
+    let location_height = location_height.min(remaining.height());
+    let location_top = (remaining.bottom() - location_height).max(remaining.top());
+    let folders_bottom = (location_top - 10.0).max(remaining.top());
+    let folders_rect =
+        egui::Rect::from_min_max(remaining.min, egui::pos2(remaining.right(), folders_bottom));
+    let location_rect =
+        egui::Rect::from_min_max(egui::pos2(remaining.left(), location_top), remaining.max);
+
+    if folders_rect.height() > 1.0 {
+        let mut folders_ui = ui.new_child(
+            UiBuilder::new()
+                .id_salt("library-folder-area")
+                .max_rect(folders_rect)
+                .layout(Layout::top_down(Align::Min)),
+        );
+        folders_ui.set_clip_rect(folders_rect);
+        egui::ScrollArea::vertical()
+            .id_salt("library-folders")
+            .auto_shrink([false, false])
+            .show(&mut folders_ui, |ui| {
+                let normalized_query = normalize_search_text(&state.query);
+                let query_tokens: Vec<&str> = normalized_query.split_whitespace().collect();
+                let mut shown = 0;
+                for folder in &input.snapshot.folders {
+                    let normalized_name = normalize_search_text(&folder.name);
+                    if !query_tokens
+                        .iter()
+                        .all(|token| normalized_name.contains(token))
+                    {
+                        continue;
+                    }
+                    shown += 1;
+                    let selected = input.selected_folder == Some(folder.path.as_path());
+                    if sidebar_row(
+                        ui,
+                        &folder.name,
+                        Some(folder.pdf_count),
+                        selected,
+                        row_height,
+                    )
+                    .clicked()
+                    {
+                        state.section = LibrarySection::All;
+                        state.query.clear();
+                        state.clear_selection();
+                        actions.push(LibraryAction::SelectFolder(folder.path.clone()));
+                    }
+                }
+                if shown == 0 && !state.query.trim().is_empty() {
+                    ui.label(
+                        RichText::new("Brak pasujących folderów")
+                            .size(14.0)
+                            .color(MUTED_TEXT),
+                    );
+                }
+            });
     }
-    ui.separator();
-    ui.label(RichText::new("Lokalizacja").small().color(Color32::GRAY));
-    ui.label(
-        RichText::new(input.library_root.display().to_string())
-            .small()
-            .color(Color32::DARK_GRAY),
+
+    let mut location_ui = ui.new_child(
+        UiBuilder::new()
+            .id_salt("library-location-area")
+            .max_rect(location_rect)
+            .layout(Layout::top_down(Align::Min)),
     );
+    location_ui.set_clip_rect(location_rect);
+    show_location_card(
+        &mut location_ui,
+        input.library_root,
+        compact_height,
+        actions,
+    );
+    ui.advance_cursor_after_rect(remaining);
 }
 
-fn section_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
-    ui.add_sized(
-        [SIDEBAR_WIDTH, 36.0],
-        Button::selectable(selected, RichText::new(text).size(15.0)),
-    )
+fn section_button(
+    ui: &mut egui::Ui,
+    text: &str,
+    count: Option<usize>,
+    selected: bool,
+    height: f32,
+) -> egui::Response {
+    sidebar_row(ui, text, count, selected, height)
+}
+
+fn sidebar_row(
+    ui: &mut egui::Ui,
+    text: &str,
+    count: Option<usize>,
+    selected: bool,
+    height: f32,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
+    let fill = if selected {
+        PALE_BLUE
+    } else if response.hovered() {
+        Color32::from_rgb(239, 244, 249)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
+
+    let max_chars = if count.is_some() { 21 } else { 27 };
+    let visible_text = ellipsize(text, max_chars);
+    let text_color = if selected {
+        BLUE
+    } else {
+        Color32::from_gray(42)
+    };
+    let painter = ui.painter().with_clip_rect(rect.shrink(8.0));
+    painter.text(
+        rect.left_center() + Vec2::new(12.0, 0.0),
+        Align2::LEFT_CENTER,
+        visible_text,
+        FontId::proportional(15.0),
+        text_color,
+    );
+    if let Some(count) = count {
+        painter.text(
+            rect.right_center() - Vec2::new(12.0, 0.0),
+            Align2::RIGHT_CENTER,
+            count.to_string(),
+            FontId::proportional(14.0),
+            MUTED_TEXT,
+        );
+    }
+    if text.chars().count() > max_chars {
+        response.on_hover_text(text)
+    } else {
+        response
+    }
+}
+
+fn show_location_card(
+    ui: &mut egui::Ui,
+    library_root: &Path,
+    compact: bool,
+    actions: &mut Vec<LibraryAction>,
+) {
+    let full_path = library_root.display().to_string();
+    let location_name = library_root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| full_path.clone());
+    Frame::new()
+        .fill(Color32::WHITE)
+        .stroke(Stroke::new(1.0, Color32::from_gray(214)))
+        .corner_radius(10.0)
+        .inner_margin(if compact { 8 } else { 12 })
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = if compact { 3.0 } else { 4.0 };
+            ui.spacing_mut().interact_size.y = if compact { 40.0 } else { CONTROL_HEIGHT };
+            ui.set_width((SIDEBAR_WIDTH - if compact { 16.0 } else { 24.0 }).max(1.0));
+            if compact {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("Lokalizacja  ·  {full_path}"))
+                            .size(14.0)
+                            .strong()
+                            .color(MUTED_TEXT),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&full_path);
+                ui.add_space(4.0);
+            } else {
+                ui.label(
+                    RichText::new("Lokalizacja biblioteki")
+                        .size(14.0)
+                        .strong()
+                        .color(MUTED_TEXT),
+                );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(if location_name == full_path {
+                            full_path.clone()
+                        } else {
+                            format!("{location_name}  ·  {full_path}")
+                        })
+                        .size(15.0)
+                        .color(MUTED_TEXT),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&full_path);
+                ui.add_space(6.0);
+            }
+            let button_height = if compact { 40.0 } else { CONTROL_HEIGHT };
+            ui.horizontal(|ui| {
+                if ui
+                    .add_sized([86.0, button_height], Button::new("Otwórz"))
+                    .on_hover_text("Otwórz folder biblioteki w Eksploratorze")
+                    .clicked()
+                {
+                    actions.push(LibraryAction::OpenFolderInExplorer(
+                        library_root.to_path_buf(),
+                    ));
+                }
+                if ui
+                    .add_sized([86.0, button_height], Button::new("Zmień"))
+                    .on_hover_text("Wybierz inną lokalizację biblioteki")
+                    .clicked()
+                {
+                    actions.push(LibraryAction::OpenSettings);
+                }
+            });
+        });
+}
+
+fn ellipsize(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let mut shortened: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    shortened.push('…');
+    shortened
 }
 
 fn show_document_list(
@@ -337,69 +530,95 @@ fn show_document_list(
         }
     };
 
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(title).size(20.0).strong());
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let destination = scan_destination(input);
-            let has_destination = destination.is_some();
-            let scan_button = ui.add_enabled(
-                has_destination,
-                Button::new(RichText::new("Nowy skan").color(Color32::WHITE).strong())
-                    .fill(Color32::from_rgb(38, 101, 180)),
-            );
-            if scan_button.clicked() {
-                actions.push(LibraryAction::NewScan(destination));
-            }
-            if !has_destination {
-                scan_button.on_disabled_hover_text("Najpierw wybierz albo utwórz folder.");
-            }
-            if ui.button("Odśwież").clicked() {
-                actions.push(LibraryAction::Refresh);
-            }
-        });
-    });
+    egui::containers::Sides::new()
+        .height(CONTROL_HEIGHT)
+        .shrink_left()
+        .truncate()
+        .show(
+            ui,
+            |ui| {
+                ui.add(egui::Label::new(RichText::new(title).size(22.0).strong()).truncate());
+            },
+            |ui| {
+                let destination = scan_destination(input);
+                let has_destination = destination.is_some();
+                let scan_button = ui.add_enabled(
+                    has_destination,
+                    Button::new(RichText::new("Nowy skan").color(Color32::WHITE).strong())
+                        .fill(BLUE)
+                        .min_size(Vec2::new(112.0, CONTROL_HEIGHT)),
+                );
+                if scan_button.clicked() {
+                    actions.push(LibraryAction::NewScan(destination));
+                }
+                if !has_destination {
+                    scan_button.on_disabled_hover_text("Najpierw wybierz albo utwórz folder.");
+                }
+                if ui
+                    .add(Button::new("Odśwież").min_size(Vec2::new(88.0, CONTROL_HEIGHT)))
+                    .clicked()
+                {
+                    actions.push(LibraryAction::Refresh);
+                }
+            },
+        );
     if let Some(folder) = input.selected_folder {
-        ui.horizontal(|ui| {
-            if folder != input.library_root && ui.button("Zmień nazwę folderu").clicked() {
+        ui.horizontal_wrapped(|ui| {
+            if folder != input.library_root
+                && ui
+                    .add(
+                        Button::new("Zmień nazwę folderu").min_size(Vec2::new(0.0, CONTROL_HEIGHT)),
+                    )
+                    .clicked()
+            {
                 actions.push(LibraryAction::RenameFolder(folder.to_path_buf()));
             }
-            if ui.button("Otwórz folder").clicked() {
+            if ui
+                .add(Button::new("Otwórz folder").min_size(Vec2::new(0.0, CONTROL_HEIGHT)))
+                .clicked()
+            {
                 actions.push(LibraryAction::OpenFolderInExplorer(folder.to_path_buf()));
             }
         });
     }
 
-    ui.horizontal(|ui| {
-        let show_sort = !state.query.trim().is_empty()
-            || input.selected_folder.is_some()
-            || state.section == LibrarySection::All;
-        let search_width = if show_sort {
-            (ui.available_width() - 176.0).max(180.0)
-        } else {
-            ui.available_width()
-        };
-        let search = ui.add_sized(
-            [search_width, 38.0],
+    let show_sort = !state.query.trim().is_empty()
+        || input.selected_folder.is_some()
+        || state.section == LibrarySection::All;
+    let narrow_toolbar = show_sort && ui.available_width() < 520.0;
+    let search = if narrow_toolbar {
+        let response = ui.add_sized(
+            [ui.available_width(), CONTROL_HEIGHT],
             egui::TextEdit::singleline(&mut state.query)
                 .id(Id::new("library-search"))
                 .hint_text("Szukaj po nazwie pliku lub folderu…"),
         );
-        if state.search_focus_requested {
-            search.request_focus();
-            state.search_focus_requested = false;
-        }
-        if show_sort {
-            egui::ComboBox::from_id_salt("library-sort")
-                .selected_text(sort_label(state.sort))
-                .width(160.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut state.sort, SortMode::Newest, "Najnowsze");
-                    ui.selectable_value(&mut state.sort, SortMode::Name, "Nazwa A–Z");
-                    ui.selectable_value(&mut state.sort, SortMode::Folder, "Folder");
-                    ui.selectable_value(&mut state.sort, SortMode::Size, "Największe");
-                });
-        }
-    });
+        show_sort_picker(ui, state);
+        response
+    } else {
+        ui.horizontal(|ui| {
+            let search_width = if show_sort {
+                (ui.available_width() - 176.0).max(180.0)
+            } else {
+                ui.available_width()
+            };
+            let search = ui.add_sized(
+                [search_width, CONTROL_HEIGHT],
+                egui::TextEdit::singleline(&mut state.query)
+                    .id(Id::new("library-search"))
+                    .hint_text("Szukaj po nazwie pliku lub folderu…"),
+            );
+            if show_sort {
+                show_sort_picker(ui, state);
+            }
+            search
+        })
+        .inner
+    };
+    if state.search_focus_requested {
+        search.request_focus();
+        state.search_focus_requested = false;
+    }
 
     if !state.selected.is_empty() {
         selected_action_bar(ui, state, input, documents, actions);
@@ -439,47 +658,44 @@ fn show_document_list(
         return;
     }
 
+    let columns = TableColumns::new(
+        (ui.available_width() - 38.0).max(320.0),
+        input.selected_folder.is_none(),
+        ui.spacing().item_spacing.x,
+    );
     Frame::new()
         .fill(Color32::from_rgb(238, 242, 247))
-        .inner_margin(Margin::symmetric(10, 7))
+        .inner_margin(Margin::symmetric(10, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(32.0, 18.0),
-                    Layout::centered_and_justified(egui::Direction::LeftToRight),
-                    |ui| {
-                        let all_selected = documents
-                            .iter()
-                            .all(|pdf| state.selected.contains(&pdf.path));
-                        let mut checked = all_selected;
-                        let response =
-                            ui.checkbox(&mut checked, "")
-                                .on_hover_text(if all_selected {
-                                    "Odznacz wszystkie widoczne dokumenty"
-                                } else {
-                                    "Zaznacz wszystkie widoczne dokumenty"
-                                });
-                        if response.changed() {
-                            set_visible_selection(state, documents, checked);
-                        }
-                    },
+                checkbox_cell(ui, |ui| {
+                    let all_selected = documents
+                        .iter()
+                        .all(|pdf| state.selected.contains(&pdf.path));
+                    let mut checked = all_selected;
+                    let response = ui
+                        .checkbox(&mut checked, "")
+                        .on_hover_text(if all_selected {
+                            "Odznacz wszystkie widoczne dokumenty"
+                        } else {
+                            "Zaznacz wszystkie widoczne dokumenty"
+                        });
+                    if response.changed() {
+                        set_visible_selection(state, documents, checked);
+                    }
+                });
+                table_label(ui, columns.name, RichText::new("Nazwa").strong());
+                if columns.show_folder {
+                    table_label(ui, columns.folder, RichText::new("Folder").strong());
+                }
+                table_label(
+                    ui,
+                    columns.modified,
+                    RichText::new("Zmodyfikowano").strong(),
                 );
-                ui.add_sized(
-                    [210.0, 18.0],
-                    egui::Label::new(RichText::new("Nazwa").strong()),
-                );
-                ui.add_sized(
-                    [130.0, 18.0],
-                    egui::Label::new(RichText::new("Folder").strong()),
-                );
-                ui.add_sized(
-                    [100.0, 18.0],
-                    egui::Label::new(RichText::new("Zmodyfikowano").strong()),
-                );
-                ui.add_sized(
-                    [75.0, 18.0],
-                    egui::Label::new(RichText::new("Rozmiar").strong()),
-                );
+                if columns.show_size {
+                    table_label(ui, columns.size, RichText::new("Rozmiar").strong());
+                }
             });
         });
 
@@ -493,7 +709,7 @@ fn show_document_list(
                 .auto_shrink([false, false])
                 .show_rows(ui, ROW_HEIGHT, documents.len(), |ui, rows| {
                     for index in rows {
-                        document_row(ui, state, documents, index, actions);
+                        document_row(ui, state, documents, index, columns, actions);
                     }
                 });
         },
@@ -520,6 +736,60 @@ fn set_visible_selection(state: &mut LibraryViewState, documents: &[PdfInfo], se
     }
 }
 
+#[derive(Clone, Copy)]
+struct TableColumns {
+    name: f32,
+    folder: f32,
+    modified: f32,
+    size: f32,
+    show_folder: bool,
+    show_size: bool,
+    compact_folder: bool,
+}
+
+impl TableColumns {
+    fn new(width: f32, may_show_folder: bool, spacing: f32) -> Self {
+        let show_folder = may_show_folder && width >= 700.0;
+        let show_size = width >= 650.0;
+        let folder = 138.0;
+        let modified = 118.0;
+        let size = 82.0;
+        let visible_columns = 3 + usize::from(show_folder) + usize::from(show_size);
+        let total_spacing = spacing * visible_columns.saturating_sub(1) as f32;
+        let fixed = 32.0
+            + modified
+            + if show_folder { folder } else { 0.0 }
+            + if show_size { size } else { 0.0 };
+        let name = (width - fixed - total_spacing).max(150.0);
+        Self {
+            name,
+            folder,
+            modified,
+            size,
+            show_folder,
+            show_size,
+            compact_folder: may_show_folder && !show_folder,
+        }
+    }
+}
+
+fn checkbox_cell(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        Vec2::new(32.0, CONTROL_HEIGHT),
+        Layout::centered_and_justified(egui::Direction::LeftToRight),
+        add_contents,
+    );
+}
+
+fn table_label(ui: &mut egui::Ui, width: f32, text: RichText) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, CONTROL_HEIGHT),
+        Layout::left_to_right(Align::Center),
+        |ui| ui.add(egui::Label::new(text).truncate()),
+    )
+    .inner
+}
+
 fn selected_action_bar(
     ui: &mut egui::Ui,
     state: &mut LibraryViewState,
@@ -534,20 +804,20 @@ fn selected_action_bar(
         .corner_radius(8.0)
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
+            let visible_paths: HashSet<&Path> =
+                documents.iter().map(|pdf| pdf.path.as_path()).collect();
+            let visible_count = paths
+                .iter()
+                .filter(|path| visible_paths.contains(path.as_path()))
+                .count();
+            let hidden_count = paths.len().saturating_sub(visible_count);
+            let selected_label = if hidden_count == 0 {
+                format!("Wybrano: {}", paths.len())
+            } else {
+                format!("Wybrano: {} (poza widokiem: {hidden_count})", paths.len())
+            };
+            ui.label(RichText::new(selected_label).strong());
             ui.horizontal_wrapped(|ui| {
-                let visible_paths: HashSet<&Path> =
-                    documents.iter().map(|pdf| pdf.path.as_path()).collect();
-                let visible_count = paths
-                    .iter()
-                    .filter(|path| visible_paths.contains(path.as_path()))
-                    .count();
-                let hidden_count = paths.len().saturating_sub(visible_count);
-                let selected_label = if hidden_count == 0 {
-                    format!("Wybrano: {}", paths.len())
-                } else {
-                    format!("Wybrano: {} (poza widokiem: {hidden_count})", paths.len())
-                };
-                ui.label(RichText::new(selected_label).strong());
                 if paths.len() == 1 {
                     let path = paths[0].clone();
                     if ui.button("Otwórz").clicked() {
@@ -587,6 +857,7 @@ fn document_row(
     state: &mut LibraryViewState,
     documents: &[PdfInfo],
     index: usize,
+    columns: TableColumns,
     actions: &mut Vec<LibraryAction>,
 ) {
     let pdf = &documents[index];
@@ -606,25 +877,54 @@ fn document_row(
             ui.scope_builder(UiBuilder::new().sense(Sense::click()), |ui| {
                 ui.set_height(ROW_HEIGHT - 14.0);
                 ui.horizontal(|ui| {
-                    let mut checked = selected;
-                    if ui.checkbox(&mut checked, "").changed() {
-                        if checked {
-                            state.selected.insert(pdf.path.clone());
-                            state.anchor = Some(pdf.path.clone());
-                        } else {
-                            state.selected.remove(&pdf.path);
+                    checkbox_cell(ui, |ui| {
+                        let mut checked = selected;
+                        if ui.checkbox(&mut checked, "").changed() {
+                            if checked {
+                                state.selected.insert(pdf.path.clone());
+                                state.anchor = Some(pdf.path.clone());
+                            } else {
+                                state.selected.remove(&pdf.path);
+                            }
                         }
+                    });
+                    if columns.compact_folder {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(columns.name, CONTROL_HEIGHT),
+                            Layout::top_down(Align::Min).with_main_align(Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.add(
+                                    egui::Label::new(RichText::new(&pdf.name).strong()).truncate(),
+                                )
+                                .on_hover_text(&pdf.name);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&pdf.folder_name)
+                                            .size(13.0)
+                                            .color(MUTED_TEXT),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(&pdf.folder_name);
+                            },
+                        );
+                    } else {
+                        table_label(ui, columns.name, RichText::new(&pdf.name).strong())
+                            .on_hover_text(&pdf.name);
                     }
-                    ui.add_sized(
-                        [210.0, 32.0],
-                        egui::Label::new(RichText::new(&pdf.name).strong()),
+                    if columns.show_folder {
+                        table_label(ui, columns.folder, RichText::new(&pdf.folder_name))
+                            .on_hover_text(&pdf.folder_name);
+                    }
+                    table_label(
+                        ui,
+                        columns.modified,
+                        RichText::new(format_relative_time(pdf.modified_secs)),
                     );
-                    ui.add_sized([130.0, 32.0], egui::Label::new(&pdf.folder_name));
-                    ui.add_sized(
-                        [100.0, 32.0],
-                        egui::Label::new(format_relative_time(pdf.modified_secs)),
-                    );
-                    ui.add_sized([75.0, 32.0], egui::Label::new(format_size(pdf.size_bytes)));
+                    if columns.show_size {
+                        table_label(ui, columns.size, RichText::new(format_size(pdf.size_bytes)));
+                    }
                 });
             })
             .response
@@ -676,7 +976,7 @@ fn show_details_panel(
     ui.label(RichText::new("Szczegóły").size(20.0).strong());
     ui.add_space(12.0);
     let Some(path) = state.selected.iter().next() else {
-        ui.label(RichText::new("Wybierz dokument, aby zobaczyć szczegóły.").color(Color32::GRAY));
+        ui.label(RichText::new("Wybierz dokument, aby zobaczyć szczegóły.").color(MUTED_TEXT));
         return;
     };
     if state.selected.len() > 1 {
@@ -710,29 +1010,62 @@ fn show_details_panel(
                 format_relative_time(pdf.modified_secs)
             ));
             ui.add_space(8.0);
-            ui.label(
-                RichText::new(pdf.path.display().to_string())
-                    .small()
-                    .color(Color32::GRAY),
-            );
+            let full_path = pdf.path.display().to_string();
+            ui.add(
+                egui::Label::new(RichText::new(&full_path).size(14.0).color(MUTED_TEXT)).truncate(),
+            )
+            .on_hover_text(full_path);
             ui.add_space(12.0);
-            if ui.button("Otwórz PDF").clicked() {
+            if ui
+                .add_sized(
+                    [ui.available_width(), CONTROL_HEIGHT],
+                    Button::new("Otwórz PDF"),
+                )
+                .clicked()
+            {
                 actions.push(LibraryAction::Open(pdf.path.clone()));
             }
-            if ui.button("Edytuj skan").clicked() {
+            if ui
+                .add_sized(
+                    [ui.available_width(), CONTROL_HEIGHT],
+                    Button::new("Edytuj skan"),
+                )
+                .clicked()
+            {
                 actions.push(LibraryAction::Edit(pdf.path.clone()));
             }
-            if ui.button("Zmień nazwę").clicked() {
+            if ui
+                .add_sized(
+                    [ui.available_width(), CONTROL_HEIGHT],
+                    Button::new("Zmień nazwę"),
+                )
+                .clicked()
+            {
                 actions.push(LibraryAction::Rename(pdf.path.clone()));
             }
-            if ui.button("Przenieś do…").clicked() {
+            if ui
+                .add_sized(
+                    [ui.available_width(), CONTROL_HEIGHT],
+                    Button::new("Przenieś do…"),
+                )
+                .clicked()
+            {
                 actions.push(LibraryAction::Move(vec![pdf.path.clone()]));
             }
-            if ui.button("Otwórz folder").clicked() {
+            if ui
+                .add_sized(
+                    [ui.available_width(), CONTROL_HEIGHT],
+                    Button::new("Otwórz folder"),
+                )
+                .clicked()
+            {
                 actions.push(LibraryAction::OpenFolderInExplorer(pdf.folder_path.clone()));
             }
             if ui
-                .button(RichText::new("Przenieś do Kosza").color(Color32::DARK_RED))
+                .add_sized(
+                    [ui.available_width(), CONTROL_HEIGHT],
+                    Button::new(RichText::new("Przenieś do Kosza").color(Color32::DARK_RED)),
+                )
                 .clicked()
             {
                 actions.push(LibraryAction::Recycle(vec![pdf.path.clone()]));
@@ -869,6 +1202,18 @@ fn find_pdf<'a>(snapshot: &'a LibrarySnapshot, path: &Path) -> Option<&'a PdfInf
     snapshot.pdfs.iter().find(|pdf| pdf.path == path)
 }
 
+fn show_sort_picker(ui: &mut egui::Ui, state: &mut LibraryViewState) {
+    egui::ComboBox::from_id_salt("library-sort")
+        .selected_text(sort_label(state.sort))
+        .width(160.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut state.sort, SortMode::Newest, "Najnowsze");
+            ui.selectable_value(&mut state.sort, SortMode::Name, "Nazwa A–Z");
+            ui.selectable_value(&mut state.sort, SortMode::Folder, "Folder");
+            ui.selectable_value(&mut state.sort, SortMode::Size, "Największe");
+        });
+}
+
 fn sort_label(sort: SortMode) -> &'static str {
     match sort {
         SortMode::Newest => "Najnowsze",
@@ -925,7 +1270,7 @@ fn empty_state(ui: &mut egui::Ui, title: &str, detail: &str) {
         .show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new(title).size(19.0).strong());
-                ui.label(RichText::new(detail).color(Color32::GRAY));
+                ui.label(RichText::new(detail).color(MUTED_TEXT));
             });
         });
 }
@@ -963,6 +1308,26 @@ mod tests {
         assert_eq!(format_relative_time_at(1_000, 1_120), "2 min temu");
         assert_eq!(format_relative_time_at(0, 1_120), "—");
         assert_eq!(format_relative_time_at(1_000, 87_400), "1 dzień temu");
+    }
+
+    #[test]
+    fn sidebar_labels_are_shortened_without_breaking_unicode() {
+        assert_eq!(ellipsize("Dokumenty", 12), "Dokumenty");
+        assert_eq!(ellipsize("Zażółć gęślą jaźń", 10), "Zażółć gę…");
+    }
+
+    #[test]
+    fn document_columns_keep_the_name_flexible_on_narrow_windows() {
+        let narrow = TableColumns::new(500.0, true, 10.0);
+        assert!(!narrow.show_folder);
+        assert!(!narrow.show_size);
+        assert!(narrow.compact_folder);
+        assert!(narrow.name >= 300.0);
+
+        let wide = TableColumns::new(900.0, true, 10.0);
+        assert!(wide.show_folder);
+        assert!(wide.show_size);
+        assert!(!wide.compact_folder);
     }
 
     #[test]

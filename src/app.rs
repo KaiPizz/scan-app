@@ -32,6 +32,7 @@ const BLUE_DARK: Color32 = Color32::from_rgb(24, 72, 130);
 const PALE_BLUE: Color32 = Color32::from_rgb(231, 241, 252);
 const BACKGROUND: Color32 = Color32::from_rgb(246, 248, 251);
 const STRIP_HEIGHT: f32 = 160.0;
+const CONTROL_HEIGHT: f32 = 44.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Screen {
@@ -1333,15 +1334,15 @@ impl DocumentScannerApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         Frame::new()
             .fill(Color32::WHITE)
-            .inner_margin(Margin::symmetric(24, 14))
+            .inner_margin(Margin::symmetric(20, 8))
             .show(ui, |ui| {
                 two_sided(
                     ui,
-                    42.0,
+                    CONTROL_HEIGHT,
                     |ui| {
                         ui.label(
                             RichText::new("Skaner dokumentów")
-                                .size(25.0)
+                                .size(24.0)
                                 .strong()
                                 .color(BLUE_DARK),
                         );
@@ -1356,11 +1357,19 @@ impl DocumentScannerApp {
                             "Najpierw zapisz albo anuluj bieżący dokument.",
                         );
                         if let Some(folder) = &self.selected_folder {
-                            ui.label(
-                                RichText::new(&folder.name)
-                                    .size(16.0)
-                                    .color(Color32::DARK_GRAY),
-                            );
+                            let width = ui.available_width().min(280.0);
+                            if width >= 100.0 {
+                                ui.add_sized(
+                                    [width, CONTROL_HEIGHT],
+                                    egui::Label::new(
+                                        RichText::new(&folder.name)
+                                            .size(16.0)
+                                            .color(Color32::DARK_GRAY),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(&folder.name);
+                            }
                         }
                     },
                 );
@@ -1382,7 +1391,7 @@ impl DocumentScannerApp {
             .map(|folder| folder.path.as_path());
         let keyboard_enabled = !self.has_blocking_dialog();
         let actions = Frame::new()
-            .inner_margin(Margin::symmetric(20, 18))
+            .inner_margin(Margin::symmetric(16, 10))
             .show(ui, |ui| {
                 show_library_view(
                     ui,
@@ -1507,6 +1516,9 @@ impl DocumentScannerApp {
                 if let Err(error) = open::that_detached(path) {
                     self.message = Some(format!("Nie można otworzyć folderu: {error}"));
                 }
+            }
+            LibraryAction::OpenSettings => {
+                self.show_settings = true;
             }
         }
     }
@@ -1722,6 +1734,9 @@ impl DocumentScannerApp {
             return;
         }
         page_container(ui, |ui| {
+            let compact_height = ui.available_height() < 460.0;
+            let scan_strip_height = if compact_height { 96.0 } else { STRIP_HEIGHT };
+            let preview_min_height = if compact_height { 52.0 } else { 80.0 };
             let camera_ready = self.camera_ready;
             let camera_status = self.camera_status.clone();
             let page_count_text = polish_page_count(self.slots.len());
@@ -1856,7 +1871,7 @@ impl DocumentScannerApp {
                 self.selected_slot = None;
             }
             let selection = self.selected_slot;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 match selection {
                     Some(index) => {
                         ui.label(
@@ -1922,7 +1937,8 @@ impl DocumentScannerApp {
             let preview_min = ui.available_rect_before_wrap().min;
             let preview_max = Pos2::new(
                 ui.max_rect().right(),
-                (ui.max_rect().bottom() - STRIP_HEIGHT - 10.0).max(preview_min.y + 80.0),
+                (ui.max_rect().bottom() - scan_strip_height - 10.0)
+                    .max(preview_min.y + preview_min_height),
             );
             if preview_max.x > preview_min.x && preview_max.y > preview_min.y {
                 let preview_rect = Rect::from_min_max(preview_min, preview_max);
@@ -1999,8 +2015,8 @@ impl DocumentScannerApp {
     }
 
     fn film_strip_ui(&mut self, ui: &mut egui::Ui) {
-        let tile_height = (ui.available_height() - 12.0).clamp(104.0, 140.0);
-        let image_height = (tile_height - 28.0).max(76.0);
+        let tile_height = (ui.available_height() - 12.0).clamp(72.0, 140.0);
+        let image_height = (tile_height - 28.0).max(44.0);
         if self.slots.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space((tile_height * 0.35).max(24.0));
@@ -2104,7 +2120,7 @@ impl DocumentScannerApp {
             ui.add_space(10.0);
             let available = Vec2::new(
                 ui.available_width(),
-                (ui.available_height() - 70.0).max(320.0),
+                (ui.available_height() - 70.0).max(180.0),
             );
             let (response, painter) = ui.allocate_painter(available, Sense::hover());
             painter.rect_filled(response.rect, 12.0, Color32::from_gray(28));
@@ -2277,10 +2293,12 @@ impl DocumentScannerApp {
             );
             ui.add_space(8.0);
 
-            let strip_height = 124.0;
+            let compact_height = ui.available_height() < 430.0;
+            let strip_height = if compact_height { 88.0 } else { 124.0 };
+            let minimum_body_height = if compact_height { 140.0 } else { 220.0 };
             let body_size = Vec2::new(
                 ui.available_width(),
-                (ui.available_height() - strip_height - 10.0).max(280.0),
+                (ui.available_height() - strip_height - 10.0).max(minimum_body_height),
             );
             let (body_rect, _) = ui.allocate_exact_size(body_size, Sense::hover());
             let inspector_width = 282.0_f32.min((body_rect.width() * 0.36).max(240.0));
@@ -2371,7 +2389,10 @@ impl DocumentScannerApp {
                             );
                             if ui
                                 .add_enabled_ui(rotatable, |ui| {
-                                    ui.add_sized([ui.available_width(), 38.0], Button::new("Obróć"))
+                                    ui.add_sized(
+                                        [ui.available_width(), CONTROL_HEIGHT],
+                                        Button::new("Obróć"),
+                                    )
                                 })
                                 .inner
                                 .clicked()
@@ -2384,7 +2405,7 @@ impl DocumentScannerApp {
                             if ui
                                 .add_enabled_ui(editable, |ui| {
                                     ui.add_sized(
-                                        [ui.available_width(), 38.0],
+                                        [ui.available_width(), CONTROL_HEIGHT],
                                         Button::new("Popraw kadr"),
                                     )
                                 })
@@ -2409,7 +2430,7 @@ impl DocumentScannerApp {
                             });
                             if ui
                                 .add_sized(
-                                    [ui.available_width(), 38.0],
+                                    [ui.available_width(), CONTROL_HEIGHT],
                                     Button::new(
                                         RichText::new("Usuń stronę").color(Color32::DARK_RED),
                                     ),
@@ -2422,7 +2443,7 @@ impl DocumentScannerApp {
                             ui.separator();
                             ui.label(RichText::new("Nazwa pliku").strong());
                             let filename_response = ui.add_sized(
-                                [ui.available_width(), 36.0],
+                                [ui.available_width(), CONTROL_HEIGHT],
                                 egui::TextEdit::singleline(&mut self.filename)
                                     .id(filename_id)
                                     .hint_text("np. Umowa - Kowalski"),
@@ -2587,7 +2608,7 @@ impl DocumentScannerApp {
                 ui.add_space(8.0);
                 ui.label("Nazwa folderu:");
                 let response = ui.add_sized(
-                    [360.0, 34.0],
+                    [360.0, CONTROL_HEIGHT],
                     egui::TextEdit::singleline(&mut self.new_folder_name),
                 );
                 if context.memory(|memory| memory.focused().is_none()) {
@@ -2619,7 +2640,7 @@ impl DocumentScannerApp {
                 ui.add_space(8.0);
                 ui.label("Nowa nazwa:");
                 ui.add_sized(
-                    [360.0, 34.0],
+                    [360.0, CONTROL_HEIGHT],
                     egui::TextEdit::singleline(&mut self.rename_folder_name),
                 );
                 ui.add_space(10.0);
@@ -2657,18 +2678,37 @@ impl DocumentScannerApp {
 
         if self.show_settings {
             egui::Modal::new(Id::new("settings-modal")).show(context, |ui| {
+                ui.set_min_width(420.0);
+                ui.set_max_width(540.0);
                 ui.heading("Ustawienia");
                 ui.add_space(8.0);
                 ui.label(RichText::new("Folder biblioteki").strong());
-                ui.label(self.library_root.display().to_string());
+                let library_path = self.library_root.display().to_string();
+                Frame::new()
+                    .fill(Color32::from_rgb(246, 248, 251))
+                    .stroke(Stroke::new(1.0, Color32::from_gray(218)))
+                    .corner_radius(8.0)
+                    .inner_margin(10)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&library_path)
+                                    .size(15.0)
+                                    .color(Color32::from_gray(65)),
+                            )
+                            .wrap()
+                            .selectable(true),
+                        );
+                    });
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Otwórz lokalizację").clicked()
                         && let Err(error) = open::that_detached(&self.library_root)
                     {
                         self.message = Some(format!("Nie można otworzyć folderu: {error}"));
                     }
-                    if ui.button("Zmień lokalizację").clicked() {
+                    if primary_button(ui, "Zmień lokalizację").clicked() {
                         if self.has_active_workflow() {
                             self.show_settings = false;
                             self.message =
@@ -2702,9 +2742,11 @@ impl DocumentScannerApp {
                     }
                 });
                 ui.add_space(12.0);
-                if primary_button(ui, "Gotowe").clicked() {
-                    self.show_settings = false;
-                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Gotowe").clicked() {
+                        self.show_settings = false;
+                    }
+                });
             });
         }
 
@@ -2715,7 +2757,7 @@ impl DocumentScannerApp {
                 ui.set_max_width(480.0);
                 ui.label("Nowa nazwa:");
                 let response = ui.add_sized(
-                    [420.0, 34.0],
+                    [420.0, CONTROL_HEIGHT],
                     egui::TextEdit::singleline(&mut self.rename_pdf_name),
                 );
                 if context.memory(|memory| memory.focused().is_none()) {
@@ -2766,7 +2808,7 @@ impl DocumentScannerApp {
                     ui.label("Brak folderów docelowych. Najpierw utwórz folder.");
                 } else {
                     ui.add_sized(
-                        [ui.available_width(), 34.0],
+                        [ui.available_width(), CONTROL_HEIGHT],
                         egui::TextEdit::singleline(&mut self.move_folder_query)
                             .hint_text("Szukaj folderu docelowego…"),
                     );
@@ -3121,8 +3163,9 @@ impl eframe::App for DocumentScannerApp {
 fn configure_style(context: &egui::Context) {
     context.set_theme(egui::Theme::Light);
     let mut style = (*context.style_of(egui::Theme::Light)).clone();
-    style.spacing.button_padding = Vec2::new(16.0, 10.0);
-    style.spacing.item_spacing = Vec2::new(10.0, 10.0);
+    style.spacing.button_padding = Vec2::new(14.0, 9.0);
+    style.spacing.item_spacing = Vec2::new(10.0, 8.0);
+    style.spacing.interact_size.y = CONTROL_HEIGHT;
     style.visuals = egui::Visuals::light();
     style.visuals.widgets.active.bg_fill = BLUE;
     style.visuals.widgets.hovered.bg_fill = PALE_BLUE;
@@ -3136,12 +3179,15 @@ fn configure_style(context: &egui::Context) {
     style
         .text_styles
         .insert(egui::TextStyle::Button, FontId::proportional(16.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, FontId::proportional(14.0));
     context.set_style_of(egui::Theme::Light, style);
 }
 
 fn page_container(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     Frame::new()
-        .inner_margin(Margin::symmetric(28, 22))
+        .inner_margin(Margin::symmetric(20, 12))
         .show(ui, |ui| add_contents(ui));
 }
 
@@ -3151,32 +3197,19 @@ fn two_sided<Left, Right>(
     add_left: impl FnOnce(&mut egui::Ui) -> Left,
     add_right: impl FnOnce(&mut egui::Ui) -> Right,
 ) -> (Left, Right) {
-    let min = ui.available_rect_before_wrap().min;
-    let width = (ui.max_rect().right() - min.x).max(0.0);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-    let id = ui.next_auto_id();
-    let mut left_ui = ui.new_child(
-        UiBuilder::new()
-            .id_salt((id, "left"))
-            .max_rect(rect)
-            .layout(Layout::left_to_right(Align::Center)),
-    );
-    let mut right_ui = ui.new_child(
-        UiBuilder::new()
-            .id_salt((id, "right"))
-            .max_rect(rect)
-            .layout(Layout::right_to_left(Align::Center)),
-    );
-    let left = add_left(&mut left_ui);
-    let right = add_right(&mut right_ui);
-    (left, right)
+    egui::containers::Sides::new()
+        .height(height)
+        .shrink_left()
+        .truncate()
+        .show(ui, add_left, add_right)
 }
 
 fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         Button::new(RichText::new(text).strong().color(Color32::WHITE))
             .fill(BLUE)
-            .corner_radius(9.0),
+            .corner_radius(9.0)
+            .min_size(Vec2::new(0.0, CONTROL_HEIGHT)),
     )
 }
 
