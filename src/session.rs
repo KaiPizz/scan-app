@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize)]
@@ -342,6 +344,140 @@ impl SessionStore {
             fs::remove_dir_all(&self.dir).map_err(io_error)?;
         }
         Ok(())
+    }
+}
+
+enum SessionCommand {
+    Begin { folder: PathBuf },
+    WritePage {
+        id: u64,
+        jpeg: Vec<u8>,
+        original_jpeg: Vec<u8>,
+        corners: [CropPoint; 4],
+        quarter_turns: u8,
+    },
+    RemovePage { id: u64 },
+    SetOrder { ids: Vec<u64> },
+    SetFolder { folder: PathBuf },
+    Clear,
+}
+
+/// Runs every session mutation on its own thread, in submission order.
+///
+/// Each page write is four fsync-ed atomic replacements — on a slow or
+/// AV-scanned disk that stalled the UI for up to a second per page when done
+/// inline. Ordering (and therefore crash consistency) is unchanged because
+/// the worker is strictly sequential, and dropping the worker joins it only
+/// after the queue has fully drained, so exiting the app still flushes the
+/// session.
+pub struct SessionWorker {
+    command_tx: Option<Sender<SessionCommand>>,
+    error_rx: Receiver<String>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl SessionWorker {
+    pub fn start(store: SessionStore) -> Self {
+        let (command_tx, command_rx) = channel::<SessionCommand>();
+        let (error_tx, error_rx) = channel();
+        let thread = std::thread::Builder::new()
+            .name("session-persist".to_owned())
+            .spawn(move || {
+                while let Ok(command) = command_rx.recv() {
+                    let result = match command {
+                        SessionCommand::Begin { folder } => store.begin(&folder),
+                        SessionCommand::WritePage {
+                            id,
+                            jpeg,
+                            original_jpeg,
+                            corners,
+                            quarter_turns,
+                        } => store.write_page(id, &jpeg, &original_jpeg, corners, quarter_turns),
+                        SessionCommand::RemovePage { id } => store.remove_page(id),
+                        SessionCommand::SetOrder { ids } => store.set_order(&ids),
+                        SessionCommand::SetFolder { folder } => store.set_folder(&folder),
+                        SessionCommand::Clear => store.clear(),
+                    };
+                    if let Err(error) = result
+                        && error_tx.send(error).is_err()
+                    {
+                        return;
+                    }
+                }
+            })
+            .expect("cannot start session persist thread");
+        Self {
+            command_tx: Some(command_tx),
+            error_rx,
+            thread: Some(thread),
+        }
+    }
+
+    fn send(&self, command: SessionCommand) {
+        if let Some(command_tx) = &self.command_tx {
+            let _ = command_tx.send(command);
+        }
+    }
+
+    pub fn begin(&self, folder: &Path) {
+        self.send(SessionCommand::Begin {
+            folder: folder.to_path_buf(),
+        });
+    }
+
+    pub fn write_page(
+        &self,
+        id: u64,
+        jpeg: &[u8],
+        original_jpeg: &[u8],
+        corners: [CropPoint; 4],
+        quarter_turns: u8,
+    ) {
+        self.send(SessionCommand::WritePage {
+            id,
+            jpeg: jpeg.to_vec(),
+            original_jpeg: original_jpeg.to_vec(),
+            corners,
+            quarter_turns,
+        });
+    }
+
+    pub fn remove_page(&self, id: u64) {
+        self.send(SessionCommand::RemovePage { id });
+    }
+
+    pub fn set_order(&self, ids: Vec<u64>) {
+        self.send(SessionCommand::SetOrder { ids });
+    }
+
+    pub fn set_folder(&self, folder: &Path) {
+        self.send(SessionCommand::SetFolder {
+            folder: folder.to_path_buf(),
+        });
+    }
+
+    pub fn clear(&self) {
+        self.send(SessionCommand::Clear);
+    }
+
+    /// First persistence error, if any occurred since the last poll.
+    pub fn try_recv_error(&self) -> Option<String> {
+        match self.error_rx.try_recv() {
+            Ok(error) => Some(error),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                Some("Wątek zapisu sesji nieoczekiwanie zakończył pracę.".to_owned())
+            }
+        }
+    }
+}
+
+impl Drop for SessionWorker {
+    fn drop(&mut self) {
+        drop(self.command_tx.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 

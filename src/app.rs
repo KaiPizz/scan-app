@@ -12,7 +12,7 @@ use crate::library_view::{LibraryAction, LibraryViewInput, LibraryViewState, sho
 use crate::overlay::OverlayDetector;
 use crate::pipeline::{PipelineEvent, ProcessingPipeline};
 use crate::review_viewport::{PageTextureKey, ReviewViewport};
-use crate::session::{RecoveredSession, SessionStore};
+use crate::session::{RecoveredSession, SessionStore, SessionWorker};
 use crate::storage::{
     FolderInfo, PdfInfo, Settings, create_folder, default_library_root, ensure_library,
     load_settings, next_sequence_name, normalized_pdf_stem, pdf_info, rename_folder, save_settings,
@@ -147,7 +147,7 @@ pub struct DocumentScannerApp {
     editor: Option<EditorState>,
     capture_flash: Option<Instant>,
     last_slot_count: usize,
-    session: Option<SessionStore>,
+    session: Option<SessionWorker>,
     session_broken: bool,
     recovered: Option<RecoveredSession>,
     show_restore: bool,
@@ -258,10 +258,12 @@ impl DocumentScannerApp {
         if let Err(error) = ensure_library(&app.library_root) {
             app.message = Some(error);
         }
-        app.session = SessionStore::open_default();
-        if let Some(recovered) = app.session.as_ref().and_then(SessionStore::load_existing) {
-            app.recovered = Some(recovered);
-            app.show_restore = true;
+        if let Some(store) = SessionStore::open_default() {
+            if let Some(recovered) = store.load_existing() {
+                app.recovered = Some(recovered);
+                app.show_restore = true;
+            }
+            app.session = Some(SessionWorker::start(store));
         }
         app
     }
@@ -447,9 +449,19 @@ impl DocumentScannerApp {
             self.autocapture.set_enabled(false);
         }
         self.session_broken = false;
-        if let (Some(session), Some(folder)) = (&self.session, &self.selected_folder)
-            && let Err(error) = session.begin(&folder.path)
-        {
+        if let (Some(session), Some(folder)) = (&self.session, &self.selected_folder) {
+            session.begin(&folder.path);
+        }
+        self.start_camera();
+    }
+
+    /// Persistence errors surface asynchronously; the first one disables the
+    /// session copy for the rest of the document, exactly as before.
+    fn poll_session_errors(&mut self) {
+        if self.session_broken {
+            return;
+        }
+        if let Some(error) = self.session.as_ref().and_then(SessionWorker::try_recv_error) {
             self.session_broken = true;
             self.toast = Some(Toast {
                 text: format!("Kopia sesji wyłączona: {error}"),
@@ -457,7 +469,6 @@ impl DocumentScannerApp {
                 pdf_path: None,
             });
         }
-        self.start_camera();
     }
 
     fn session_write_page(
@@ -471,15 +482,8 @@ impl DocumentScannerApp {
         if self.session_broken {
             return;
         }
-        if let Some(session) = &self.session
-            && let Err(error) = session.write_page(id, jpeg, original_jpeg, corners, quarter_turns)
-        {
-            self.session_broken = true;
-            self.toast = Some(Toast {
-                text: format!("Kopia sesji wyłączona: {error}"),
-                shown_at: Instant::now(),
-                pdf_path: None,
-            });
+        if let Some(session) = &self.session {
+            session.write_page(id, jpeg, original_jpeg, corners, quarter_turns);
         }
     }
 
@@ -488,21 +492,14 @@ impl DocumentScannerApp {
             return;
         }
         let ids: Vec<u64> = self.slots.iter().map(|entry| entry.id).collect();
-        if let Some(session) = &self.session
-            && let Err(error) = session.set_order(&ids)
-        {
-            self.session_broken = true;
-            self.toast = Some(Toast {
-                text: format!("Kopia sesji wyłączona: {error}"),
-                shown_at: Instant::now(),
-                pdf_path: None,
-            });
+        if let Some(session) = &self.session {
+            session.set_order(ids);
         }
     }
 
     fn session_clear(&mut self) {
         if let Some(session) = &self.session {
-            let _ = session.clear();
+            session.clear();
         }
     }
 
@@ -923,7 +920,7 @@ impl DocumentScannerApp {
             Some(index.min(self.slots.len() - 1))
         };
         if let Some(session) = &self.session {
-            let _ = session.remove_page(removed_id);
+            session.remove_page(removed_id);
         }
         self.session_sync_order();
     }
@@ -1153,7 +1150,7 @@ impl DocumentScannerApp {
         // The session may have been redirected (original folder gone → library
         // root); keep the persisted manifest pointing at the actual target.
         if let Some(session) = &self.session {
-            let _ = session.set_folder(&recovered.folder_path);
+            session.set_folder(&recovered.folder_path);
         }
         self.slots.clear();
         self.selected_slot = None;
@@ -2656,7 +2653,7 @@ impl DocumentScannerApp {
                             .clicked()
                         {
                             if let Some(session) = &self.session {
-                                let _ = session.clear();
+                                session.clear();
                             }
                             self.recovered = None;
                             self.show_restore = false;
@@ -3199,6 +3196,7 @@ impl eframe::App for DocumentScannerApp {
         let context = ui.ctx().clone();
         self.poll_file_operation(&context);
         self.poll_library(&context);
+        self.poll_session_errors();
         let dialog_open = self.reviewing || self.editor.is_some() || self.has_blocking_dialog();
         let focus_free = context.memory(|memory| memory.focused().is_none());
         if self.screen == Screen::ScanHub && !dialog_open && focus_free {
