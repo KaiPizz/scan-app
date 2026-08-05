@@ -2322,6 +2322,8 @@ impl DocumentScannerApp {
                     quarter_turns: data.quarter_turns,
                 },
                 &data.page.jpeg,
+                Vec2::new(data.page.width as f32, data.page.height as f32),
+                Some(data.texture.clone()),
             ),
             _ => self.review_viewport.invalidate(),
         }

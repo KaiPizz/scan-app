@@ -2,10 +2,47 @@ use eframe::egui::{
     self, Color32, ColorImage, CursorIcon, Pos2, Rect, Sense, Stroke, TextureHandle,
     TextureOptions, Ui, Vec2,
 };
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 const MIN_ZOOM: f32 = 0.01;
 const MAX_ZOOM: f32 = 4.0;
 const ZOOM_STEP: f32 = 1.25;
+
+struct DecodeResult {
+    key: PageTextureKey,
+    outcome: Result<(TextureHandle, Vec2), String>,
+}
+
+struct DecodeJob {
+    key: PageTextureKey,
+    jpeg: Vec<u8>,
+    max_texture_side: usize,
+}
+
+/// One long-lived decode thread; queued jobs collapse to the newest one, so
+/// holding the arrow key through a stack never piles up 11 MP decodes.
+fn decode_worker(
+    context: egui::Context,
+    jobs: Receiver<DecodeJob>,
+    results: Sender<DecodeResult>,
+) {
+    while let Ok(mut job) = jobs.recv() {
+        while let Ok(newer) = jobs.try_recv() {
+            job = newer;
+        }
+        let outcome = decode_full_texture(&context, job.key, &job.jpeg, job.max_texture_side);
+        if results
+            .send(DecodeResult {
+                key: job.key,
+                outcome,
+            })
+            .is_err()
+        {
+            return;
+        }
+        context.request_repaint();
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageTextureKey {
@@ -30,25 +67,38 @@ enum ViewCommand {
 pub struct ReviewViewport {
     key: Option<PageTextureKey>,
     texture: Option<TextureHandle>,
+    /// Small strip thumbnail shown at full layout size until the background
+    /// decode of the real page finishes.
+    placeholder: Option<TextureHandle>,
     source_px: Vec2,
     zoom: f32,
     pan: Vec2,
     mode: ZoomMode,
     pending_command: Option<ViewCommand>,
     load_error: Option<String>,
+    decode_tx: Sender<DecodeResult>,
+    decode_rx: Receiver<DecodeResult>,
+    /// Lazily started on the first page (needs a `Context`); dropping the
+    /// sender ends the worker.
+    job_tx: Option<Sender<DecodeJob>>,
 }
 
 impl Default for ReviewViewport {
     fn default() -> Self {
+        let (decode_tx, decode_rx) = channel();
         Self {
             key: None,
             texture: None,
+            placeholder: None,
             source_px: Vec2::ZERO,
             zoom: 1.0,
             pan: Vec2::ZERO,
             mode: ZoomMode::Fit,
             pending_command: None,
             load_error: None,
+            decode_tx,
+            decode_rx,
+            job_tx: None,
         }
     }
 }
@@ -61,6 +111,7 @@ impl ReviewViewport {
     pub fn invalidate(&mut self) {
         self.key = None;
         self.texture = None;
+        self.placeholder = None;
         self.source_px = Vec2::ZERO;
         self.mode = ZoomMode::Fit;
         self.zoom = 1.0;
@@ -69,52 +120,71 @@ impl ReviewViewport {
         self.load_error = None;
     }
 
-    pub fn ensure_page(&mut self, context: &egui::Context, key: PageTextureKey, jpeg: &[u8]) {
+    /// Switches the viewport to a page. The heavy JPEG decode happens on a
+    /// background thread; until it lands, the strip thumbnail (if provided)
+    /// is drawn at the final layout size, so navigation never blocks.
+    pub fn ensure_page(
+        &mut self,
+        context: &egui::Context,
+        key: PageTextureKey,
+        jpeg: &[u8],
+        page_px: Vec2,
+        placeholder: Option<TextureHandle>,
+    ) {
         if self.key == Some(key) {
             return;
         }
         self.key = Some(key);
         self.texture = None;
-        self.source_px = Vec2::ZERO;
+        self.placeholder = placeholder;
+        // Layout coordinates are known up front from the page dimensions, so
+        // fit/zoom math is identical before and after the decode lands.
+        self.source_px = if key.quarter_turns % 2 == 1 {
+            Vec2::new(page_px.y, page_px.x)
+        } else {
+            page_px
+        };
         self.mode = ZoomMode::Fit;
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
         self.pending_command = None;
         self.load_error = None;
 
-        let image = match image::load_from_memory(jpeg) {
-            Ok(image) => image.to_rgb8(),
-            Err(error) => {
-                self.load_error = Some(format!("Nie można otworzyć pełnego podglądu: {error}"));
-                return;
-            }
-        };
-        let image = if key.quarter_turns.is_multiple_of(4) {
-            image
-        } else {
-            crate::document::rotate_rgb(&image, key.quarter_turns)
-        };
-        // Zoom and the pixel readout stay in source coordinates even when the
-        // uploaded texture had to be reduced to the GPU limit.
-        self.source_px = Vec2::new(image.width() as f32, image.height() as f32);
         let max_texture_side = context.input(|input| input.max_texture_side);
-        let scaled = fit_texture_image(&image, max_texture_side);
-        let texture_source = scaled.as_ref().unwrap_or(&image);
-        let color_image = ColorImage::from_rgb(
-            [
-                texture_source.width() as usize,
-                texture_source.height() as usize,
-            ],
-            texture_source.as_raw(),
-        );
-        self.texture = Some(context.load_texture(
-            format!("review-full-{}-{}-t{}", key.id, key.revision, key.quarter_turns),
-            color_image,
-            TextureOptions::LINEAR,
-        ));
+        let job_tx = self.job_tx.get_or_insert_with(|| {
+            let (job_tx, job_rx) = channel();
+            let context = context.clone();
+            let results = self.decode_tx.clone();
+            std::thread::Builder::new()
+                .name("review-decode".to_owned())
+                .spawn(move || decode_worker(context, job_rx, results))
+                .expect("cannot start review decode thread");
+            job_tx
+        });
+        let _ = job_tx.send(DecodeJob {
+            key,
+            jpeg: jpeg.to_vec(),
+            max_texture_side,
+        });
+    }
+
+    fn poll_decoded(&mut self) {
+        while let Ok(result) = self.decode_rx.try_recv() {
+            if self.key != Some(result.key) {
+                continue;
+            }
+            match result.outcome {
+                Ok((texture, source_px)) => {
+                    self.texture = Some(texture);
+                    self.source_px = source_px;
+                }
+                Err(error) => self.load_error = Some(error),
+            }
+        }
     }
 
     pub fn show(&mut self, ui: &mut Ui) {
+        self.poll_decoded();
         self.toolbar(ui);
         ui.add_space(6.0);
 
@@ -124,7 +194,7 @@ impl ReviewViewport {
         let painter = painter.with_clip_rect(viewport);
         painter.rect_filled(viewport, 10.0, Color32::from_rgb(28, 31, 36));
 
-        let Some(texture) = &self.texture else {
+        let Some(texture) = self.texture.as_ref().or(self.placeholder.as_ref()) else {
             self.pending_command = None;
             let text = self
                 .load_error
@@ -247,6 +317,15 @@ impl ReviewViewport {
                 egui::StrokeKind::Inside,
             );
         }
+        if self.texture.is_none() && self.load_error.is_none() {
+            painter.text(
+                Pos2::new(viewport.center().x, viewport.top() + 18.0),
+                egui::Align2::CENTER_CENTER,
+                "Wczytywanie pełnej rozdzielczości…",
+                egui::FontId::proportional(13.0),
+                Color32::from_gray(210),
+            );
+        }
         ui.ctx().set_cursor_icon(if response.dragged() {
             CursorIcon::Grabbing
         } else if response.hovered() {
@@ -297,6 +376,42 @@ impl ReviewViewport {
             );
         });
     }
+}
+
+fn decode_full_texture(
+    context: &egui::Context,
+    key: PageTextureKey,
+    jpeg: &[u8],
+    max_texture_side: usize,
+) -> Result<(TextureHandle, Vec2), String> {
+    let image = image::load_from_memory(jpeg)
+        .map_err(|error| format!("Nie można otworzyć pełnego podglądu: {error}"))?
+        .to_rgb8();
+    let image = if key.quarter_turns.is_multiple_of(4) {
+        image
+    } else {
+        crate::document::rotate_rgb(&image, key.quarter_turns)
+    };
+    // Zoom and the pixel readout stay in source coordinates even when the
+    // uploaded texture had to be reduced to the GPU limit.
+    let source_px = Vec2::new(image.width() as f32, image.height() as f32);
+    let scaled = fit_texture_image(&image, max_texture_side);
+    let texture_source = scaled.as_ref().unwrap_or(&image);
+    let color_image = ColorImage::from_rgb(
+        [
+            texture_source.width() as usize,
+            texture_source.height() as usize,
+        ],
+        texture_source.as_raw(),
+    );
+    Ok((
+        context.load_texture(
+            format!("review-full-{}-{}-t{}", key.id, key.revision, key.quarter_turns),
+            color_image,
+            TextureOptions::LINEAR,
+        ),
+        source_px,
+    ))
 }
 
 /// Returns a copy reduced to the GPU texture limit, or `None` when the image

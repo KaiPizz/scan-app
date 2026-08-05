@@ -7,6 +7,10 @@ use std::path::Path;
 
 pub const A4_WIDTH_PX: u32 = 2480;
 pub const A4_HEIGHT_PX: u32 = 3508;
+/// Film-strip thumbnails draw at ≤96 pt (~170 px at 175% DPI); 320 px keeps
+/// them crisp at a fraction of the former 1200 px footprint (~0.2 MB RAM and
+/// ~0.3 MB VRAM per page instead of ~3 MB + 4 MB).
+const STRIP_THUMB_PX: u32 = 320;
 const FLATTEN_COLS: usize = 12;
 const FLATTEN_ROWS: usize = 16;
 
@@ -25,6 +29,8 @@ impl CropPoint {
 #[derive(Clone)]
 pub struct ScannedPage {
     pub jpeg: Vec<u8>,
+    /// Small thumbnail (≤`STRIP_THUMB_PX`) for the film strip and as the
+    /// review placeholder while the full JPEG decodes in the background.
     pub review_image: RgbImage,
     pub width: u32,
     pub height: u32,
@@ -419,7 +425,7 @@ pub fn save_pdf(path: &Path, pages: &[(&ScannedPage, u8)]) -> Result<(), String>
 fn page_from_image(image: RgbImage) -> Result<ScannedPage, String> {
     let width = image.width();
     let height = image.height();
-    let review_image = resize_to_fit(&image, 1200, 1200, imageops::FilterType::Lanczos3);
+    let review_image = resize_to_fit(&image, STRIP_THUMB_PX, STRIP_THUMB_PX, imageops::FilterType::Lanczos3);
     let mut jpeg = Vec::new();
     JpegEncoder::new_with_quality(&mut jpeg, 91)
         .encode_image(&image)
@@ -806,7 +812,7 @@ fn approx(left: f64, right: f64, tolerance: f64) -> bool {
 
 pub fn page_from_jpeg_bytes(jpeg: Vec<u8>) -> Result<ScannedPage, String> {
     let image = decode_jpeg(&jpeg)?;
-    let review_image = resize_to_fit(&image, 1200, 1200, imageops::FilterType::Lanczos3);
+    let review_image = resize_to_fit(&image, STRIP_THUMB_PX, STRIP_THUMB_PX, imageops::FilterType::Lanczos3);
     Ok(ScannedPage {
         width: image.width(),
         height: image.height(),
