@@ -1,10 +1,6 @@
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, ImageReader, Rgb, RgbImage, imageops};
 use imageproc::geometric_transformations::{Border, Interpolation, Projection, warp_into};
-use printpdf::{
-    ImageCompression, ImageOptimizationOptions, Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, Pt,
-    RawImage, XObjectTransform,
-};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::path::Path;
@@ -312,55 +308,106 @@ pub fn rotate_page_by_quarter_turns(
     page_from_image(rotated)
 }
 
+const PDF_TITLE: &str = "Zeskanowany dokument";
+const PDF_EDITABLE_MARKER: &str = "skaner-dokumentow-editable-v1";
+const A4_PORTRAIT_PT: (f32, f32) = (210.0 / 25.4 * 72.0, 297.0 / 25.4 * 72.0);
+
+/// Writes each page's JPEG bytes directly as a DCTDecode image stream.
+///
+/// No decode or re-encode happens here: the PDF carries the exact q91 bytes
+/// held in RAM, so saving is fast, needs no per-page raster buffers, and
+/// repeated edit → save cycles add no generational JPEG loss. The layout
+/// mirrors exactly what `extract_pdf_pages` accepts back.
 pub fn render_pdf(pages: &[&ScannedPage]) -> Result<Vec<u8>, String> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{Object, Stream, dictionary};
+
     if pages.is_empty() {
         return Err("Dokument nie zawiera żadnych stron.".to_owned());
     }
-    let mut document = PdfDocument::new("Zeskanowany dokument");
-    document.metadata.info.creator = "Skaner dokumentów".to_owned();
-    document.metadata.info.producer = "Skaner dokumentów".to_owned();
-    document
-        .metadata
-        .info
-        .keywords
-        .push("skaner-dokumentow-editable-v1".to_owned());
-    let mut pdf_pages = Vec::with_capacity(pages.len());
+    let mut document = lopdf::Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let mut kids = Vec::with_capacity(pages.len());
     for page in pages {
-        let mut warnings = Vec::new();
-        let image = RawImage::decode_from_bytes(&page.jpeg, &mut warnings)
-            .map_err(|error| format!("Nie można przygotować strony PDF: {error}"))?;
-        let image_id = document.add_image(&image);
         let landscape = page.width > page.height;
         let (page_width, page_height) = if landscape {
-            (Mm(297.0), Mm(210.0))
+            (A4_PORTRAIT_PT.1, A4_PORTRAIT_PT.0)
         } else {
-            (Mm(210.0), Mm(297.0))
+            A4_PORTRAIT_PT
         };
-        let operations = vec![Op::UseXobject {
-            id: image_id,
-            transform: XObjectTransform {
-                translate_x: Some(Pt(0.0)),
-                translate_y: Some(Pt(0.0)),
-                dpi: Some(300.0),
-                ..Default::default()
+        let image_stream = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => i64::from(page.width),
+                "Height" => i64::from(page.height),
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "DCTDecode",
             },
-        }];
-        pdf_pages.push(PdfPage::new(page_width, page_height, operations));
+            page.jpeg.clone(),
+        )
+        .with_compression(false);
+        let image_id = document.add_object(image_stream);
+        let content = Content {
+            operations: vec![
+                Operation::new("q", vec![]),
+                Operation::new(
+                    "cm",
+                    vec![
+                        page_width.into(),
+                        0.into(),
+                        0.into(),
+                        page_height.into(),
+                        0.into(),
+                        0.into(),
+                    ],
+                ),
+                Operation::new("Do", vec![Object::Name(b"Im0".to_vec())]),
+                Operation::new("Q", vec![]),
+            ],
+        };
+        let encoded = content
+            .encode()
+            .map_err(|error| format!("Nie można przygotować treści strony PDF: {error}"))?;
+        let content_id = document.add_object(Stream::new(dictionary! {}, encoded));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![0.into(), 0.into(), page_width.into(), page_height.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "Im0" => Object::Reference(image_id) },
+            },
+            "Contents" => Object::Reference(content_id),
+        });
+        kids.push(Object::Reference(page_id));
     }
-    let save_options = PdfSaveOptions {
-        image_optimization: Some(ImageOptimizationOptions {
-            quality: Some(0.93),
-            max_image_size: None,
-            dither_greyscale: None,
-            convert_to_greyscale: None,
-            auto_optimize: None,
-            format: Some(ImageCompression::Jpeg),
+    let count = kids.len() as i64;
+    document.objects.insert(
+        pages_id,
+        lopdf::Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => count,
         }),
-        ..PdfSaveOptions::default()
-    };
-    Ok(document
-        .with_pages(pdf_pages)
-        .save(&save_options, &mut Vec::new()))
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(pages_id),
+    });
+    let info_id = document.add_object(dictionary! {
+        "Title" => Object::string_literal(PDF_TITLE),
+        "Creator" => Object::string_literal("Skaner dokumentów"),
+        "Producer" => Object::string_literal("Skaner dokumentów"),
+        "Keywords" => Object::string_literal(PDF_EDITABLE_MARKER),
+    });
+    document.trailer.set("Root", catalog_id);
+    document.trailer.set("Info", info_id);
+    let mut bytes = Vec::new();
+    document
+        .save_to(&mut Cursor::new(&mut bytes))
+        .map_err(|error| format!("Nie można zapisać PDF: {error}"))?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -392,7 +439,7 @@ pub fn extract_pdf_pages(path: &Path) -> Result<Vec<Vec<u8>>, String> {
     let document =
         lopdf::Document::load(path).map_err(|error| format!("Nie można odczytać PDF: {error}"))?;
     let has_marker = has_editable_marker(&document);
-    if !has_marker && !pdf_info_string_equals(&document, b"Title", "Zeskanowany dokument") {
+    if !has_marker && !pdf_info_string_equals(&document, b"Title", PDF_TITLE) {
         return Err(
             "Ten PDF nie ma bezpiecznego znacznika edycji tej wersji programu. Możesz go otworzyć, ale edycja została zablokowana, aby nie utracić tekstu OCR, adnotacji ani układu strony."
                 .to_owned(),
@@ -482,11 +529,17 @@ pub fn extract_pdf_pages(path: &Path) -> Result<Vec<Vec<u8>>, String> {
             .and_then(|subtype| subtype.as_name())
             .map(|name| name == b"Image")
             .unwrap_or(false);
+        // A filter chain such as [FlateDecode, DCTDecode] would hand back
+        // still-compressed bytes, so only a lone DCTDecode qualifies.
         let is_jpeg = match stream.dict.get(b"Filter") {
             Ok(lopdf::Object::Name(name)) => name == b"DCTDecode",
-            Ok(lopdf::Object::Array(filters)) => filters
-                .iter()
-                .any(|filter| matches!(filter, lopdf::Object::Name(name) if name == b"DCTDecode")),
+            Ok(lopdf::Object::Array(filters)) => {
+                filters.len() == 1
+                    && matches!(
+                        filters.first(),
+                        Some(lopdf::Object::Name(name)) if name == b"DCTDecode"
+                    )
+            }
             _ => false,
         };
         if !is_image || !is_jpeg {
@@ -544,7 +597,7 @@ fn has_meaningful_pdf_entry(
 }
 
 fn has_editable_marker(document: &lopdf::Document) -> bool {
-    pdf_info_string_contains(document, b"Keywords", "skaner-dokumentow-editable-v1")
+    pdf_info_string_contains(document, b"Keywords", PDF_EDITABLE_MARKER)
 }
 
 fn pdf_info_string_contains(document: &lopdf::Document, key: &[u8], needle: &str) -> bool {
@@ -1381,28 +1434,25 @@ mod tests {
     }
 
     #[test]
-    fn saved_pdf_keeps_full_resolution() {
-        let image = RgbImage::from_pixel(1000, 1414, Rgb([245, 245, 245]));
+    fn saved_pdf_embeds_the_exact_jpeg_bytes() {
+        let image = RgbImage::from_pixel(A4_WIDTH_PX, A4_HEIGHT_PX, Rgb([245, 245, 245]));
         let page = page_from_image(image).expect("strona testowa");
         let path =
             std::env::temp_dir().join(format!("skaner-dokumentow-res-{}.pdf", std::process::id()));
         save_pdf(&path, &[&page]).expect("zapis PDF");
         let bytes = std::fs::read(&path).expect("odczyt PDF");
+        assert!(
+            bytes
+                .windows(page.jpeg.len())
+                .any(|window| window == page.jpeg.as_slice()),
+            "PDF nie zawiera oryginalnych bajtów JPEG — strona została przekodowana"
+        );
+        let extracted = extract_pdf_pages(&path).expect("ekstrakcja");
         std::fs::remove_file(&path).expect("usunięcie testowego PDF");
-        let start = bytes
-            .windows(3)
-            .position(|w| w == [0xFF, 0xD8, 0xFF])
-            .expect("brak strumienia JPEG w PDF");
-        let end = bytes[start..]
-            .windows(2)
-            .position(|w| w == [0xFF, 0xD9])
-            .map(|offset| start + offset + 2)
-            .expect("brak końca JPEG");
-        let embedded = image::load_from_memory(&bytes[start..end]).expect("dekodowanie JPEG");
+        assert_eq!(extracted.len(), 1);
         assert_eq!(
-            (embedded.width(), embedded.height()),
-            (1000, 1414),
-            "printpdf zmniejszył osadzony obraz"
+            extracted[0], page.jpeg,
+            "wyodrębniona strona nie jest bajtowo identyczna z zapisaną"
         );
     }
 

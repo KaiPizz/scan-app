@@ -12,7 +12,6 @@ imageproc = { version = "0.27.0", default-features = false }
 lopdf = "0.44"
 nokhwa = { version = "0.10.11", default-features = false, features = ["decoding", "input-msmf"] }
 open = "5.4.0"
-printpdf = { version = "0.12.5", default-features = false, features = ["jpeg"] }
 rfd = "0.15.4"
 ron = "0.12.2"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -26,5 +25,6 @@ winresource = { version = "0.1.31", default-features = false }
 
 [profile.release]
 lto = "thin"
-opt-level = "s"
+# Speed over size: warp/enhance na klatkach 11-13 MP tracą wyraźnie na "s".
+opt-level = 3
 strip = true
