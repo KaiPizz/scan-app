@@ -30,6 +30,7 @@ pub struct LibraryViewState {
     pub section: LibrarySection,
     pub query: String,
     pub sort: SortMode,
+    pub sort_ascending: bool,
     selected: BTreeSet<PathBuf>,
     anchor: Option<PathBuf>,
     search_focus_requested: bool,
@@ -43,6 +44,7 @@ struct VisibleCacheKey {
     snapshot_revision: u64,
     query: String,
     sort: SortMode,
+    ascending: bool,
     section: LibrarySection,
     folder_scope: Option<PathBuf>,
     recent_documents: Vec<PathBuf>,
@@ -53,13 +55,27 @@ impl Default for LibraryViewState {
         Self {
             section: LibrarySection::Home,
             query: String::new(),
-            sort: SortMode::Newest,
+            sort: SortMode::Modified,
+            sort_ascending: SortMode::Modified.default_ascending(),
             selected: BTreeSet::new(),
             anchor: None,
             search_focus_requested: false,
             selection_revision: 0,
             visible_cache_key: None,
             visible_documents: Vec::new(),
+        }
+    }
+}
+
+impl LibraryViewState {
+    /// Column-header click: same column flips the direction, a new column
+    /// starts in its natural direction.
+    fn sort_by(&mut self, mode: SortMode) {
+        if self.sort == mode {
+            self.sort_ascending = !self.sort_ascending;
+        } else {
+            self.sort = mode;
+            self.sort_ascending = mode.default_ascending();
         }
     }
 }
@@ -585,7 +601,7 @@ fn show_document_list(
     let show_sort = !state.query.trim().is_empty()
         || input.selected_folder.is_some()
         || state.section == LibrarySection::All;
-    let narrow_toolbar = show_sort && ui.available_width() < 520.0;
+    let narrow_toolbar = show_sort && ui.available_width() < 560.0;
     let search = if narrow_toolbar {
         let response = ui.add_sized(
             [ui.available_width(), CONTROL_HEIGHT],
@@ -597,8 +613,10 @@ fn show_document_list(
         response
     } else {
         ui.horizontal(|ui| {
+            // Reserved space = sort combo (170) + direction button (44) +
+            // item spacing; keep in sync with `show_sort_picker`.
             let search_width = if show_sort {
-                (ui.available_width() - 176.0).max(180.0)
+                (ui.available_width() - 238.0).max(180.0)
             } else {
                 ui.available_width()
             };
@@ -684,17 +702,20 @@ fn show_document_list(
                         set_visible_selection(state, documents, checked);
                     }
                 });
-                table_label(ui, columns.name, RichText::new("Nazwa").strong());
+                sort_header(ui, columns.name, "Nazwa", SortMode::Name, state, false);
                 if columns.show_folder {
-                    table_label(ui, columns.folder, RichText::new("Folder").strong());
+                    sort_header(ui, columns.folder, "Folder", SortMode::Folder, state, false);
                 }
-                table_label(
+                sort_header(
                     ui,
                     columns.modified,
-                    RichText::new("Zmodyfikowano").strong(),
+                    "Data",
+                    SortMode::Modified,
+                    state,
+                    false,
                 );
                 if columns.show_size {
-                    table_label_right(ui, columns.size, RichText::new("Rozmiar").strong());
+                    sort_header(ui, columns.size, "Rozmiar", SortMode::Size, state, true);
                 }
             });
         });
@@ -800,6 +821,44 @@ fn table_label(ui: &mut egui::Ui, width: f32, text: RichText) -> egui::Response 
     fixed_cell(ui, width, Layout::left_to_right(Align::Center), |ui| {
         ui.add(egui::Label::new(text).truncate())
     })
+}
+
+/// Clickable column header: click sorts by the column, a second click flips
+/// the direction; the active column shows a ▲/▼ marker.
+fn sort_header(
+    ui: &mut egui::Ui,
+    width: f32,
+    label: &str,
+    mode: SortMode,
+    state: &mut LibraryViewState,
+    right_aligned: bool,
+) {
+    let active = state.sort == mode;
+    let text = if active {
+        format!(
+            "{label} {}",
+            if state.sort_ascending { "⏶" } else { "⏷" }
+        )
+    } else {
+        label.to_owned()
+    };
+    let layout = if right_aligned {
+        Layout::right_to_left(Align::Center)
+    } else {
+        Layout::left_to_right(Align::Center)
+    };
+    let response = fixed_cell(ui, width, layout, |ui| {
+        ui.add(
+            egui::Label::new(RichText::new(text).strong())
+                .truncate()
+                .sense(Sense::click()),
+        )
+    })
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    .on_hover_text("Sortuj według tej kolumny — drugie kliknięcie odwraca kolejność");
+    if response.clicked() {
+        state.sort_by(mode);
+    }
 }
 
 /// Numeric columns (sizes) read best when the digits line up on the right.
@@ -1102,6 +1161,7 @@ fn refresh_visible_cache(state: &mut LibraryViewState, input: LibraryViewInput<'
         snapshot_revision: input.snapshot_revision,
         query: state.query.clone(),
         sort: state.sort,
+        ascending: state.sort_ascending,
         section: state.section,
         folder_scope: input.selected_folder.map(Path::to_path_buf),
         recent_documents: input.recent_documents.to_vec(),
@@ -1118,15 +1178,21 @@ fn visible_documents_for_key(snapshot: &LibrarySnapshot, key: &VisibleCacheKey) 
         // Inside a folder the search stays scoped to that folder — a global
         // result list would show identically named files from other folders
         // while the folder column is hidden.
-        return search_and_sort(snapshot, &key.query, key.sort, key.folder_scope.as_deref());
+        return search_and_sort(
+            snapshot,
+            &key.query,
+            key.sort,
+            key.ascending,
+            key.folder_scope.as_deref(),
+        );
     }
     if let Some(folder) = key.folder_scope.as_deref() {
-        return search_and_sort(snapshot, "", key.sort, Some(folder));
+        return search_and_sort(snapshot, "", key.sort, key.ascending, Some(folder));
     }
     match key.section {
-        LibrarySection::All => search_and_sort(snapshot, "", key.sort, None),
+        LibrarySection::All => search_and_sort(snapshot, "", key.sort, key.ascending, None),
         LibrarySection::Home => {
-            let mut newest = search_and_sort(snapshot, "", SortMode::Newest, None);
+            let mut newest = search_and_sort(snapshot, "", SortMode::Modified, false, None);
             newest.truncate(12);
             newest
         }
@@ -1228,22 +1294,43 @@ fn find_pdf<'a>(snapshot: &'a LibrarySnapshot, path: &Path) -> Option<&'a PdfInf
 
 fn show_sort_picker(ui: &mut egui::Ui, state: &mut LibraryViewState) {
     egui::ComboBox::from_id_salt("library-sort")
-        .selected_text(sort_label(state.sort))
-        .width(160.0)
+        .selected_text(sort_label(state.sort, state.sort_ascending))
+        .width(170.0)
         .show_ui(ui, |ui| {
-            ui.selectable_value(&mut state.sort, SortMode::Newest, "Najnowsze");
-            ui.selectable_value(&mut state.sort, SortMode::Name, "Nazwa A–Z");
-            ui.selectable_value(&mut state.sort, SortMode::Folder, "Folder");
-            ui.selectable_value(&mut state.sort, SortMode::Size, "Największe");
+            for mode in [
+                SortMode::Modified,
+                SortMode::Name,
+                SortMode::Folder,
+                SortMode::Size,
+            ] {
+                let selected = state.sort == mode;
+                let label = sort_label(mode, if selected { state.sort_ascending } else { mode.default_ascending() });
+                if ui.selectable_label(selected, label).clicked() && !selected {
+                    state.sort = mode;
+                    state.sort_ascending = mode.default_ascending();
+                }
+            }
         });
+    let direction = if state.sort_ascending { "⏶" } else { "⏷" };
+    if ui
+        .add_sized([CONTROL_HEIGHT, CONTROL_HEIGHT], Button::new(direction))
+        .on_hover_text("Odwróć kolejność sortowania")
+        .clicked()
+    {
+        state.sort_ascending = !state.sort_ascending;
+    }
 }
 
-fn sort_label(sort: SortMode) -> &'static str {
-    match sort {
-        SortMode::Newest => "Najnowsze",
-        SortMode::Name => "Nazwa A–Z",
-        SortMode::Folder => "Folder",
-        SortMode::Size => "Największe",
+fn sort_label(sort: SortMode, ascending: bool) -> &'static str {
+    match (sort, ascending) {
+        (SortMode::Modified, false) => "Najnowsze",
+        (SortMode::Modified, true) => "Najstarsze",
+        (SortMode::Name, true) => "Nazwa A–Z",
+        (SortMode::Name, false) => "Nazwa Z–A",
+        (SortMode::Folder, true) => "Folder A–Z",
+        (SortMode::Folder, false) => "Folder Z–A",
+        (SortMode::Size, false) => "Największe",
+        (SortMode::Size, true) => "Najmniejsze",
     }
 }
 
@@ -1368,6 +1455,7 @@ mod tests {
             snapshot_revision: 1,
             query: String::new(),
             sort: SortMode::Name,
+            ascending: true,
             section: LibrarySection::Home,
             folder_scope: None,
             recent_documents: vec![old.path.clone()],
@@ -1396,6 +1484,7 @@ mod tests {
             snapshot_revision: 1,
             query: "A01".to_owned(),
             sort: SortMode::Name,
+            ascending: true,
             section: LibrarySection::All,
             folder_scope: Some(folder_a.clone()),
             recent_documents: Vec::new(),

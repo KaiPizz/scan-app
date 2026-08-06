@@ -20,10 +20,18 @@ pub struct LibrarySnapshot {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SortMode {
     #[default]
-    Newest,
+    Modified,
     Name,
     Folder,
     Size,
+}
+
+impl SortMode {
+    /// The direction users expect when first picking a column: texts A→Z,
+    /// dates newest-first, sizes largest-first.
+    pub fn default_ascending(self) -> bool {
+        matches!(self, Self::Name | Self::Folder)
+    }
 }
 
 #[derive(Debug)]
@@ -270,7 +278,7 @@ fn worker_loop(command_rx: Receiver<WorkerCommand>, event_tx: Sender<LibraryEven
 pub fn scan_library(root: &Path) -> Result<LibrarySnapshot, String> {
     let (mut folders, mut pdfs) = scan_library_metadata(root)?;
     folders.sort_by(|left, right| natural_cmp(&left.name, &right.name));
-    sort_pdfs(&mut pdfs, SortMode::Name);
+    sort_pdfs(&mut pdfs, SortMode::Name, true);
     Ok(LibrarySnapshot {
         root: root.to_path_buf(),
         folders,
@@ -282,6 +290,7 @@ pub fn search_and_sort(
     snapshot: &LibrarySnapshot,
     query: &str,
     sort_mode: SortMode,
+    ascending: bool,
     folder_scope: Option<&Path>,
 ) -> Vec<PdfInfo> {
     let normalized_query = normalize_search_text(query);
@@ -295,11 +304,13 @@ pub fn search_and_sort(
         })
         .cloned()
         .collect();
-    sort_pdfs(&mut result, sort_mode);
+    sort_pdfs(&mut result, sort_mode, ascending);
     result
 }
 
-pub fn sort_pdfs(pdfs: &mut [PdfInfo], sort_mode: SortMode) {
+/// `ascending` flips only the primary key; tie-breakers always run in their
+/// natural ascending order so reversing a sort never scrambles equal rows.
+pub fn sort_pdfs(pdfs: &mut [PdfInfo], sort_mode: SortMode, ascending: bool) {
     if pdfs.len() < 2 {
         return;
     }
@@ -325,27 +336,23 @@ pub fn sort_pdfs(pdfs: &mut [PdfInfo], sort_mode: SortMode) {
         natural_cmp_normalized(&left.folder, &right.folder)
             .then_with(|| left.pdf.folder_name.cmp(&right.pdf.folder_name))
     };
-    entries.sort_by(|left, right| match sort_mode {
-        SortMode::Newest => right
-            .pdf
-            .modified_secs
-            .cmp(&left.pdf.modified_secs)
-            .then_with(|| natural_name(left, right))
-            .then_with(|| natural_folder(left, right))
-            .then_with(|| left.pdf.path.cmp(&right.pdf.path)),
-        SortMode::Name => natural_name(left, right)
-            .then_with(|| natural_folder(left, right))
-            .then_with(|| left.pdf.path.cmp(&right.pdf.path)),
-        SortMode::Folder => natural_folder(left, right)
-            .then_with(|| natural_name(left, right))
-            .then_with(|| left.pdf.path.cmp(&right.pdf.path)),
-        SortMode::Size => right
-            .pdf
-            .size_bytes
-            .cmp(&left.pdf.size_bytes)
-            .then_with(|| natural_name(left, right))
-            .then_with(|| natural_folder(left, right))
-            .then_with(|| left.pdf.path.cmp(&right.pdf.path)),
+    entries.sort_by(|left, right| {
+        let primary = match sort_mode {
+            SortMode::Modified => left.pdf.modified_secs.cmp(&right.pdf.modified_secs),
+            SortMode::Name => natural_name(left, right),
+            SortMode::Folder => natural_folder(left, right),
+            SortMode::Size => left.pdf.size_bytes.cmp(&right.pdf.size_bytes),
+        };
+        let primary = if ascending { primary } else { primary.reverse() };
+        primary
+            .then_with(|| match sort_mode {
+                SortMode::Modified | SortMode::Size => {
+                    natural_name(left, right).then_with(|| natural_folder(left, right))
+                }
+                SortMode::Name => natural_folder(left, right),
+                SortMode::Folder => natural_name(left, right),
+            })
+            .then_with(|| left.pdf.path.cmp(&right.pdf.path))
     });
     for (target, entry) in pdfs.iter_mut().zip(entries) {
         *target = entry.pdf;
@@ -921,7 +928,7 @@ mod tests {
             pdfs: vec![first.clone(), second],
         };
 
-        let matches = search_and_sort(&snapshot, "zazolc lodz", SortMode::Name, None);
+        let matches = search_and_sort(&snapshot, "zazolc lodz", SortMode::Name, true, None);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].path, first.path);
         assert!(
@@ -929,6 +936,7 @@ mod tests {
                 &snapshot,
                 "zazolc",
                 SortMode::Name,
+                true,
                 Some(Path::new("Warszawa"))
             )
             .is_empty()
@@ -936,20 +944,36 @@ mod tests {
     }
 
     #[test]
-    fn all_sort_modes_have_stable_expected_direction() {
+    fn all_sort_modes_work_in_both_directions() {
         let mut items = vec![
             pdf("A10.pdf", "B", 10, 500),
             pdf("A2.pdf", "A", 30, 100),
             pdf("A1.pdf", "C", 20, 900),
         ];
-        sort_pdfs(&mut items, SortMode::Newest);
+        sort_pdfs(&mut items, SortMode::Modified, false);
         assert_eq!(items[0].name, "A2.pdf");
-        sort_pdfs(&mut items, SortMode::Name);
+        sort_pdfs(&mut items, SortMode::Modified, true);
+        assert_eq!(items[0].name, "A10.pdf");
+        sort_pdfs(&mut items, SortMode::Name, true);
         assert_eq!(items[0].name, "A1.pdf");
-        sort_pdfs(&mut items, SortMode::Folder);
+        sort_pdfs(&mut items, SortMode::Name, false);
+        assert_eq!(items[0].name, "A10.pdf");
+        sort_pdfs(&mut items, SortMode::Folder, true);
         assert_eq!(items[0].folder_name, "A");
-        sort_pdfs(&mut items, SortMode::Size);
+        sort_pdfs(&mut items, SortMode::Folder, false);
+        assert_eq!(items[0].folder_name, "C");
+        sort_pdfs(&mut items, SortMode::Size, false);
         assert_eq!(items[0].size_bytes, 900);
+        sort_pdfs(&mut items, SortMode::Size, true);
+        assert_eq!(items[0].size_bytes, 100);
+    }
+
+    #[test]
+    fn default_directions_match_user_expectations() {
+        assert!(SortMode::Name.default_ascending());
+        assert!(SortMode::Folder.default_ascending());
+        assert!(!SortMode::Modified.default_ascending());
+        assert!(!SortMode::Size.default_ascending());
     }
 
     #[test]
@@ -964,7 +988,7 @@ mod tests {
         };
         let started = Instant::now();
 
-        let matches = search_and_sort(&snapshot, "akta", SortMode::Name, None);
+        let matches = search_and_sort(&snapshot, "akta", SortMode::Name, true, None);
 
         assert_eq!(matches.len(), 10_000);
         assert_eq!(matches.first().unwrap().name, "A00000.pdf");
