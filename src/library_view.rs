@@ -694,7 +694,7 @@ fn show_document_list(
                     RichText::new("Zmodyfikowano").strong(),
                 );
                 if columns.show_size {
-                    table_label(ui, columns.size, RichText::new("Rozmiar").strong());
+                    table_label_right(ui, columns.size, RichText::new("Rozmiar").strong());
                 }
             });
         });
@@ -773,21 +773,40 @@ impl TableColumns {
     }
 }
 
+/// Reserves an exact cell rect in the parent row and lays the content out
+/// inside it. `allocate_ui_with_layout` alone collapses to the content width,
+/// which made every row a different length instead of an aligned table.
+fn fixed_cell<R>(
+    ui: &mut egui::Ui,
+    width: f32,
+    layout: Layout,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, CONTROL_HEIGHT), Sense::hover());
+    let mut cell = ui.new_child(UiBuilder::new().max_rect(rect).layout(layout));
+    add_contents(&mut cell)
+}
+
 fn checkbox_cell(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
-    ui.allocate_ui_with_layout(
-        Vec2::new(32.0, CONTROL_HEIGHT),
+    fixed_cell(
+        ui,
+        32.0,
         Layout::centered_and_justified(egui::Direction::LeftToRight),
         add_contents,
     );
 }
 
 fn table_label(ui: &mut egui::Ui, width: f32, text: RichText) -> egui::Response {
-    ui.allocate_ui_with_layout(
-        Vec2::new(width, CONTROL_HEIGHT),
-        Layout::left_to_right(Align::Center),
-        |ui| ui.add(egui::Label::new(text).truncate()),
-    )
-    .inner
+    fixed_cell(ui, width, Layout::left_to_right(Align::Center), |ui| {
+        ui.add(egui::Label::new(text).truncate())
+    })
+}
+
+/// Numeric columns (sizes) read best when the digits line up on the right.
+fn table_label_right(ui: &mut egui::Ui, width: f32, text: RichText) -> egui::Response {
+    fixed_cell(ui, width, Layout::right_to_left(Align::Center), |ui| {
+        ui.add(egui::Label::new(text).truncate())
+    })
 }
 
 fn selected_action_bar(
@@ -889,8 +908,9 @@ fn document_row(
                         }
                     });
                     if columns.compact_folder {
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(columns.name, CONTROL_HEIGHT),
+                        fixed_cell(
+                            ui,
+                            columns.name,
                             Layout::top_down(Align::Min).with_main_align(Align::Center),
                             |ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
@@ -923,7 +943,11 @@ fn document_row(
                         RichText::new(format_relative_time(pdf.modified_secs)),
                     );
                     if columns.show_size {
-                        table_label(ui, columns.size, RichText::new(format_size(pdf.size_bytes)));
+                        table_label_right(
+                            ui,
+                            columns.size,
+                            RichText::new(format_size(pdf.size_bytes)),
+                        );
                     }
                 });
             })
