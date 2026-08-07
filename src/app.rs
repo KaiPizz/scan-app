@@ -18,6 +18,7 @@ use crate::storage::{
     load_settings, next_sequence_name, normalized_pdf_stem, pdf_info, rename_folder, save_settings,
     unique_pdf_path,
 };
+use crate::sync::{SyncOutcome, spawn_upload};
 use eframe::egui::{
     self, Align, Button, Color32, ColorImage, CornerRadius, FontId, Frame, Id, Layout, Margin,
     Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, UiBuilder, Vec2,
@@ -25,6 +26,7 @@ use eframe::egui::{
 use image::RgbImage;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 const BLUE: Color32 = Color32::from_rgb(38, 101, 180);
@@ -176,6 +178,12 @@ pub struct DocumentScannerApp {
     show_exit_confirm: bool,
     allow_exit: bool,
     message: Option<String>,
+
+    sync_tx: Sender<SyncOutcome>,
+    sync_rx: Receiver<SyncOutcome>,
+    sync_ok: usize,
+    sync_failed: usize,
+    last_sync_error: Option<String>,
 }
 
 impl DocumentScannerApp {
@@ -188,6 +196,7 @@ impl DocumentScannerApp {
             .unwrap_or_else(default_library_root);
         let mut library_worker = LibraryWorker::start();
         let library_loading = library_worker.request_refresh(library_root.clone()).is_ok();
+        let (sync_tx, sync_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             screen: Screen::Library,
             settings,
@@ -254,6 +263,11 @@ impl DocumentScannerApp {
             show_exit_confirm: false,
             allow_exit: false,
             message: None,
+            sync_tx,
+            sync_rx,
+            sync_ok: 0,
+            sync_failed: 0,
+            last_sync_error: None,
         };
         if let Err(error) = ensure_library(&app.library_root) {
             app.message = Some(error);
@@ -516,6 +530,48 @@ impl DocumentScannerApp {
         }
     }
 
+    /// Fire-and-forget cloud sync of a processed page. Scanning must never
+    /// block on the network, so failures only bump a counter surfaced in the
+    /// settings modal.
+    fn spawn_scan_upload(&mut self, id: u64, jpeg: Vec<u8>) {
+        let backend_url = self.settings.backend_url.clone().unwrap_or_default();
+        let salon_id = self.settings.salon_id.clone().unwrap_or_default();
+        let backend_url = backend_url.trim();
+        let salon_id = salon_id.trim();
+        if backend_url.is_empty() || salon_id.is_empty() {
+            return;
+        }
+        let api_key = self
+            .settings
+            .scan_api_key
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        spawn_upload(
+            backend_url.to_owned(),
+            salon_id.to_owned(),
+            api_key,
+            id,
+            format!("scan-{id}.jpg"),
+            jpeg,
+            self.sync_tx.clone(),
+        );
+    }
+
+    fn poll_sync(&mut self) {
+        while let Ok(outcome) = self.sync_rx.try_recv() {
+            match outcome.result {
+                Ok(_) => self.sync_ok += 1,
+                Err(error) => {
+                    self.sync_failed += 1;
+                    self.last_sync_error =
+                        Some(format!("Strona {}: {error}", outcome.page_id + 1));
+                }
+            }
+        }
+    }
+
     fn start_camera(&mut self) {
         self.stop_camera();
         self.camera_status = "Łączenie z IRIScan Visualizer 7…".to_owned();
@@ -667,6 +723,7 @@ impl DocumentScannerApp {
                         continue;
                     };
                     self.session_write_page(id, &page.jpeg, &original_jpeg, corners, 0);
+                    self.spawn_scan_upload(id, page.jpeg.clone());
                     let texture = strip_texture(context, id, 0, &page, 0);
                     self.slots[index].slot = PageSlot::Ready(Box::new(PageData {
                         page,
@@ -1775,6 +1832,7 @@ impl DocumentScannerApp {
     fn scan_hub_ui(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         self.poll_camera(context);
         self.poll_pipeline(context);
+        self.poll_sync();
         if self.overlay.as_ref().is_some_and(OverlayDetector::is_dead) {
             self.overlay = Some(OverlayDetector::start());
         }
@@ -2823,6 +2881,78 @@ impl DocumentScannerApp {
                         }
                     }
                 });
+                ui.add_space(14.0);
+                ui.label(RichText::new("Synchronizacja z chmurą").strong());
+                ui.label(
+                    RichText::new(
+                        "Każda zeskanowana strona trafia automatycznie na serwer. \
+                         Zostaw puste, aby wyłączyć.",
+                    )
+                    .small()
+                    .color(Color32::GRAY),
+                );
+                ui.add_space(6.0);
+                let mut sync_changed = false;
+                ui.label("Adres API:");
+                let mut backend_url = self.settings.backend_url.clone().unwrap_or_default();
+                if ui
+                    .add_sized(
+                        [420.0, CONTROL_HEIGHT],
+                        egui::TextEdit::singleline(&mut backend_url)
+                            .hint_text("https://api.enail.pro/api/v1"),
+                    )
+                    .changed()
+                {
+                    self.settings.backend_url = none_if_blank(backend_url);
+                    sync_changed = true;
+                }
+                ui.label("ID salonu:");
+                let mut salon_id = self.settings.salon_id.clone().unwrap_or_default();
+                if ui
+                    .add_sized(
+                        [420.0, CONTROL_HEIGHT],
+                        egui::TextEdit::singleline(&mut salon_id),
+                    )
+                    .changed()
+                {
+                    self.settings.salon_id = none_if_blank(salon_id);
+                    sync_changed = true;
+                }
+                ui.label("Klucz API:");
+                let mut scan_api_key = self.settings.scan_api_key.clone().unwrap_or_default();
+                if ui
+                    .add_sized(
+                        [420.0, CONTROL_HEIGHT],
+                        egui::TextEdit::singleline(&mut scan_api_key).password(true),
+                    )
+                    .changed()
+                {
+                    self.settings.scan_api_key = none_if_blank(scan_api_key);
+                    sync_changed = true;
+                }
+                if sync_changed {
+                    let _ = save_settings(&self.settings);
+                }
+                if self.sync_ok > 0 || self.sync_failed > 0 {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Wysłane strony: {} · Błędy: {}",
+                            self.sync_ok, self.sync_failed
+                        ))
+                        .small()
+                        .color(Color32::from_gray(90)),
+                    );
+                    if self.sync_failed > 0
+                        && let Some(error) = &self.last_sync_error
+                    {
+                        ui.label(
+                            RichText::new(error)
+                                .small()
+                                .color(Color32::from_rgb(180, 40, 40)),
+                        );
+                    }
+                }
                 ui.add_space(12.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Gotowe").clicked() {
@@ -3191,6 +3321,10 @@ impl DocumentScannerApp {
             context.request_repaint_after(Duration::from_millis(250));
         }
     }
+}
+
+fn none_if_blank(value: String) -> Option<String> {
+    if value.trim().is_empty() { None } else { Some(value) }
 }
 
 impl eframe::App for DocumentScannerApp {

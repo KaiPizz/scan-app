@@ -37,6 +37,12 @@ pub struct Settings {
     pub recent_documents: Vec<PathBuf>,
     #[serde(default)]
     pub auto_capture: Option<bool>,
+    #[serde(default)]
+    pub backend_url: Option<String>,
+    #[serde(default)]
+    pub salon_id: Option<String>,
+    #[serde(default)]
+    pub scan_api_key: Option<String>,
 }
 
 pub fn default_library_root() -> PathBuf {

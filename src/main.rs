@@ -12,6 +12,7 @@ mod pipeline;
 mod review_viewport;
 mod session;
 mod storage;
+mod sync;
 
 use app::DocumentScannerApp;
 use eframe::egui;

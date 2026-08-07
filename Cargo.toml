@@ -5,6 +5,7 @@ edition = "2024"
 description = "Prosty skaner dokumentow dla IRIScan Visualizer 7"
 
 [dependencies]
+reqwest = { version = "0.12.12", features = ["multipart", "blocking", "json"] }
 directories = "6.0.0"
 eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
