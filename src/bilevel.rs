@@ -70,7 +70,9 @@ use image::RgbImage;
 use imageproc::region_labelling::{Connectivity, connected_components};
 
 const SAUVOLA_WINDOW: u32 = 41; // px at 300 dpi
-const SAUVOLA_K: f64 = 0.30;
+/// 0.20 rather than the textbook 0.30: on real IRIScan pages the higher value
+/// dropped the dots of Polish `i`/`ż`; 0.20 keeps them for ~5 % more bytes.
+const SAUVOLA_K: f64 = 0.20;
 const SAUVOLA_R: f64 = 128.0;
 /// A border-touching black component is the dark mat rim (the 1.8 % corner
 /// expansion drags it in) unless it is a thin rule: ≥ 60 % of one side long
@@ -355,6 +357,33 @@ mod tests {
         let out = binarize(&page);
         assert_eq!(out.get_pixel(200, 150).0[0], 0, "table rule was erased");
         assert_eq!(out.get_pixel(0, 150).0[0], 0);
+    }
+
+    /// IRISCAN_TEST_FRAME=<frame.jpg|png> [PROBE_PDF=<out.pdf>] cargo test --release bilevel_real_frame -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostyka na prawdziwej klatce"]
+    fn bilevel_real_frame() {
+        use crate::document::{ColorMode, decode_page, detect_document_corners, process_page_with};
+        let input = std::env::var("IRISCAN_TEST_FRAME").expect("IRISCAN_TEST_FRAME");
+        let frame = image::open(input).expect("klatka").to_rgb8();
+        let corners = detect_document_corners(&frame);
+        let started = std::time::Instant::now();
+        let page = process_page_with(&frame, corners, true, ColorMode::BlackWhite).expect("strona");
+        let processed = started.elapsed();
+        let started = std::time::Instant::now();
+        let decoded = decode_page(&page.encoded()).expect("decode");
+        let black = decoded.pixels().filter(|p| p.0[0] == 0).count();
+        println!(
+            "bytes={} KB process={:?} decode={:?} black={:.2}%",
+            page.bytes.len() / 1024,
+            processed,
+            started.elapsed(),
+            black as f64 * 100.0 / (page.width as f64 * page.height as f64)
+        );
+        if let Ok(out) = std::env::var("PROBE_PDF") {
+            std::fs::write(out, crate::document::render_pdf(&[(&page, 0)]).expect("pdf")).expect("zapis");
+        }
+        assert!(page.bytes.len() < 150 * 1024, "strona za duża: {} B", page.bytes.len());
     }
 
     #[test]

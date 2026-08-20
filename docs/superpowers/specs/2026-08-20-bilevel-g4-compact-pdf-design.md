@@ -103,7 +103,7 @@ uneven lighting per channel), so a simple local threshold is enough:
 
 1. Luma (Rec. 601 weights) from the enhanced RGB.
 2. **Sauvola threshold** on an integral image (sum + sum of squares):
-   `T = m · (1 + k · (s / R − 1))`, window **41 px**, `k = 0.30`, `R = 128`.
+   `T = m · (1 + k · (s / R − 1))`, window **41 px**, `k = 0.20`, `R = 128`.
    Pixel < T → black. Integral images make this O(pixels); ~8.7 MP ≈ 100–150 ms
    release on the Ryzen 5 laptop — acceptable inside the existing worker thread
    (capture latency budget unchanged: the UI never waits on it).
