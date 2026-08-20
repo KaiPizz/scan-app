@@ -1,3 +1,4 @@
+use crate::document::ColorMode;
 use directories::{ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -43,6 +44,9 @@ pub struct Settings {
     pub salon_id: Option<String>,
     #[serde(default)]
     pub scan_api_key: Option<String>,
+    /// `None` means the default, black-and-white (G4) pages.
+    #[serde(default)]
+    pub color_mode: Option<ColorMode>,
 }
 
 pub fn default_library_root() -> PathBuf {
@@ -714,6 +718,20 @@ mod tests {
         );
         drop(first);
         assert!(acquire_instance_lock().expect("re-acquire").is_some());
+    }
+
+    #[test]
+    fn color_mode_defaults_to_black_white_and_round_trips() {
+        let legacy: Settings = ron::from_str("(library_root:None,last_folder:None)").unwrap();
+        assert_eq!(legacy.color_mode, None);
+        assert_eq!(legacy.color_mode.unwrap_or_default(), ColorMode::BlackWhite);
+        let settings = Settings {
+            color_mode: Some(ColorMode::Color),
+            ..Settings::default()
+        };
+        let text = ron::to_string(&settings).unwrap();
+        let back: Settings = ron::from_str(&text).unwrap();
+        assert_eq!(back.color_mode, Some(ColorMode::Color));
     }
 
     #[test]

@@ -534,6 +534,10 @@ impl DocumentScannerApp {
     /// Fire-and-forget cloud sync of a processed page. Scanning must never
     /// block on the network, so failures only bump a counter surfaced in the
     /// settings modal.
+    fn color_mode(&self) -> ColorMode {
+        self.settings.color_mode.unwrap_or_default()
+    }
+
     fn spawn_scan_upload(&mut self, id: u64, page: EncodedPage) {
         let backend_url = self.settings.backend_url.clone().unwrap_or_default();
         let salon_id = self.settings.salon_id.clone().unwrap_or_default();
@@ -666,11 +670,12 @@ impl DocumentScannerApp {
             }
             return false;
         };
+        let mode = self.color_mode();
         let Some(pipeline) = &self.pipeline else {
             return false;
         };
         let id = self.next_page_id;
-        if pipeline.try_submit(id, frame, ColorMode::Color) {
+        if pipeline.try_submit(id, frame, mode) {
             self.next_page_id += 1;
             self.slots.push(SlotEntry {
                 id,
@@ -1336,6 +1341,7 @@ impl DocumentScannerApp {
         let Some(editor) = self.editor.take() else {
             return;
         };
+        let mode = self.color_mode();
         let Some(entry) = self.slots.get_mut(editor.slot_index) else {
             return;
         };
@@ -1347,12 +1353,7 @@ impl DocumentScannerApp {
             PageSlot::Failed { quarter_turns, .. } => *quarter_turns,
             _ => return,
         };
-        if pipeline.submit_reprocess(
-            entry.id,
-            Arc::new(editor.original),
-            editor.corners,
-            ColorMode::Color,
-        ) {
+        if pipeline.submit_reprocess(entry.id, Arc::new(editor.original), editor.corners, mode) {
             let current = std::mem::replace(&mut entry.slot, PageSlot::Processing);
             let (original_jpeg, previous) = match current {
                 PageSlot::Ready(mut data) => {
@@ -2202,7 +2203,8 @@ impl DocumentScannerApp {
                                         ui.add(
                                             egui::Image::new(&data.texture).fit_to_exact_size(size),
                                         );
-                                        ui.label(format!("{}", index + 1));
+                                        ui.label(format!("{}", index + 1))
+                                            .on_hover_text(page_size_label(&data.page));
                                     }
                                     PageSlot::Processing | PageSlot::Reprocessing { .. } => {
                                         ui.add_space(40.0);
@@ -2493,6 +2495,13 @@ impl DocumentScannerApp {
                 None => {}
             }
 
+            let page_size_text = match self.slots.get(index) {
+                Some(SlotEntry {
+                    slot: PageSlot::Ready(data),
+                    ..
+                }) => Some(page_size_label(&data.page)),
+                _ => None,
+            };
             let mut inspector_ui = ui.new_child(
                 UiBuilder::new()
                     .id_salt("review-inspector")
@@ -2516,6 +2525,9 @@ impl DocumentScannerApp {
                                     .size(19.0)
                                     .strong(),
                             );
+                            if let Some(text) = &page_size_text {
+                                ui.label(RichText::new(text).small().color(Color32::GRAY));
+                            }
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
                                 if ui.add_enabled(index > 0, Button::new("◀")).clicked() {
@@ -2895,6 +2907,49 @@ impl DocumentScannerApp {
                         }
                     }
                 });
+                ui.add_space(14.0);
+                ui.label(RichText::new("Tryb koloru").strong());
+                ui.label(
+                    RichText::new(
+                        "Czarno-biały daje strony ~66 KB zamiast ~2 MB bez utraty rozdzielczości. \
+                         Kolor tylko dla dokumentów z pieczęciami lub kolorowym papierem.",
+                    )
+                    .small()
+                    .color(Color32::GRAY),
+                );
+                ui.add_space(6.0);
+                let mut mode = self.color_mode();
+                let mode_changed = egui::ComboBox::from_id_salt("tryb-koloru")
+                    .width(260.0)
+                    .selected_text(color_mode_label(mode))
+                    .show_ui(ui, |ui| {
+                        let first = ui
+                            .selectable_value(
+                                &mut mode,
+                                ColorMode::BlackWhite,
+                                color_mode_label(ColorMode::BlackWhite),
+                            )
+                            .changed();
+                        let second = ui
+                            .selectable_value(
+                                &mut mode,
+                                ColorMode::Color,
+                                color_mode_label(ColorMode::Color),
+                            )
+                            .changed();
+                        first || second
+                    })
+                    .inner
+                    .unwrap_or(false);
+                if mode_changed {
+                    self.settings.color_mode = Some(mode);
+                    let _ = save_settings(&self.settings);
+                }
+                ui.label(
+                    RichText::new("Zmiana dotyczy kolejnych skanowanych stron.")
+                        .small()
+                        .color(Color32::GRAY),
+                );
                 ui.add_space(14.0);
                 ui.label(RichText::new("Synchronizacja z chmurą").strong());
                 ui.label(
@@ -3558,6 +3613,22 @@ fn rgb_to_color_image(image: &RgbImage) -> ColorImage {
 }
 
 /// Film-strip texture for a page, rotated for display by its quarter turns.
+fn color_mode_label(mode: ColorMode) -> &'static str {
+    match mode {
+        ColorMode::BlackWhite => "Czarno-biały (domyślnie)",
+        ColorMode::Color => "Kolor",
+    }
+}
+
+fn page_size_label(page: &ScannedPage) -> String {
+    let kb = page.bytes.len() / 1024;
+    let mode = match page.encoding {
+        crate::document::PageEncoding::G4 => "czarno-biała",
+        crate::document::PageEncoding::Jpeg => "kolor",
+    };
+    format!("{kb} KB · {mode}")
+}
+
 fn strip_texture(
     context: &egui::Context,
     id: u64,
