@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Binarize at **300 dpi, never downsample**; Sauvola window 41 px, k = 0.20, R = 128; border-touching black components removed unless they span > 60 % of width or height; components ≤ 3 px removed.
+- Binarize at **300 dpi, never downsample**; unsharp mask σ=2/amount 1.5, then Sauvola window 41 px, k = 0.30, R = 128; border-touching black components removed unless they span > 60 % of width or height; components ≤ 3 px removed.
 - G4 bit convention: PDF `BlackIs1 false` → `fax::Color::Black`/`White` written directly; `GrayImage` pixels are strictly `0` (black) or `255` (white).
 - PDF G4 XObject: `DeviceGray`, `BitsPerComponent 1`, `CCITTFaxDecode`, `DecodeParms << /K -1 /Columns W /Rows H /BlackIs1 false >>`. Everything else in `render_pdf` unchanged (A4 MediaBox, `q cm Do Q`, `/Rotate`, Keywords marker `skaner-dokumentow-editable-v1`).
 - `Kolor` mode = RGB JPEG **q80**; `ColorMode::default()` = `BlackWhite`.

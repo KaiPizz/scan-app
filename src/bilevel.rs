@@ -67,12 +67,18 @@ pub fn decode_g4(bytes: &[u8], width: u32, height: u32) -> Result<GrayImage, Str
 }
 
 use image::RgbImage;
+use imageproc::filter::gaussian_blur_f32;
 use imageproc::region_labelling::{Connectivity, connected_components};
 
+/// Unsharp mask before thresholding. The IRIScan optics blur small print by
+/// ~2 px; thresholding that blur directly either fattens glyphs (low k) or
+/// breaks strokes (high k). Sharpening first restores the stroke edges, so
+/// the textbook k = 0.30 then yields thin, intact letters (verified on real
+/// pages from the production library, 2026-08-20).
+const UNSHARP_SIGMA: f32 = 2.0;
+const UNSHARP_AMOUNT: f32 = 1.5;
 const SAUVOLA_WINDOW: u32 = 41; // px at 300 dpi
-/// 0.20 rather than the textbook 0.30: on real IRIScan pages the higher value
-/// dropped the dots of Polish `i`/`ż`; 0.20 keeps them for ~5 % more bytes.
-const SAUVOLA_K: f64 = 0.20;
+const SAUVOLA_K: f64 = 0.30;
 const SAUVOLA_R: f64 = 128.0;
 /// A border-touching black component is the dark mat rim (the 1.8 % corner
 /// expansion drags it in) unless it is a thin rule: ≥ 60 % of one side long
@@ -89,9 +95,24 @@ pub fn binarize(image: &RgbImage) -> GrayImage {
         let luma = 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
         Luma([luma.round().clamp(0.0, 255.0) as u8])
     });
-    let mut bilevel = sauvola_threshold(&gray);
+    let sharpened = unsharp_mask(&gray);
+    let mut bilevel = sauvola_threshold(&sharpened);
     remove_border_and_specks(&mut bilevel);
     bilevel
+}
+
+/// `g + amount · (g − blur(g))`, clamped — classic unsharp mask.
+fn unsharp_mask(gray: &GrayImage) -> GrayImage {
+    let blurred = gaussian_blur_f32(gray, UNSHARP_SIGMA);
+    let raw = gray.as_raw();
+    let blur = blurred.as_raw();
+    let mut out = GrayImage::new(gray.width(), gray.height());
+    for (index, value) in out.as_mut().iter_mut().enumerate() {
+        let g = raw[index] as f32;
+        let b = blur[index] as f32;
+        *value = (g + UNSHARP_AMOUNT * (g - b)).round().clamp(0.0, 255.0) as u8;
+    }
+    out
 }
 
 /// Sauvola: T = m · (1 + k · (s / R − 1)) over a square window, via integral
