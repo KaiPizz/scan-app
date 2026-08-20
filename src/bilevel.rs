@@ -79,6 +79,11 @@ const UNSHARP_SIGMA: f32 = 2.0;
 const UNSHARP_AMOUNT: f32 = 1.5;
 const SAUVOLA_WINDOW: u32 = 41; // px at 300 dpi
 const SAUVOLA_K: f64 = 0.30;
+/// Sauvola hollows out solid dark areas wider than its window (a filled table
+/// header, a stamp, a thick signature stroke): inside them mean ≈ pixel and
+/// the threshold drops below the pixel. `enhance_document` already puts paper
+/// at ~247, so anything this dark is ink regardless of the local statistics.
+const ABSOLUTE_INK_MAX: u8 = 100;
 const SAUVOLA_R: f64 = 128.0;
 /// A border-touching black component is the dark mat rim (the 1.8 % corner
 /// expansion drags it in) unless it is a thin rule: ≥ 60 % of one side long
@@ -154,7 +159,8 @@ fn sauvola_threshold(gray: &GrayImage) -> GrayImage {
             let mean = s / n;
             let var = (s2 / n - mean * mean).max(0.0);
             let threshold = mean * (1.0 + SAUVOLA_K * (var.sqrt() / SAUVOLA_R - 1.0));
-            if (raw[y * w + x] as f64) < threshold {
+            let value = raw[y * w + x];
+            if value < ABSOLUTE_INK_MAX || (value as f64) < threshold {
                 out_raw[y * w + x] = 0;
             }
         }
@@ -405,6 +411,22 @@ mod tests {
             std::fs::write(out, crate::document::render_pdf(&[(&page, 0)]).expect("pdf")).expect("zapis");
         }
         assert!(page.bytes.len() < 150 * 1024, "strona za duża: {} B", page.bytes.len());
+    }
+
+    #[test]
+    fn binarize_keeps_solid_blocks_wider_than_the_window_filled() {
+        // A 120×120 filled square (stamp / table header) on plain paper must
+        // not hollow out in the middle.
+        let mut page = RgbImage::from_pixel(400, 400, Rgb([246, 246, 246]));
+        for y in 140..260 {
+            for x in 140..260 {
+                page.put_pixel(x, y, Rgb([18, 18, 18]));
+            }
+        }
+        let out = binarize(&page);
+        assert_eq!(out.get_pixel(200, 200).0[0], 0, "centre hollowed out");
+        assert_eq!(out.get_pixel(145, 145).0[0], 0);
+        assert_eq!(out.get_pixel(100, 100).0[0], 255);
     }
 
     #[test]
