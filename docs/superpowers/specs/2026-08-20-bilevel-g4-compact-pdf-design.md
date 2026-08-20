@@ -204,8 +204,9 @@ Status text of a ready page (film strip tooltip) shows the page size
 
 ### 3.8 Cloud sync (`sync.rs`, `app.rs::spawn_scan_upload`)
 
-`spawn_scan_upload(id, page)` now takes the page; for `G4` it encodes a **1-bit
-PNG** (image crate `PngEncoder`, `ExtendedColorType::L1`, ≈115 KB) inside the
+`spawn_scan_upload(id, page)` now takes the page; for `G4` it encodes an **8-bit
+grayscale PNG** (image crate `PngEncoder`, `ExtendedColorType::L8` — image 0.25
+cannot write 1-bit PNG; two-valued data still deflates to ~200 KB) inside the
 upload thread and sends `image/png`; for `Jpeg` it sends the bytes as today.
 Not deployed (endpoint still 404 on Contabo); covered by a unit test that the
 multipart part is built with the right MIME and a decodable PNG.

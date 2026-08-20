@@ -534,7 +534,7 @@ impl DocumentScannerApp {
     /// Fire-and-forget cloud sync of a processed page. Scanning must never
     /// block on the network, so failures only bump a counter surfaced in the
     /// settings modal.
-    fn spawn_scan_upload(&mut self, id: u64, jpeg: Vec<u8>) {
+    fn spawn_scan_upload(&mut self, id: u64, page: EncodedPage) {
         let backend_url = self.settings.backend_url.clone().unwrap_or_default();
         let salon_id = self.settings.salon_id.clone().unwrap_or_default();
         let backend_url = backend_url.trim();
@@ -554,8 +554,7 @@ impl DocumentScannerApp {
             salon_id.to_owned(),
             api_key,
             id,
-            format!("scan-{id}.jpg"),
-            jpeg,
+            page,
             self.sync_tx.clone(),
         );
     }
@@ -724,7 +723,7 @@ impl DocumentScannerApp {
                         continue;
                     };
                     self.session_write_page(id, &page.encoded(), &original_jpeg, corners, 0);
-                    self.spawn_scan_upload(id, page.bytes.clone());
+                    self.spawn_scan_upload(id, page.encoded());
                     let texture = strip_texture(context, id, 0, &page, 0);
                     self.slots[index].slot = PageSlot::Ready(Box::new(PageData {
                         page,
