@@ -1,8 +1,8 @@
 use crate::autocapture::{AutoCapture, FeedResult};
 use crate::camera::{CameraController, CameraEvent};
 use crate::document::{
-    ColorMode, CropPoint, EncodedPage, PageEncoding, ScannedPage, extract_pdf_pages,
-    page_from_encoded, pages_from_extracted,
+    ColorMode, CropPoint, EncodedPage, ScannedPage, extract_pdf_pages, page_from_encoded,
+    pages_from_extracted,
     render_pdf, rotate_rgb,
 };
 use crate::library::{
@@ -502,7 +502,7 @@ impl DocumentScannerApp {
     fn session_write_page(
         &mut self,
         id: u64,
-        jpeg: &[u8],
+        page: &EncodedPage,
         original_jpeg: &[u8],
         corners: [CropPoint; 4],
         quarter_turns: u8,
@@ -511,7 +511,7 @@ impl DocumentScannerApp {
             return;
         }
         if let Some(session) = &self.session {
-            session.write_page(id, jpeg, original_jpeg, corners, quarter_turns);
+            session.write_page(id, page, original_jpeg, corners, quarter_turns);
         }
     }
 
@@ -723,7 +723,7 @@ impl DocumentScannerApp {
                     }) else {
                         continue;
                     };
-                    self.session_write_page(id, &page.bytes, &original_jpeg, corners, 0);
+                    self.session_write_page(id, &page.encoded(), &original_jpeg, corners, 0);
                     self.spawn_scan_upload(id, page.bytes.clone());
                     let texture = strip_texture(context, id, 0, &page, 0);
                     self.slots[index].slot = PageSlot::Ready(Box::new(PageData {
@@ -766,7 +766,7 @@ impl DocumentScannerApp {
                         // unrotated and only the strip texture is rotated.
                         let texture =
                             strip_texture(context, entry.id, entry.revision + 1, &page, quarter_turns);
-                        let persisted_jpeg = page.bytes.clone();
+                        let persisted_page = page.encoded();
                         entry.revision += 1;
                         entry.slot = PageSlot::Ready(Box::new(PageData {
                             page,
@@ -775,10 +775,10 @@ impl DocumentScannerApp {
                             quarter_turns,
                             texture,
                         }));
-                        persisted = Some((persisted_jpeg, original_jpeg, quarter_turns));
+                        persisted = Some((persisted_page, original_jpeg, quarter_turns));
                     }
-                    if let Some((jpeg, original_jpeg, quarter_turns)) = persisted {
-                        self.session_write_page(id, &jpeg, &original_jpeg, corners, quarter_turns);
+                    if let Some((page, original_jpeg, quarter_turns)) = persisted {
+                        self.session_write_page(id, &page, &original_jpeg, corners, quarter_turns);
                     }
                 }
                 PipelineEvent::ReprocessFailed { id, error } => {
@@ -962,13 +962,13 @@ impl DocumentScannerApp {
         }
         let written = (
             entry.id,
-            data.page.bytes.clone(),
+            data.page.encoded(),
             data.original_jpeg.clone(),
             data.corners,
             data.quarter_turns,
         );
-        let (id, jpeg, original_jpeg, corners, quarter_turns) = written;
-        self.session_write_page(id, &jpeg, &original_jpeg, corners, quarter_turns);
+        let (id, page, original_jpeg, corners, quarter_turns) = written;
+        self.session_write_page(id, &page, &original_jpeg, corners, quarter_turns);
         self.review_viewport.invalidate();
     }
 
@@ -1238,25 +1238,25 @@ impl DocumentScannerApp {
         let mut max_id = recovered.highest_page_id;
         for recovered_page in recovered.pages {
             let id = recovered_page.id;
-            let processed_jpeg = recovered_page.jpeg;
+            let processed_page = recovered_page.page;
             let original_jpeg = recovered_page.original_jpeg.unwrap_or_default();
             let corners = recovered_page
                 .corners
                 .unwrap_or_else(full_frame_editor_corners);
             let quarter_turns = recovered_page.quarter_turns;
             max_id = max_id.max(id);
-            let recovered_page = processed_jpeg
+            let recovered_page = processed_page
                 .ok_or_else(|| "Brak przetworzonego obrazu strony.".to_owned())
-                .and_then(|bytes| {
-                    let (width, height) = image::load_from_memory(&bytes)
-                        .map(|image| (image.width(), image.height()))
-                        .map_err(|error| format!("Nie można odczytać zeskanowanej strony: {error}"))?;
-                    page_from_encoded(EncodedPage {
-                        bytes,
-                        encoding: PageEncoding::Jpeg,
-                        width,
-                        height,
-                    })
+                .and_then(|mut encoded| {
+                    if encoded.width == 0 || encoded.height == 0 {
+                        // Format 0/1 sessions: dimensions live only in the JPEG header.
+                        let image = image::load_from_memory(&encoded.bytes).map_err(|error| {
+                            format!("Nie można odczytać zeskanowanej strony: {error}")
+                        })?;
+                        encoded.width = image.width();
+                        encoded.height = image.height();
+                    }
+                    page_from_encoded(encoded)
                 });
             match recovered_page {
                 Ok(page) => {
@@ -1451,7 +1451,7 @@ impl DocumentScannerApp {
             // apply perspective correction and JPEG compression a second time.
             let original_jpeg = Vec::new();
             let corners = full_frame_editor_corners();
-            self.session_write_page(id, &page.bytes, &original_jpeg, corners, quarter_turns);
+            self.session_write_page(id, &page.encoded(), &original_jpeg, corners, quarter_turns);
             let texture = strip_texture(context, id, 0, &page, quarter_turns);
             self.slots.push(SlotEntry {
                 id,

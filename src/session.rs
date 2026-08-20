@@ -1,4 +1,4 @@
-use crate::document::CropPoint;
+use crate::document::{CropPoint, EncodedPage, PageEncoding};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -20,7 +20,9 @@ struct Manifest {
 #[derive(Debug, PartialEq)]
 pub struct RecoveredPage {
     pub id: u64,
-    pub jpeg: Option<Vec<u8>>,
+    /// `width/height` are 0 for format-0/1 sessions (JPEG only); the app
+    /// reads them from the JPEG header in that case.
+    pub page: Option<EncodedPage>,
     pub original_jpeg: Option<Vec<u8>>,
     pub corners: Option<[CropPoint; 4]>,
     pub quarter_turns: u8,
@@ -44,9 +46,11 @@ enum ManifestState {
     Corrupt,
 }
 
-/// `format` 0 (legacy) stored the page JPEG already rotated, so its
+/// Format 0 (legacy) stored the page JPEG already rotated, so its
 /// `quarter_turns` must not be applied again at display time. Format 1 keeps
-/// the JPEG unrotated and treats `quarter_turns` as display metadata.
+/// the JPEG unrotated and treats `quarter_turns` as display metadata. Format 2
+/// adds the page `encoding` (the page file is `.g4` for G4) and its pixel
+/// dimensions, without which a G4 stream cannot be decoded.
 #[derive(Serialize, Deserialize)]
 struct PageMetadata {
     corners: [CropPoint; 4],
@@ -54,6 +58,25 @@ struct PageMetadata {
     quarter_turns: u8,
     #[serde(default)]
     format: u8,
+    #[serde(default = "default_encoding")]
+    encoding: PageEncoding,
+    #[serde(default)]
+    width: u32,
+    #[serde(default)]
+    height: u32,
+}
+
+fn default_encoding() -> PageEncoding {
+    PageEncoding::Jpeg
+}
+
+const PAGE_METADATA_FORMAT: u8 = 2;
+
+fn page_extension(encoding: PageEncoding) -> &'static str {
+    match encoding {
+        PageEncoding::Jpeg => "jpg",
+        PageEncoding::G4 => "g4",
+    }
 }
 
 pub struct SessionStore {
@@ -109,8 +132,55 @@ impl SessionStore {
         )
     }
 
+    /// The page file for an encoding: `.jpg` for JPEG, `.g4` for G4 — same stem.
+    fn page_path_for(&self, id: u64, revision: Option<u64>, encoding: PageEncoding) -> PathBuf {
+        self.paths_for(id, revision)
+            .0
+            .with_extension(page_extension(encoding))
+    }
+
+    /// Reads whichever page file exists (JPEG first, then G4) and tells which.
+    fn read_page_file(&self, id: u64, revision: Option<u64>) -> Option<(Vec<u8>, PageEncoding)> {
+        for encoding in [PageEncoding::Jpeg, PageEncoding::G4] {
+            if let Ok(bytes) = fs::read(self.page_path_for(id, revision, encoding)) {
+                return Some((bytes, encoding));
+            }
+        }
+        None
+    }
+
+    /// Combines a page file with its metadata. A JPEG without format-2
+    /// metadata gets 0×0 dimensions (the app reads them from the header); a
+    /// G4 stream without trustworthy dimensions is unusable and yields `None`.
+    fn recovered_encoded_page(
+        page_file: Option<(Vec<u8>, PageEncoding)>,
+        metadata: Option<&PageMetadata>,
+    ) -> Option<EncodedPage> {
+        let (bytes, file_encoding) = page_file?;
+        let modern = metadata.filter(|metadata| metadata.format >= 2);
+        match file_encoding {
+            PageEncoding::Jpeg => Some(EncodedPage {
+                bytes,
+                encoding: PageEncoding::Jpeg,
+                width: modern.map_or(0, |metadata| metadata.width),
+                height: modern.map_or(0, |metadata| metadata.height),
+            }),
+            PageEncoding::G4 => modern
+                .filter(|metadata| {
+                    metadata.encoding == PageEncoding::G4 && metadata.width > 0 && metadata.height > 0
+                })
+                .map(|metadata| EncodedPage {
+                    bytes,
+                    encoding: PageEncoding::G4,
+                    width: metadata.width,
+                    height: metadata.height,
+                }),
+        }
+    }
+
     fn remove_revision_files(&self, id: u64, revision: Option<u64>) {
         let (page, original, metadata) = self.paths_for(id, revision);
+        let _ = fs::remove_file(page.with_extension("g4"));
         let _ = fs::remove_file(page);
         let _ = fs::remove_file(original);
         let _ = fs::remove_file(metadata);
@@ -156,7 +226,7 @@ impl SessionStore {
     pub fn write_page(
         &self,
         id: u64,
-        jpeg: &[u8],
+        page: &EncodedPage,
         original_jpeg: &[u8],
         corners: [CropPoint; 4],
         quarter_turns: u8,
@@ -166,13 +236,17 @@ impl SessionStore {
         };
         let previous_revision = manifest.page_revisions.get(&id).copied();
         let revision = previous_revision.unwrap_or(0) + 1;
-        let (page_path, original_path, metadata_path) = self.revision_paths(id, revision);
-        crate::atomic_file::write(&page_path, jpeg).map_err(io_error)?;
+        let (_, original_path, metadata_path) = self.revision_paths(id, revision);
+        let page_path = self.page_path_for(id, Some(revision), page.encoding);
+        crate::atomic_file::write(&page_path, &page.bytes).map_err(io_error)?;
         crate::atomic_file::write(&original_path, original_jpeg).map_err(io_error)?;
         let metadata = ron::to_string(&PageMetadata {
             corners,
             quarter_turns: quarter_turns % 4,
-            format: 1,
+            format: PAGE_METADATA_FORMAT,
+            encoding: page.encoding,
+            width: page.width,
+            height: page.height,
         })
         .map_err(|error| error.to_string())?;
         crate::atomic_file::write(&metadata_path, metadata).map_err(io_error)?;
@@ -223,10 +297,10 @@ impl SessionStore {
         let mut skipped_pages = 0;
         for id in &manifest.page_ids {
             let revision = manifest.page_revisions.get(id).copied();
-            let (page_path, original_path, metadata_path) = self.paths_for(*id, revision);
-            let jpeg = fs::read(page_path).ok();
+            let (_, original_path, metadata_path) = self.paths_for(*id, revision);
+            let page_file = self.read_page_file(*id, revision);
             let original_jpeg = fs::read(original_path).ok();
-            if jpeg.is_none() && original_jpeg.is_none() {
+            if page_file.is_none() && original_jpeg.is_none() {
                 skipped_pages += 1;
                 continue;
             }
@@ -235,7 +309,7 @@ impl SessionStore {
                 .and_then(|contents| ron::from_str::<PageMetadata>(&contents).ok());
             pages.push(RecoveredPage {
                 id: *id,
-                jpeg,
+                page: Self::recovered_encoded_page(page_file, metadata.as_ref()),
                 original_jpeg,
                 corners: metadata.as_ref().map(|metadata| metadata.corners),
                 quarter_turns: metadata
@@ -287,10 +361,10 @@ impl SessionStore {
             let Some(revision) = revisions.pop() else {
                 continue;
             };
-            let (page_path, original_path, metadata_path) = self.paths_for(id, revision);
-            let jpeg = fs::read(page_path).ok();
+            let (_, original_path, metadata_path) = self.paths_for(id, revision);
+            let page_file = self.read_page_file(id, revision);
             let original_jpeg = fs::read(original_path).ok();
-            if jpeg.is_none() && original_jpeg.is_none() {
+            if page_file.is_none() && original_jpeg.is_none() {
                 continue;
             }
             let metadata = fs::read_to_string(metadata_path)
@@ -302,7 +376,7 @@ impl SessionStore {
             }
             pages.push(RecoveredPage {
                 id,
-                jpeg,
+                page: Self::recovered_encoded_page(page_file, metadata.as_ref()),
                 original_jpeg,
                 corners: metadata.as_ref().map(|metadata| metadata.corners),
                 quarter_turns: metadata
@@ -351,7 +425,7 @@ enum SessionCommand {
     Begin { folder: PathBuf },
     WritePage {
         id: u64,
-        jpeg: Vec<u8>,
+        page: EncodedPage,
         original_jpeg: Vec<u8>,
         corners: [CropPoint; 4],
         quarter_turns: u8,
@@ -388,11 +462,11 @@ impl SessionWorker {
                         SessionCommand::Begin { folder } => store.begin(&folder),
                         SessionCommand::WritePage {
                             id,
-                            jpeg,
+                            page,
                             original_jpeg,
                             corners,
                             quarter_turns,
-                        } => store.write_page(id, &jpeg, &original_jpeg, corners, quarter_turns),
+                        } => store.write_page(id, &page, &original_jpeg, corners, quarter_turns),
                         SessionCommand::RemovePage { id } => store.remove_page(id),
                         SessionCommand::SetOrder { ids } => store.set_order(&ids),
                         SessionCommand::SetFolder { folder } => store.set_folder(&folder),
@@ -428,14 +502,14 @@ impl SessionWorker {
     pub fn write_page(
         &self,
         id: u64,
-        jpeg: &[u8],
+        page: &EncodedPage,
         original_jpeg: &[u8],
         corners: [CropPoint; 4],
         quarter_turns: u8,
     ) {
         self.send(SessionCommand::WritePage {
             id,
-            jpeg: jpeg.to_vec(),
+            page: page.clone(),
             original_jpeg: original_jpeg.to_vec(),
             corners,
             quarter_turns,
@@ -492,6 +566,8 @@ fn parse_session_file_name(name: &str) -> Option<(u64, Option<u64>, SessionFileK
         (head, SessionFileKind::Original)
     } else if let Some(head) = name.strip_suffix(".crop.ron") {
         (head, SessionFileKind::Metadata)
+    } else if let Some(head) = name.strip_suffix(".g4") {
+        (head, SessionFileKind::Page)
     } else {
         (name.strip_suffix(".jpg")?, SessionFileKind::Page)
     };
@@ -516,6 +592,24 @@ mod tests {
         let store = SessionStore::at(dir);
         let _ = store.clear();
         store
+    }
+
+    fn jpeg(bytes: &[u8]) -> EncodedPage {
+        EncodedPage {
+            bytes: bytes.to_vec(),
+            encoding: PageEncoding::Jpeg,
+            width: 80,
+            height: 120,
+        }
+    }
+
+    fn g4(bytes: &[u8]) -> EncodedPage {
+        EncodedPage {
+            bytes: bytes.to_vec(),
+            encoding: PageEncoding::G4,
+            width: 2480,
+            height: 3508,
+        }
     }
 
     fn corners() -> [CropPoint; 4] {
@@ -543,16 +637,16 @@ mod tests {
         let folder = Path::new("D:/dokumenty/umowy");
         store.begin(folder).expect("begin");
         store
-            .write_page(5, b"piata-strona", b"oryginal-5", corners(), 1)
+            .write_page(5, &jpeg(b"piata-strona"), b"oryginal-5", corners(), 1)
             .expect("write 5");
         store
-            .write_page(9, b"dziewiata-strona", b"oryginal-9", corners(), 0)
+            .write_page(9, &jpeg(b"dziewiata-strona"), b"oryginal-9", corners(), 0)
             .expect("write 9");
         let recovered = store.load_existing().expect("session");
         assert_eq!(recovered.folder_path, folder);
         assert_eq!(recovered.pages[0].id, 5);
         assert_eq!(
-            recovered.pages[0].jpeg.as_deref(),
+            recovered.pages[0].page.as_ref().map(|page| page.bytes.as_slice()),
             Some(b"piata-strona".as_slice())
         );
         assert_eq!(
@@ -571,13 +665,13 @@ mod tests {
         let store = test_store("mutations");
         store.begin(Path::new("D:/dokumenty")).expect("begin");
         store
-            .write_page(1, b"a", b"oa", corners(), 0)
+            .write_page(1, &jpeg(b"a"), b"oa", corners(), 0)
             .expect("write 1");
         store
-            .write_page(2, b"b", b"ob", corners(), 0)
+            .write_page(2, &jpeg(b"b"), b"ob", corners(), 0)
             .expect("write 2");
         store
-            .write_page(3, b"c", b"oc", corners(), 0)
+            .write_page(3, &jpeg(b"c"), b"oc", corners(), 0)
             .expect("write 3");
         store.remove_page(2).expect("remove");
         store.set_order(&[3, 1]).expect("reorder");
@@ -590,7 +684,7 @@ mod tests {
     #[test]
     fn write_without_manifest_errors_without_panic() {
         let store = test_store("nomanifest");
-        assert!(store.write_page(1, b"x", b"ox", corners(), 0).is_err());
+        assert!(store.write_page(1, &jpeg(b"x"), b"ox", corners(), 0).is_err());
         let _ = store.clear();
     }
 
@@ -599,10 +693,10 @@ mod tests {
         let store = test_store("rewrite");
         store.begin(Path::new("D:/dokumenty")).expect("begin");
         store
-            .write_page(4, b"stara", b"oryginal", corners(), 0)
+            .write_page(4, &jpeg(b"stara"), b"oryginal", corners(), 0)
             .expect("write");
         store
-            .write_page(4, b"nowa", b"oryginal", corners(), 0)
+            .write_page(4, &jpeg(b"nowa"), b"oryginal", corners(), 0)
             .expect("rewrite");
         let manifest = store.read_manifest().expect("manifest");
         assert_eq!(manifest.page_revisions.get(&4), Some(&2));
@@ -611,7 +705,7 @@ mod tests {
         let recovered = store.load_existing().expect("session");
         assert_eq!(recovered.pages.len(), 1);
         assert_eq!(recovered.pages[0].id, 4);
-        assert_eq!(recovered.pages[0].jpeg.as_deref(), Some(b"nowa".as_slice()));
+        assert_eq!(recovered.pages[0].page.as_ref().map(|page| page.bytes.as_slice()), Some(b"nowa".as_slice()));
         store.clear().expect("clear");
     }
 
@@ -627,7 +721,7 @@ mod tests {
         let recovered = store.load_existing().expect("session");
         assert_eq!(recovered.pages.len(), 1);
         assert_eq!(
-            recovered.pages[0].jpeg.as_deref(),
+            recovered.pages[0].page.as_ref().map(|page| page.bytes.as_slice()),
             Some(b"stary-format".as_slice())
         );
         assert_eq!(recovered.pages[0].original_jpeg, None);
@@ -664,10 +758,10 @@ mod tests {
         let store = test_store("corrupt-manifest");
         store.begin(Path::new("D:/dokumenty")).expect("begin");
         store
-            .write_page(3, b"trzecia", b"oryginal-3", corners(), 1)
+            .write_page(3, &jpeg(b"trzecia"), b"oryginal-3", corners(), 1)
             .expect("write 3");
         store
-            .write_page(8, b"osma", b"oryginal-8", corners(), 0)
+            .write_page(8, &jpeg(b"osma"), b"oryginal-8", corners(), 0)
             .expect("write 8");
         fs::write(store.manifest_path(), "###nie-ron###").expect("corrupt manifest");
 
@@ -676,7 +770,7 @@ mod tests {
         let ids: Vec<u64> = recovered.pages.iter().map(|page| page.id).collect();
         assert_eq!(ids, vec![3, 8]);
         assert_eq!(
-            recovered.pages[0].jpeg.as_deref(),
+            recovered.pages[0].page.as_ref().map(|page| page.bytes.as_slice()),
             Some(b"trzecia".as_slice())
         );
         assert_eq!(recovered.pages[0].corners, Some(corners()));
@@ -684,7 +778,7 @@ mod tests {
         assert_eq!(recovered.highest_page_id, 8);
         // Salvage rebuilds the manifest so the restored session keeps persisting.
         store
-            .write_page(9, b"dziewiata", b"o9", corners(), 0)
+            .write_page(9, &jpeg(b"dziewiata"), b"o9", corners(), 0)
             .expect("write after salvage");
         store.clear().expect("clear");
     }
@@ -693,8 +787,8 @@ mod tests {
     fn highest_page_id_includes_pages_with_lost_files() {
         let store = test_store("highest-id");
         store.begin(Path::new("D:/dokumenty")).expect("begin");
-        store.write_page(2, b"a", b"oa", corners(), 0).expect("write 2");
-        store.write_page(7, b"b", b"ob", corners(), 0).expect("write 7");
+        store.write_page(2, &jpeg(b"a"), b"oa", corners(), 0).expect("write 2");
+        store.write_page(7, &jpeg(b"b"), b"ob", corners(), 0).expect("write 7");
         let manifest = store.read_manifest().expect("manifest");
         let revision = manifest.page_revisions.get(&7).copied();
         store.remove_revision_files(7, revision);
@@ -703,6 +797,78 @@ mod tests {
         assert_eq!(recovered.pages.len(), 1);
         assert_eq!(recovered.skipped_pages, 1);
         assert_eq!(recovered.highest_page_id, 7);
+        store.clear().expect("clear");
+    }
+
+    #[test]
+    fn g4_page_round_trips_with_encoding_and_dimensions() {
+        let store = test_store("g4");
+        store.begin(Path::new("D:/dokumenty")).expect("begin");
+        store
+            .write_page(2, &g4(b"g4-bajty"), b"oryginal", corners(), 1)
+            .expect("write");
+        assert!(store.revision_paths(2, 1).0.with_extension("g4").exists());
+        assert!(
+            !store.revision_paths(2, 1).0.exists(),
+            "no .jpg for a G4 page"
+        );
+        let recovered = store.load_existing().expect("session");
+        assert_eq!(recovered.pages[0].page, Some(g4(b"g4-bajty")));
+        assert_eq!(recovered.pages[0].quarter_turns, 1);
+        store.clear().expect("clear");
+    }
+
+    #[test]
+    fn format_one_metadata_still_restores_as_jpeg() {
+        let store = test_store("format1");
+        store.begin(Path::new("D:/dokumenty")).expect("begin");
+        fs::write(store.page_path(4), b"jpeg-bajty").expect("page");
+        fs::write(
+            store.metadata_path(4),
+            "(corners:((x:0.1,y:0.2),(x:0.9,y:0.2),(x:0.9,y:0.8),(x:0.1,y:0.8)),quarter_turns:2,format:1)",
+        )
+        .expect("metadata");
+        let mut manifest = store.read_manifest().expect("manifest");
+        manifest.page_ids.push(4);
+        store.write_manifest(&manifest).expect("manifest update");
+        let recovered = store.load_existing().expect("session");
+        let page = recovered.pages[0].page.as_ref().expect("page");
+        assert_eq!(page.encoding, PageEncoding::Jpeg);
+        assert_eq!(page.bytes, b"jpeg-bajty");
+        assert_eq!(
+            (page.width, page.height),
+            (0, 0),
+            "legacy dims are unknown here; the app reads them from the JPEG"
+        );
+        assert_eq!(recovered.pages[0].quarter_turns, 2);
+        store.clear().expect("clear");
+    }
+
+    #[test]
+    fn orphan_g4_without_metadata_is_skipped_not_guessed() {
+        let store = test_store("orphan-g4");
+        store.begin(Path::new("D:/dokumenty")).expect("begin");
+        store
+            .write_page(3, &g4(b"g4"), b"o3", corners(), 0)
+            .expect("write 3");
+        store
+            .write_page(5, &jpeg(b"jpg"), b"o5", corners(), 0)
+            .expect("write 5");
+        let (_, _, metadata_3) = store.revision_paths(3, 1);
+        fs::remove_file(metadata_3).expect("drop metadata of 3");
+        fs::write(store.manifest_path(), "###nie-ron###").expect("corrupt manifest");
+        let recovered = store.load_existing().expect("salvage");
+        let ids: Vec<u64> = recovered.pages.iter().map(|page| page.id).collect();
+        assert_eq!(ids, vec![3, 5]);
+        assert!(
+            recovered.pages[0].page.is_none(),
+            "G4 bytes without dims are unusable"
+        );
+        assert_eq!(
+            recovered.pages[0].original_jpeg.as_deref(),
+            Some(b"o3".as_slice())
+        );
+        assert_eq!(recovered.pages[1].page, Some(jpeg(b"jpg")));
         store.clear().expect("clear");
     }
 
@@ -717,7 +883,7 @@ mod tests {
 
         let recovered = store.load_existing().expect("session");
         assert_eq!(recovered.pages.len(), 1);
-        assert_eq!(recovered.pages[0].jpeg, None);
+        assert!(recovered.pages[0].page.is_none());
         assert_eq!(
             recovered.pages[0].original_jpeg.as_deref(),
             Some(b"oryginal".as_slice())
