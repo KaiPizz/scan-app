@@ -3,6 +3,7 @@
 mod app;
 mod atomic_file;
 mod autocapture;
+mod bilevel;
 mod camera;
 mod document;
 mod library;
