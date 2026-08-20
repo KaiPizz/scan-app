@@ -110,9 +110,9 @@ uneven lighting per channel), so a simple local threshold is enough:
 3. **Border cleanup**: black connected components that touch the canvas edge are
    removed (flood fill from every black border pixel, 4-connected). This erases the
    dark mat rim that the 1.8 % corner expansion drags in (visible in the prototype)
-   without touching inner content; a component that is both border-touching and
-   spans > 60 % of width or height (a real full-width table rule cut by the edge)
-   is kept.
+   without touching inner content; a border-touching component is kept only if
+   it is a thin rule: ≥ 60 % of one side long and ≤ 0.4 % of the other side
+   thick (a real table rule cut by the crop). The rim is ≥ 1 % thick.
 4. **Despeckle**: black components with ≤ 3 pixels are removed (sensor noise).
    Text diacritics (`ą ę ó ć ń`) at 300 dpi are ≥ 8 px, so they survive.
 
