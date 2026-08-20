@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Binarize at **300 dpi, never downsample**; Sauvola window 41 px, k = 0.30, R = 128; border-touching black components removed unless they span > 60 % of width or height; components ≤ 3 px removed.
+- Binarize at **300 dpi, never downsample**; Sauvola window 41 px, k = 0.20, R = 128; border-touching black components removed unless they span > 60 % of width or height; components ≤ 3 px removed.
 - G4 bit convention: PDF `BlackIs1 false` → `fax::Color::Black`/`White` written directly; `GrayImage` pixels are strictly `0` (black) or `255` (white).
 - PDF G4 XObject: `DeviceGray`, `BitsPerComponent 1`, `CCITTFaxDecode`, `DecodeParms << /K -1 /Columns W /Rows H /BlackIs1 false >>`. Everything else in `render_pdf` unchanged (A4 MediaBox, `q cm Do Q`, `/Rotate`, Keywords marker `skaner-dokumentow-editable-v1`).
 - `Kolor` mode = RGB JPEG **q80**; `ColorMode::default()` = `BlackWhite`.
@@ -324,7 +324,7 @@ use image::RgbImage;
 use imageproc::region_labelling::{Connectivity, connected_components};
 
 const SAUVOLA_WINDOW: u32 = 41; // px at 300 dpi
-const SAUVOLA_K: f64 = 0.30;
+const SAUVOLA_K: f64 = 0.20;
 const SAUVOLA_R: f64 = 128.0;
 /// A border-touching black component is the dark mat rim (the 1.8 % corner
 /// expansion drags it in) unless it is a thin rule: ≥ 60 % of one side long
