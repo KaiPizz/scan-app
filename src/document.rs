@@ -542,6 +542,20 @@ fn page_from_image(image: RgbImage, mode: ColorMode) -> Result<ScannedPage, Stri
 pub fn extract_pdf_pages(path: &Path) -> Result<Vec<(EncodedPage, u8)>, String> {
     let document =
         lopdf::Document::load(path).map_err(|error| format!("Nie można odczytać PDF: {error}"))?;
+    extract_pdf_pages_from_document(document)
+}
+
+/// Same acceptance rules as [`extract_pdf_pages`], for an in-memory PDF
+/// (used to verify a freshly rendered document before it replaces a file).
+pub fn extract_pdf_pages_bytes(bytes: &[u8]) -> Result<Vec<(EncodedPage, u8)>, String> {
+    let document = lopdf::Document::load_mem(bytes)
+        .map_err(|error| format!("Nie można odczytać PDF: {error}"))?;
+    extract_pdf_pages_from_document(document)
+}
+
+fn extract_pdf_pages_from_document(
+    document: lopdf::Document,
+) -> Result<Vec<(EncodedPage, u8)>, String> {
     let has_marker = has_editable_marker(&document);
     if !has_marker && !pdf_info_string_equals(&document, b"Title", PDF_TITLE) {
         return Err(
@@ -971,6 +985,18 @@ fn pdf_number(value: &lopdf::Object) -> Option<f64> {
 
 fn approx(left: f64, right: f64, tolerance: f64) -> bool {
     (left - right).abs() <= tolerance
+}
+
+/// Re-encodes an already processed page (typically a JPEG page of an older PDF)
+/// as a bilevel G4 page through the same binarizer the live pipeline uses.
+pub fn rebinarize_page(page: &EncodedPage) -> Result<ScannedPage, String> {
+    let image = decode_page(page)?;
+    page_from_image(image, ColorMode::BlackWhite)
+}
+
+#[cfg(test)]
+pub fn process_page_test_image(image: RgbImage, mode: ColorMode) -> ScannedPage {
+    page_from_image(image, mode).expect("test page")
 }
 
 pub fn page_from_encoded(page: EncodedPage) -> Result<ScannedPage, String> {

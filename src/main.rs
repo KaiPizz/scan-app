@@ -10,6 +10,7 @@ mod library;
 mod library_view;
 mod overlay;
 mod pipeline;
+mod recompress;
 mod review_viewport;
 mod session;
 mod storage;
@@ -19,6 +20,24 @@ use app::DocumentScannerApp;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    // `skaner-dokumentow.exe --recompress <folder>` — batch re-encode the
+    // library's JPEG PDFs as bilevel G4 and exit (no window; log file in the
+    // folder). Refuses to run while the scanner itself is open.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && args[1] == "--recompress" {
+        let Some(folder) = args.get(2) else {
+            eprintln!("Użycie: skaner-dokumentow --recompress <folder>");
+            std::process::exit(2);
+        };
+        let code = match storage::acquire_instance_lock() {
+            Ok(_lock) => recompress::run(std::path::Path::new(folder)),
+            Err(message) => {
+                eprintln!("Zamknij program Skaner dokumentów przed kompresją: {message}");
+                2
+            }
+        };
+        std::process::exit(code);
+    }
     let instance_lock = match storage::acquire_instance_lock() {
         Ok(lock) => lock,
         Err(message) => return run_already_running_notice(message),
