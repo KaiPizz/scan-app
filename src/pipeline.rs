@@ -1,5 +1,5 @@
 use crate::document::{
-    CropPoint, ScannedPage, detect_document_corners, process_page, process_page_with,
+    ColorMode, CropPoint, ScannedPage, detect_document_corners, process_page_with,
 };
 use image::RgbImage;
 use image::codecs::jpeg::JpegEncoder;
@@ -38,11 +38,13 @@ enum Job {
     New {
         id: u64,
         frame: Arc<RgbImage>,
+        mode: ColorMode,
     },
     Reprocess {
         id: u64,
         frame: Arc<RgbImage>,
         corners: [CropPoint; 4],
+        mode: ColorMode,
     },
     #[cfg(test)]
     TestPanic,
@@ -71,16 +73,28 @@ impl ProcessingPipeline {
         }
     }
 
-    pub fn try_submit(&self, id: u64, frame: Arc<RgbImage>) -> bool {
+    pub fn try_submit(&self, id: u64, frame: Arc<RgbImage>, mode: ColorMode) -> bool {
         self.jobs
             .as_ref()
-            .is_some_and(|jobs| jobs.try_send(Job::New { id, frame }).is_ok())
+            .is_some_and(|jobs| jobs.try_send(Job::New { id, frame, mode }).is_ok())
     }
 
-    pub fn submit_reprocess(&self, id: u64, frame: Arc<RgbImage>, corners: [CropPoint; 4]) -> bool {
-        self.jobs
-            .as_ref()
-            .is_some_and(|jobs| jobs.try_send(Job::Reprocess { id, frame, corners }).is_ok())
+    pub fn submit_reprocess(
+        &self,
+        id: u64,
+        frame: Arc<RgbImage>,
+        corners: [CropPoint; 4],
+        mode: ColorMode,
+    ) -> bool {
+        self.jobs.as_ref().is_some_and(|jobs| {
+            jobs.try_send(Job::Reprocess {
+                id,
+                frame,
+                corners,
+                mode,
+            })
+            .is_ok()
+        })
     }
 
     pub fn try_event(&self) -> Option<PipelineEvent> {
@@ -133,7 +147,7 @@ fn worker_loop(jobs: &Receiver<Job>, events: &Sender<PipelineEvent>, abort: &Arc
 
 fn process_job(job: &Job) -> PipelineEvent {
     match job {
-        Job::New { id, frame } => {
+        Job::New { id, frame, mode } => {
             let corners = detect_document_corners(frame);
             let mut original_jpeg = Vec::new();
             if JpegEncoder::new_with_quality(&mut original_jpeg, ORIGINAL_JPEG_QUALITY)
@@ -142,7 +156,7 @@ fn process_job(job: &Job) -> PipelineEvent {
             {
                 original_jpeg.clear();
             }
-            match process_page(frame, corners) {
+            match process_page_with(frame, corners, true, *mode) {
                 Ok(page) => PipelineEvent::PageReady {
                     id: *id,
                     page,
@@ -156,7 +170,12 @@ fn process_job(job: &Job) -> PipelineEvent {
                 },
             }
         }
-        Job::Reprocess { id, frame, corners } => match process_page_with(frame, *corners, false) {
+        Job::Reprocess {
+            id,
+            frame,
+            corners,
+            mode,
+        } => match process_page_with(frame, *corners, false, *mode) {
             Ok(page) => PipelineEvent::ReprocessDone {
                 id: *id,
                 page,
@@ -207,8 +226,8 @@ mod tests {
     #[test]
     fn processes_pages_in_submit_order_with_caller_ids() {
         let pipeline = ProcessingPipeline::start();
-        assert!(pipeline.try_submit(7, Arc::new(white_document_frame(400, 300))));
-        assert!(pipeline.try_submit(9, Arc::new(white_document_frame(300, 400))));
+        assert!(pipeline.try_submit(7, Arc::new(white_document_frame(400, 300)), ColorMode::Color));
+        assert!(pipeline.try_submit(9, Arc::new(white_document_frame(300, 400)), ColorMode::BlackWhite));
         let events = collect_events(&pipeline, 2, Duration::from_secs(120));
         assert_eq!(events.len(), 2, "worker nie odesłał dwóch zdarzeń");
         let ids: Vec<u64> = events
@@ -263,7 +282,12 @@ mod tests {
             CropPoint::new(0.8, 0.8),
             CropPoint::new(0.2, 0.8),
         ];
-        assert!(pipeline.submit_reprocess(3, Arc::new(white_document_frame(400, 300)), corners));
+        assert!(pipeline.submit_reprocess(
+            3,
+            Arc::new(white_document_frame(400, 300)),
+            corners,
+            ColorMode::BlackWhite
+        ));
         let events = collect_events(&pipeline, 1, Duration::from_secs(120));
         match events.first() {
             Some(PipelineEvent::ReprocessDone {
@@ -278,6 +302,26 @@ mod tests {
             }
             _ => panic!("oczekiwano ReprocessDone"),
         }
+    }
+
+    #[test]
+    fn black_white_mode_yields_g4_pages_and_color_yields_jpeg() {
+        use crate::document::PageEncoding;
+        let pipeline = ProcessingPipeline::start();
+        assert!(pipeline.try_submit(1, Arc::new(white_document_frame(400, 300)), ColorMode::BlackWhite));
+        assert!(pipeline.try_submit(2, Arc::new(white_document_frame(400, 300)), ColorMode::Color));
+        let events = collect_events(&pipeline, 2, Duration::from_secs(120));
+        let mut seen = Vec::new();
+        for event in events {
+            if let PipelineEvent::PageReady { id, page, .. } = event {
+                seen.push((id, page.encoding, page.bytes.len()));
+            }
+        }
+        seen.sort_by_key(|(id, _, _)| *id);
+        assert_eq!(seen.len(), 2, "oczekiwano dwóch gotowych stron");
+        assert_eq!(seen[0].1, PageEncoding::G4);
+        assert_eq!(seen[1].1, PageEncoding::Jpeg);
+        assert!(seen[0].2 < seen[1].2 / 10, "G4 {} B vs JPEG {} B", seen[0].2, seen[1].2);
     }
 
     #[test]
@@ -296,7 +340,7 @@ mod tests {
     fn shutdown_aborts_queued_jobs_promptly() {
         let mut pipeline = ProcessingPipeline::start();
         for id in 0..6 {
-            let _ = pipeline.try_submit(id, Arc::new(white_document_frame(400, 300)));
+            let _ = pipeline.try_submit(id, Arc::new(white_document_frame(400, 300)), ColorMode::BlackWhite);
         }
         let started = Instant::now();
         pipeline.shutdown();

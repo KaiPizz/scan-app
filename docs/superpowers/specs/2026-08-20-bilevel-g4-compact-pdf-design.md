@@ -160,11 +160,10 @@ Returns `Vec<(Vec<u8>, PageEncoding, u32 /*w*/, u32 /*h*/, u8 /*turns*/)>` (a sm
 `page_is_safe_to_edit` keeps its A4 ±10 % dimension check for both encodings.
 
 Editing a page loaded from an old RGB PDF and re-saving keeps it `Jpeg` (we never
-re-encode what we did not re-process). Re-cropping any page (old or new) goes
-through `Job::Reprocess` on the **original frame** when the session still has it;
-when it does not (reopened PDF), reprocess warps the decoded page raster — a G4
-page warped bilinearly yields gray edges, which the binarizer cleans again. Good
-enough; no special casing.
+re-encode what we did not re-process). Re-cropping goes through `Job::Reprocess`
+on the **original frame**; pages loaded from a PDF have no original frame, so the
+editor stays disabled for them (existing behaviour: „Ta strona nie ma zapisanego
+oryginału”). No special casing needed.
 
 ### 3.6 Session / crash recovery (`session.rs`)
 

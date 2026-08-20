@@ -1,7 +1,8 @@
 use crate::autocapture::{AutoCapture, FeedResult};
 use crate::camera::{CameraController, CameraEvent};
 use crate::document::{
-    CropPoint, ScannedPage, extract_pdf_pages, page_from_jpeg_bytes, pages_from_extracted,
+    ColorMode, CropPoint, EncodedPage, PageEncoding, ScannedPage, extract_pdf_pages,
+    page_from_encoded, pages_from_extracted,
     render_pdf, rotate_rgb,
 };
 use crate::library::{
@@ -670,7 +671,7 @@ impl DocumentScannerApp {
             return false;
         };
         let id = self.next_page_id;
-        if pipeline.try_submit(id, frame) {
+        if pipeline.try_submit(id, frame, ColorMode::Color) {
             self.next_page_id += 1;
             self.slots.push(SlotEntry {
                 id,
@@ -722,8 +723,8 @@ impl DocumentScannerApp {
                     }) else {
                         continue;
                     };
-                    self.session_write_page(id, &page.jpeg, &original_jpeg, corners, 0);
-                    self.spawn_scan_upload(id, page.jpeg.clone());
+                    self.session_write_page(id, &page.bytes, &original_jpeg, corners, 0);
+                    self.spawn_scan_upload(id, page.bytes.clone());
                     let texture = strip_texture(context, id, 0, &page, 0);
                     self.slots[index].slot = PageSlot::Ready(Box::new(PageData {
                         page,
@@ -765,7 +766,7 @@ impl DocumentScannerApp {
                         // unrotated and only the strip texture is rotated.
                         let texture =
                             strip_texture(context, entry.id, entry.revision + 1, &page, quarter_turns);
-                        let persisted_jpeg = page.jpeg.clone();
+                        let persisted_jpeg = page.bytes.clone();
                         entry.revision += 1;
                         entry.slot = PageSlot::Ready(Box::new(PageData {
                             page,
@@ -961,7 +962,7 @@ impl DocumentScannerApp {
         }
         let written = (
             entry.id,
-            data.page.jpeg.clone(),
+            data.page.bytes.clone(),
             data.original_jpeg.clone(),
             data.corners,
             data.quarter_turns,
@@ -1246,7 +1247,17 @@ impl DocumentScannerApp {
             max_id = max_id.max(id);
             let recovered_page = processed_jpeg
                 .ok_or_else(|| "Brak przetworzonego obrazu strony.".to_owned())
-                .and_then(page_from_jpeg_bytes);
+                .and_then(|bytes| {
+                    let (width, height) = image::load_from_memory(&bytes)
+                        .map(|image| (image.width(), image.height()))
+                        .map_err(|error| format!("Nie można odczytać zeskanowanej strony: {error}"))?;
+                    page_from_encoded(EncodedPage {
+                        bytes,
+                        encoding: PageEncoding::Jpeg,
+                        width,
+                        height,
+                    })
+                });
             match recovered_page {
                 Ok(page) => {
                     let texture = strip_texture(context, id, 0, &page, quarter_turns);
@@ -1337,7 +1348,12 @@ impl DocumentScannerApp {
             PageSlot::Failed { quarter_turns, .. } => *quarter_turns,
             _ => return,
         };
-        if pipeline.submit_reprocess(entry.id, Arc::new(editor.original), editor.corners) {
+        if pipeline.submit_reprocess(
+            entry.id,
+            Arc::new(editor.original),
+            editor.corners,
+            ColorMode::Color,
+        ) {
             let current = std::mem::replace(&mut entry.slot, PageSlot::Processing);
             let (original_jpeg, previous) = match current {
                 PageSlot::Ready(mut data) => {
@@ -1435,7 +1451,7 @@ impl DocumentScannerApp {
             // apply perspective correction and JPEG compression a second time.
             let original_jpeg = Vec::new();
             let corners = full_frame_editor_corners();
-            self.session_write_page(id, &page.jpeg, &original_jpeg, corners, quarter_turns);
+            self.session_write_page(id, &page.bytes, &original_jpeg, corners, quarter_turns);
             let texture = strip_texture(context, id, 0, &page, quarter_turns);
             self.slots.push(SlotEntry {
                 id,
@@ -2389,8 +2405,7 @@ impl DocumentScannerApp {
                     revision: *revision,
                     quarter_turns: data.quarter_turns,
                 },
-                &data.page.jpeg,
-                Vec2::new(data.page.width as f32, data.page.height as f32),
+                &data.page.encoded(),
                 Some(data.texture.clone()),
             ),
             _ => self.review_viewport.invalidate(),

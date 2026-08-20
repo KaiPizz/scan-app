@@ -1,3 +1,4 @@
+use crate::document::EncodedPage;
 use eframe::egui::{
     self, Color32, ColorImage, CursorIcon, Pos2, Rect, Sense, Stroke, TextureHandle,
     TextureOptions, Ui, Vec2,
@@ -15,7 +16,7 @@ struct DecodeResult {
 
 struct DecodeJob {
     key: PageTextureKey,
-    jpeg: Vec<u8>,
+    page: EncodedPage,
     max_texture_side: usize,
 }
 
@@ -30,7 +31,7 @@ fn decode_worker(
         while let Ok(newer) = jobs.try_recv() {
             job = newer;
         }
-        let outcome = decode_full_texture(&context, job.key, &job.jpeg, job.max_texture_side);
+        let outcome = decode_full_texture(&context, job.key, &job.page, job.max_texture_side);
         if results
             .send(DecodeResult {
                 key: job.key,
@@ -120,20 +121,20 @@ impl ReviewViewport {
         self.load_error = None;
     }
 
-    /// Switches the viewport to a page. The heavy JPEG decode happens on a
+    /// Switches the viewport to a page. The heavy page decode happens on a
     /// background thread; until it lands, the strip thumbnail (if provided)
     /// is drawn at the final layout size, so navigation never blocks.
     pub fn ensure_page(
         &mut self,
         context: &egui::Context,
         key: PageTextureKey,
-        jpeg: &[u8],
-        page_px: Vec2,
+        page: &EncodedPage,
         placeholder: Option<TextureHandle>,
     ) {
         if self.key == Some(key) {
             return;
         }
+        let page_px = Vec2::new(page.width as f32, page.height as f32);
         self.key = Some(key);
         self.texture = None;
         self.placeholder = placeholder;
@@ -163,7 +164,7 @@ impl ReviewViewport {
         });
         let _ = job_tx.send(DecodeJob {
             key,
-            jpeg: jpeg.to_vec(),
+            page: page.clone(),
             max_texture_side,
         });
     }
@@ -381,12 +382,11 @@ impl ReviewViewport {
 fn decode_full_texture(
     context: &egui::Context,
     key: PageTextureKey,
-    jpeg: &[u8],
+    page: &EncodedPage,
     max_texture_side: usize,
 ) -> Result<(TextureHandle, Vec2), String> {
-    let image = image::load_from_memory(jpeg)
-        .map_err(|error| format!("Nie można otworzyć pełnego podglądu: {error}"))?
-        .to_rgb8();
+    let image = crate::document::decode_page(page)
+        .map_err(|error| format!("Nie można otworzyć pełnego podglądu: {error}"))?;
     let image = if key.quarter_turns.is_multiple_of(4) {
         image
     } else {

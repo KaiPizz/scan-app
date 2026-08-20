@@ -33,15 +33,19 @@ pub fn encode_g4(image: &GrayImage) -> Vec<u8> {
     writer.finish()
 }
 
-/// Decodes a raw G4 stream of known dimensions. Fewer lines than `height`,
-/// or a decoder error, is a hard error: a half page must never pass as a page.
+/// Decodes a raw G4 stream of known dimensions. The stream must carry exactly
+/// `height` lines (our encoder always writes every line, including trailing
+/// white ones); fewer or more lines, or a decoder error, is a hard error — a
+/// half page or a bare EOFB must never pass as a page.
 pub fn decode_g4(bytes: &[u8], width: u32, height: u32) -> Result<GrayImage, String> {
     if width == 0 || height == 0 {
         return Err("Strona ma zerowy rozmiar.".to_owned());
     }
     let mut image = GrayImage::from_pixel(width, height, Luma([255]));
     let mut lines = 0_u32;
-    let status = fax_decode_g4(bytes.iter().copied(), width, Some(height), |transitions| {
+    // `None`: decode to the EOFB instead of letting the decoder pad missing
+    // lines with white, so the line count below is the real one.
+    let status = fax_decode_g4(bytes.iter().copied(), width, None, |transitions| {
         if lines < height {
             for (x, color) in pels(transitions, width).enumerate() {
                 if color == Color::Black {
@@ -54,7 +58,7 @@ pub fn decode_g4(bytes: &[u8], width: u32, height: u32) -> Result<GrayImage, Str
     if status.is_none() {
         return Err("Nie można odczytać strony (uszkodzone dane G4).".to_owned());
     }
-    if lines < height {
+    if lines != height {
         return Err(format!(
             "Nie można odczytać strony (G4: {lines} z {height} wierszy)."
         ));
@@ -242,6 +246,12 @@ mod tests {
             decode_g4(&bytes, 2480, 3508).expect("decode").as_raw(),
             image.as_raw()
         );
+    }
+
+    #[test]
+    fn bare_eofb_or_garbage_is_not_a_white_page() {
+        assert!(decode_g4(&[0x00, 0x01, 0x02], 64, 64).is_err());
+        assert!(decode_g4(&[], 64, 64).is_err());
     }
 
     #[test]
