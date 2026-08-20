@@ -22,11 +22,7 @@ struct DecodeJob {
 
 /// One long-lived decode thread; queued jobs collapse to the newest one, so
 /// holding the arrow key through a stack never piles up 11 MP decodes.
-fn decode_worker(
-    context: egui::Context,
-    jobs: Receiver<DecodeJob>,
-    results: Sender<DecodeResult>,
-) {
+fn decode_worker(context: egui::Context, jobs: Receiver<DecodeJob>, results: Sender<DecodeResult>) {
     while let Ok(mut job) = jobs.recv() {
         while let Ok(newer) = jobs.try_recv() {
             job = newer;
@@ -406,7 +402,10 @@ fn decode_full_texture(
     );
     Ok((
         context.load_texture(
-            format!("review-full-{}-{}-t{}", key.id, key.revision, key.quarter_turns),
+            format!(
+                "review-full-{}-{}-t{}",
+                key.id, key.revision, key.quarter_turns
+            ),
             color_image,
             TextureOptions::LINEAR,
         ),

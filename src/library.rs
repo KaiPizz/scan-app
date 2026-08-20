@@ -343,7 +343,11 @@ pub fn sort_pdfs(pdfs: &mut [PdfInfo], sort_mode: SortMode, ascending: bool) {
             SortMode::Folder => natural_folder(left, right),
             SortMode::Size => left.pdf.size_bytes.cmp(&right.pdf.size_bytes),
         };
-        let primary = if ascending { primary } else { primary.reverse() };
+        let primary = if ascending {
+            primary
+        } else {
+            primary.reverse()
+        };
         primary
             .then_with(|| match sort_mode {
                 SortMode::Modified | SortMode::Size => {
@@ -1086,8 +1090,11 @@ mod tests {
         fs::create_dir(&folder).expect("create folder");
         fs::write(folder.join("Umowa.pdf"), b"dokument").expect("document");
         fs::write(folder.join("Umowa.pdf.part-999-1"), b"czesc").expect("part");
-        fs::write(folder.join(".Umowa.scan-save-conflict-999-2.pdf"), b"konflikt")
-            .expect("conflict");
+        fs::write(
+            folder.join(".Umowa.scan-save-conflict-999-2.pdf"),
+            b"konflikt",
+        )
+        .expect("conflict");
         fs::write(
             root.path().join(".skaner-rename-recovery-999-3.pdf"),
             b"po-rename",
@@ -1108,7 +1115,10 @@ mod tests {
             b"po-rename"
         );
         assert!(!folder.join(".Umowa.pdf.skaner-edit.lock").exists());
-        assert!(folder.join("Umowa.pdf").exists(), "zwykły dokument nietknięty");
+        assert!(
+            folder.join("Umowa.pdf").exists(),
+            "zwykły dokument nietknięty"
+        );
         assert!(report.failures.is_empty(), "{:?}", report.failures);
     }
 

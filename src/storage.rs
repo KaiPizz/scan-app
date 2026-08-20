@@ -500,9 +500,9 @@ pub fn acquire_instance_lock() -> Result<Option<InstanceLock>, String> {
             .open(&path)
         {
             Ok(file) => Ok(Some(InstanceLock { _file: file })),
-            Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Err(
-                "Skaner dokumentów jest już uruchomiony na tym komputerze.".to_owned(),
-            ),
+            Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+                Err("Skaner dokumentów jest już uruchomiony na tym komputerze.".to_owned())
+            }
             Err(_) => Ok(None),
         }
     }

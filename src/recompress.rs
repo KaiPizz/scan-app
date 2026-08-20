@@ -46,11 +46,18 @@ pub fn run(root: &Path) -> i32 {
     let pdfs = match collect_pdfs(root) {
         Ok(pdfs) => pdfs,
         Err(error) => {
-            emit(&format!("BŁĄD: nie można odczytać folderu {}: {error}", root.display()));
+            emit(&format!(
+                "BŁĄD: nie można odczytać folderu {}: {error}",
+                root.display()
+            ));
             return 2;
         }
     };
-    emit(&format!("Kompresja: {} plików PDF w {}", pdfs.len(), root.display()));
+    emit(&format!(
+        "Kompresja: {} plików PDF w {}",
+        pdfs.len(),
+        root.display()
+    ));
     let summary = run_over(&pdfs, root, &mut emit);
     emit(&format!(
         "RAZEM: przekonwertowano {} · już czarno-białe {} · pominięto (obce) {} · błędy {} · {:.1} MB → {:.1} MB",
@@ -90,9 +97,17 @@ fn collect_pdfs(root: &Path) -> std::io::Result<Vec<PathBuf>> {
 pub fn run_over(pdfs: &[PathBuf], root: &Path, emit: &mut dyn FnMut(&str)) -> Summary {
     let mut summary = Summary::default();
     for path in pdfs {
-        let rel = path.strip_prefix(root).unwrap_or(path).display().to_string();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
         match recompress_file(path) {
-            Ok(Outcome::Converted { pages, before, after }) => {
+            Ok(Outcome::Converted {
+                pages,
+                before,
+                after,
+            }) => {
                 summary.converted += 1;
                 summary.bytes_before += before;
                 summary.bytes_after += after;
@@ -120,7 +135,11 @@ pub fn run_over(pdfs: &[PathBuf], root: &Path, emit: &mut dyn FnMut(&str)) -> Su
 }
 
 enum Outcome {
-    Converted { pages: usize, before: u64, after: u64 },
+    Converted {
+        pages: usize,
+        before: u64,
+        after: u64,
+    },
     AlreadyBilevel,
     Foreign(String),
 }
@@ -134,7 +153,10 @@ fn recompress_file(path: &Path) -> Result<Outcome, String> {
         // Not our layout (or OCR/annotations/forms): leave it alone.
         Err(reason) => return Ok(Outcome::Foreign(reason)),
     };
-    if pages.iter().all(|(page, _)| page.encoding == PageEncoding::G4) {
+    if pages
+        .iter()
+        .all(|(page, _)| page.encoding == PageEncoding::G4)
+    {
         return Ok(Outcome::AlreadyBilevel);
     }
     let converted = convert_pages(&pages)?;
@@ -174,7 +196,9 @@ fn convert_pages(pages: &[(EncodedPage, u8)]) -> Result<Vec<(ScannedPage, u8)>, 
                         .iter()
                         .map(|(page, turns)| {
                             let converted = match page.encoding {
-                                PageEncoding::G4 => crate::document::page_from_encoded(page.clone())?,
+                                PageEncoding::G4 => {
+                                    crate::document::page_from_encoded(page.clone())?
+                                }
                                 PageEncoding::Jpeg => rebinarize_page(page)?,
                             };
                             Ok((converted, *turns))
@@ -233,10 +257,8 @@ mod tests {
     use std::time::Duration;
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "skaner-recompress-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("skaner-recompress-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("Sektor")).expect("dir");
         dir
@@ -259,13 +281,26 @@ mod tests {
         let g4_pdf = dir.join("nowy.pdf");
         let foreign_pdf = dir.join("obcy.pdf");
         let colour = page(ColorMode::Color);
-        fs::write(&jpeg_pdf, render_pdf(&[(&colour, 0), (&colour, 3)]).unwrap()).unwrap();
+        fs::write(
+            &jpeg_pdf,
+            render_pdf(&[(&colour, 0), (&colour, 3)]).unwrap(),
+        )
+        .unwrap();
         let bilevel = page(ColorMode::BlackWhite);
         let g4_bytes = render_pdf(&[(&bilevel, 1)]).unwrap();
         fs::write(&g4_pdf, &g4_bytes).unwrap();
-        fs::write(&foreign_pdf, b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF").unwrap();
+        fs::write(
+            &foreign_pdf,
+            b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF",
+        )
+        .unwrap();
         let old_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        fs::OpenOptions::new().write(true).open(&jpeg_pdf).unwrap().set_modified(old_mtime).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&jpeg_pdf)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
         let before = fs::metadata(&jpeg_pdf).unwrap().len();
 
         let pdfs = collect_pdfs(&dir).unwrap();
@@ -280,14 +315,26 @@ mod tests {
 
         let reread = extract_pdf_pages(&jpeg_pdf).expect("converted PDF is ours");
         assert_eq!(reread.len(), 2);
-        assert!(reread.iter().all(|(page, _)| page.encoding == PageEncoding::G4));
+        assert!(
+            reread
+                .iter()
+                .all(|(page, _)| page.encoding == PageEncoding::G4)
+        );
         assert_eq!(reread[1].1, 3, "rotation preserved");
         assert!(fs::metadata(&jpeg_pdf).unwrap().len() < before / 5);
         let restored = fs::metadata(&jpeg_pdf).unwrap().modified().unwrap();
         assert!(restored.duration_since(old_mtime).unwrap() < Duration::from_secs(2));
         assert_eq!(fs::read(&g4_pdf).unwrap(), g4_bytes, "G4 PDF untouched");
-        assert!(fs::read(&foreign_pdf).unwrap().starts_with(b"%PDF-1.4\n1 0 obj"));
-        assert!(lines.iter().any(|line| line.contains("obcy.pdf: POMINIĘTO")));
+        assert!(
+            fs::read(&foreign_pdf)
+                .unwrap()
+                .starts_with(b"%PDF-1.4\n1 0 obj")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("obcy.pdf: POMINIĘTO"))
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -226,8 +226,16 @@ mod tests {
     #[test]
     fn processes_pages_in_submit_order_with_caller_ids() {
         let pipeline = ProcessingPipeline::start();
-        assert!(pipeline.try_submit(7, Arc::new(white_document_frame(400, 300)), ColorMode::Color));
-        assert!(pipeline.try_submit(9, Arc::new(white_document_frame(300, 400)), ColorMode::BlackWhite));
+        assert!(pipeline.try_submit(
+            7,
+            Arc::new(white_document_frame(400, 300)),
+            ColorMode::Color
+        ));
+        assert!(pipeline.try_submit(
+            9,
+            Arc::new(white_document_frame(300, 400)),
+            ColorMode::BlackWhite
+        ));
         let events = collect_events(&pipeline, 2, Duration::from_secs(120));
         assert_eq!(events.len(), 2, "worker nie odesłał dwóch zdarzeń");
         let ids: Vec<u64> = events
@@ -308,8 +316,16 @@ mod tests {
     fn black_white_mode_yields_g4_pages_and_color_yields_jpeg() {
         use crate::document::PageEncoding;
         let pipeline = ProcessingPipeline::start();
-        assert!(pipeline.try_submit(1, Arc::new(white_document_frame(400, 300)), ColorMode::BlackWhite));
-        assert!(pipeline.try_submit(2, Arc::new(white_document_frame(400, 300)), ColorMode::Color));
+        assert!(pipeline.try_submit(
+            1,
+            Arc::new(white_document_frame(400, 300)),
+            ColorMode::BlackWhite
+        ));
+        assert!(pipeline.try_submit(
+            2,
+            Arc::new(white_document_frame(400, 300)),
+            ColorMode::Color
+        ));
         let events = collect_events(&pipeline, 2, Duration::from_secs(120));
         let mut seen = Vec::new();
         for event in events {
@@ -321,7 +337,12 @@ mod tests {
         assert_eq!(seen.len(), 2, "oczekiwano dwóch gotowych stron");
         assert_eq!(seen[0].1, PageEncoding::G4);
         assert_eq!(seen[1].1, PageEncoding::Jpeg);
-        assert!(seen[0].2 < seen[1].2 / 10, "G4 {} B vs JPEG {} B", seen[0].2, seen[1].2);
+        assert!(
+            seen[0].2 < seen[1].2 / 10,
+            "G4 {} B vs JPEG {} B",
+            seen[0].2,
+            seen[1].2
+        );
     }
 
     #[test]
@@ -340,7 +361,11 @@ mod tests {
     fn shutdown_aborts_queued_jobs_promptly() {
         let mut pipeline = ProcessingPipeline::start();
         for id in 0..6 {
-            let _ = pipeline.try_submit(id, Arc::new(white_document_frame(400, 300)), ColorMode::BlackWhite);
+            let _ = pipeline.try_submit(
+                id,
+                Arc::new(white_document_frame(400, 300)),
+                ColorMode::BlackWhite,
+            );
         }
         let started = Instant::now();
         pipeline.shutdown();

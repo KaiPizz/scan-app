@@ -167,7 +167,9 @@ impl SessionStore {
             }),
             PageEncoding::G4 => modern
                 .filter(|metadata| {
-                    metadata.encoding == PageEncoding::G4 && metadata.width > 0 && metadata.height > 0
+                    metadata.encoding == PageEncoding::G4
+                        && metadata.width > 0
+                        && metadata.height > 0
                 })
                 .map(|metadata| EncodedPage {
                     bytes,
@@ -422,7 +424,9 @@ impl SessionStore {
 }
 
 enum SessionCommand {
-    Begin { folder: PathBuf },
+    Begin {
+        folder: PathBuf,
+    },
     WritePage {
         id: u64,
         page: EncodedPage,
@@ -430,9 +434,15 @@ enum SessionCommand {
         corners: [CropPoint; 4],
         quarter_turns: u8,
     },
-    RemovePage { id: u64 },
-    SetOrder { ids: Vec<u64> },
-    SetFolder { folder: PathBuf },
+    RemovePage {
+        id: u64,
+    },
+    SetOrder {
+        ids: Vec<u64>,
+    },
+    SetFolder {
+        folder: PathBuf,
+    },
     Clear,
 }
 
@@ -646,7 +656,10 @@ mod tests {
         assert_eq!(recovered.folder_path, folder);
         assert_eq!(recovered.pages[0].id, 5);
         assert_eq!(
-            recovered.pages[0].page.as_ref().map(|page| page.bytes.as_slice()),
+            recovered.pages[0]
+                .page
+                .as_ref()
+                .map(|page| page.bytes.as_slice()),
             Some(b"piata-strona".as_slice())
         );
         assert_eq!(
@@ -684,7 +697,11 @@ mod tests {
     #[test]
     fn write_without_manifest_errors_without_panic() {
         let store = test_store("nomanifest");
-        assert!(store.write_page(1, &jpeg(b"x"), b"ox", corners(), 0).is_err());
+        assert!(
+            store
+                .write_page(1, &jpeg(b"x"), b"ox", corners(), 0)
+                .is_err()
+        );
         let _ = store.clear();
     }
 
@@ -705,7 +722,13 @@ mod tests {
         let recovered = store.load_existing().expect("session");
         assert_eq!(recovered.pages.len(), 1);
         assert_eq!(recovered.pages[0].id, 4);
-        assert_eq!(recovered.pages[0].page.as_ref().map(|page| page.bytes.as_slice()), Some(b"nowa".as_slice()));
+        assert_eq!(
+            recovered.pages[0]
+                .page
+                .as_ref()
+                .map(|page| page.bytes.as_slice()),
+            Some(b"nowa".as_slice())
+        );
         store.clear().expect("clear");
     }
 
@@ -721,7 +744,10 @@ mod tests {
         let recovered = store.load_existing().expect("session");
         assert_eq!(recovered.pages.len(), 1);
         assert_eq!(
-            recovered.pages[0].page.as_ref().map(|page| page.bytes.as_slice()),
+            recovered.pages[0]
+                .page
+                .as_ref()
+                .map(|page| page.bytes.as_slice()),
             Some(b"stary-format".as_slice())
         );
         assert_eq!(recovered.pages[0].original_jpeg, None);
@@ -770,7 +796,10 @@ mod tests {
         let ids: Vec<u64> = recovered.pages.iter().map(|page| page.id).collect();
         assert_eq!(ids, vec![3, 8]);
         assert_eq!(
-            recovered.pages[0].page.as_ref().map(|page| page.bytes.as_slice()),
+            recovered.pages[0]
+                .page
+                .as_ref()
+                .map(|page| page.bytes.as_slice()),
             Some(b"trzecia".as_slice())
         );
         assert_eq!(recovered.pages[0].corners, Some(corners()));
@@ -787,8 +816,12 @@ mod tests {
     fn highest_page_id_includes_pages_with_lost_files() {
         let store = test_store("highest-id");
         store.begin(Path::new("D:/dokumenty")).expect("begin");
-        store.write_page(2, &jpeg(b"a"), b"oa", corners(), 0).expect("write 2");
-        store.write_page(7, &jpeg(b"b"), b"ob", corners(), 0).expect("write 7");
+        store
+            .write_page(2, &jpeg(b"a"), b"oa", corners(), 0)
+            .expect("write 2");
+        store
+            .write_page(7, &jpeg(b"b"), b"ob", corners(), 0)
+            .expect("write 7");
         let manifest = store.read_manifest().expect("manifest");
         let revision = manifest.page_revisions.get(&7).copied();
         store.remove_revision_files(7, revision);

@@ -247,7 +247,6 @@ pub fn detect_document(image: &RgbImage) -> DetectResult {
 
 /// Test-only shorthand: detected corners, default (black-and-white) mode.
 #[cfg(test)]
-#[cfg(test)]
 pub fn process_page(image: &RgbImage, corners: [CropPoint; 4]) -> Result<ScannedPage, String> {
     process_page_with(image, corners, true, ColorMode::default())
 }
@@ -500,8 +499,12 @@ fn page_from_image(image: RgbImage, mode: ColorMode) -> Result<ScannedPage, Stri
     let height = image.height();
     match mode {
         ColorMode::Color => {
-            let review_image =
-                resize_to_fit(&image, STRIP_THUMB_PX, STRIP_THUMB_PX, imageops::FilterType::Lanczos3);
+            let review_image = resize_to_fit(
+                &image,
+                STRIP_THUMB_PX,
+                STRIP_THUMB_PX,
+                imageops::FilterType::Lanczos3,
+            );
             let mut bytes = Vec::new();
             JpegEncoder::new_with_quality(&mut bytes, COLOR_JPEG_QUALITY)
                 .encode_image(&image)
@@ -522,8 +525,12 @@ fn page_from_image(image: RgbImage, mode: ColorMode) -> Result<ScannedPage, Stri
             }
             // The thumbnail shows what is saved, not the colour input.
             let preview = DynamicImage::ImageLuma8(bilevel).to_rgb8();
-            let review_image =
-                resize_to_fit(&preview, STRIP_THUMB_PX, STRIP_THUMB_PX, imageops::FilterType::Lanczos3);
+            let review_image = resize_to_fit(
+                &preview,
+                STRIP_THUMB_PX,
+                STRIP_THUMB_PX,
+                imageops::FilterType::Lanczos3,
+            );
             Ok(ScannedPage {
                 bytes,
                 encoding: PageEncoding::G4,
@@ -691,7 +698,10 @@ fn extract_pdf_pages_from_document(
 /// app writes. A filter chain (e.g. `[FlateDecode, DCTDecode]` would hand back
 /// still-compressed bytes), G3, inverted polarity or mismatched Columns/Rows
 /// is foreign.
-fn stream_page_encoding(document: &lopdf::Document, stream: &lopdf::Stream) -> Option<PageEncoding> {
+fn stream_page_encoding(
+    document: &lopdf::Document,
+    stream: &lopdf::Stream,
+) -> Option<PageEncoding> {
     let filter: &[u8] = match stream.dict.get(b"Filter") {
         Ok(lopdf::Object::Name(name)) => name,
         Ok(lopdf::Object::Array(filters)) if filters.len() == 1 => match filters.first() {
@@ -700,7 +710,11 @@ fn stream_page_encoding(document: &lopdf::Document, stream: &lopdf::Stream) -> O
         },
         _ => return None,
     };
-    let bpc = stream.dict.get(b"BitsPerComponent").ok().and_then(pdf_number);
+    let bpc = stream
+        .dict
+        .get(b"BitsPerComponent")
+        .ok()
+        .and_then(pdf_number);
     let colorspace: &[u8] = match stream.dict.get(b"ColorSpace") {
         Ok(lopdf::Object::Name(name)) => name,
         _ => return None,
@@ -1004,7 +1018,12 @@ pub fn page_from_encoded(page: EncodedPage) -> Result<ScannedPage, String> {
     if (image.width(), image.height()) != (page.width, page.height) {
         return Err("Wymiary strony nie zgadzają się z jej danymi.".to_owned());
     }
-    let review_image = resize_to_fit(&image, STRIP_THUMB_PX, STRIP_THUMB_PX, imageops::FilterType::Lanczos3);
+    let review_image = resize_to_fit(
+        &image,
+        STRIP_THUMB_PX,
+        STRIP_THUMB_PX,
+        imageops::FilterType::Lanczos3,
+    );
     Ok(ScannedPage {
         width: page.width,
         height: page.height,
@@ -1394,11 +1413,10 @@ mod tests {
 
     #[test]
     fn extracts_pages_from_own_pdf() {
-        let first = page_from_image(RgbImage::from_pixel(
-            A4_WIDTH_PX,
-            A4_HEIGHT_PX,
-            Rgb([245, 245, 245]),
-        ), ColorMode::Color)
+        let first = page_from_image(
+            RgbImage::from_pixel(A4_WIDTH_PX, A4_HEIGHT_PX, Rgb([245, 245, 245])),
+            ColorMode::Color,
+        )
         .expect("strona 1");
         let path = std::env::temp_dir().join(format!(
             "skaner-dokumentow-extract-{}.pdf",
@@ -1430,7 +1448,11 @@ mod tests {
     fn black_white_mode_produces_small_g4_pages() {
         let page = bilevel_page();
         assert_eq!(page.encoding, PageEncoding::G4);
-        assert!(page.bytes.len() < 40 * 1024, "G4 page {} B", page.bytes.len());
+        assert!(
+            page.bytes.len() < 40 * 1024,
+            "G4 page {} B",
+            page.bytes.len()
+        );
         let decoded = decode_page(&page.encoded()).expect("decode");
         assert_eq!(decoded.dimensions(), (A4_WIDTH_PX, A4_HEIGHT_PX));
         assert_eq!(decoded.get_pixel(1000, 420), &Rgb([0, 0, 0]));
@@ -1454,10 +1476,8 @@ mod tests {
     #[test]
     fn g4_pdf_round_trips_exact_bytes_and_dimensions() {
         let page = bilevel_page();
-        let path = std::env::temp_dir().join(format!(
-            "skaner-dokumentow-g4-{}.pdf",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("skaner-dokumentow-g4-{}.pdf", std::process::id()));
         save_pdf(&path, &[(&page, 1)]).expect("zapis PDF");
         let bytes = std::fs::read(&path).expect("odczyt PDF");
         assert!(
@@ -1527,7 +1547,9 @@ mod tests {
             .collect();
         assert_eq!(ids.len(), 1);
         if let Ok(lopdf::Object::Stream(stream)) = document.get_object_mut(ids[0]) {
-            stream.dict.set("DecodeParms", lopdf::Object::Dictionary(parms));
+            stream
+                .dict
+                .set("DecodeParms", lopdf::Object::Dictionary(parms));
         }
         document.save(&path).expect("save");
         path
@@ -1579,11 +1601,10 @@ mod tests {
 
     #[test]
     fn rotation_round_trips_as_metadata_without_touching_bytes() {
-        let page = page_from_image(RgbImage::from_pixel(
-            A4_WIDTH_PX,
-            A4_HEIGHT_PX,
-            Rgb([245, 245, 245]),
-        ), ColorMode::Color)
+        let page = page_from_image(
+            RgbImage::from_pixel(A4_WIDTH_PX, A4_HEIGHT_PX, Rgb([245, 245, 245])),
+            ColorMode::Color,
+        )
         .expect("strona");
         let path = std::env::temp_dir().join(format!(
             "skaner-dokumentow-rotate-{}.pdf",
@@ -1594,7 +1615,10 @@ mod tests {
         std::fs::remove_file(&path).expect("usunięcie testowego PDF");
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].1, 3, "obrót musi wrócić z /Rotate");
-        assert_eq!(pages[0].0.bytes, page.bytes, "bajty JPEG nie mogą się zmienić");
+        assert_eq!(
+            pages[0].0.bytes, page.bytes,
+            "bajty JPEG nie mogą się zmienić"
+        );
     }
 
     #[test]
@@ -1831,8 +1855,11 @@ mod tests {
 
     #[test]
     fn pdf_page_import_is_all_or_nothing() {
-        let page = page_from_image(RgbImage::from_pixel(80, 120, Rgb([240, 240, 240])), ColorMode::Color)
-            .expect("valid page");
+        let page = page_from_image(
+            RgbImage::from_pixel(80, 120, Rgb([240, 240, 240])),
+            ColorMode::Color,
+        )
+        .expect("valid page");
         let error = pages_from_extracted(vec![
             (page.encoded(), 0),
             (
@@ -1845,8 +1872,8 @@ mod tests {
                 1,
             ),
         ])
-            .err()
-            .expect("second page must fail");
+        .err()
+        .expect("second page must fail");
         assert!(error.contains("strony 2"), "unexpected error: {error}");
     }
 
@@ -1876,11 +1903,10 @@ mod tests {
 
     #[test]
     fn safely_imports_full_page_pdf_from_legacy_app_version() {
-        let page = page_from_image(RgbImage::from_pixel(
-            A4_WIDTH_PX,
-            A4_HEIGHT_PX,
-            Rgb([245, 245, 245]),
-        ), ColorMode::Color)
+        let page = page_from_image(
+            RgbImage::from_pixel(A4_WIDTH_PX, A4_HEIGHT_PX, Rgb([245, 245, 245])),
+            ColorMode::Color,
+        )
         .expect("legacy page");
         let path = std::env::temp_dir().join(format!(
             "skaner-dokumentow-legacy-{}.pdf",
@@ -1908,8 +1934,11 @@ mod tests {
 
     #[test]
     fn rejects_unmarked_pdf_that_is_not_a_full_a4_page() {
-        let page = page_from_image(RgbImage::from_pixel(400, 566, Rgb([245, 245, 245])), ColorMode::Color)
-            .expect("small page");
+        let page = page_from_image(
+            RgbImage::from_pixel(400, 566, Rgb([245, 245, 245])),
+            ColorMode::Color,
+        )
+        .expect("small page");
         let path = std::env::temp_dir().join(format!(
             "skaner-dokumentow-unsafe-legacy-{}.pdf",
             std::process::id()

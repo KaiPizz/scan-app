@@ -835,10 +835,7 @@ fn sort_header(
 ) {
     let active = state.sort == mode;
     let text = if active {
-        format!(
-            "{label} {}",
-            if state.sort_ascending { "⏶" } else { "⏷" }
-        )
+        format!("{label} {}", if state.sort_ascending { "⏶" } else { "⏷" })
     } else {
         label.to_owned()
     };
@@ -1304,7 +1301,14 @@ fn show_sort_picker(ui: &mut egui::Ui, state: &mut LibraryViewState) {
                 SortMode::Size,
             ] {
                 let selected = state.sort == mode;
-                let label = sort_label(mode, if selected { state.sort_ascending } else { mode.default_ascending() });
+                let label = sort_label(
+                    mode,
+                    if selected {
+                        state.sort_ascending
+                    } else {
+                        mode.default_ascending()
+                    },
+                );
                 if ui.selectable_label(selected, label).clicked() && !selected {
                     state.sort = mode;
                     state.sort_ascending = mode.default_ascending();

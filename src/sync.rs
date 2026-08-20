@@ -30,7 +30,12 @@ pub fn upload_payload(page: &EncodedPage) -> Result<(Vec<u8>, &'static str, &'st
             let gray = crate::bilevel::decode_g4(&page.bytes, page.width, page.height)?;
             let mut png = Vec::new();
             PngEncoder::new(&mut png)
-                .write_image(gray.as_raw(), page.width, page.height, ExtendedColorType::L8)
+                .write_image(
+                    gray.as_raw(),
+                    page.width,
+                    page.height,
+                    ExtendedColorType::L8,
+                )
                 .map_err(|error| format!("Nie można przygotować strony do wysyłki: {error}"))?;
             Ok((png, "image/png", "png"))
         }

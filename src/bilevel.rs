@@ -299,7 +299,11 @@ mod tests {
     fn g4_white_page_compresses_to_a_few_bytes() {
         let image = GrayImage::from_pixel(2480, 3508, Luma([255]));
         let bytes = encode_g4(&image);
-        assert!(bytes.len() < 2048, "white A4 page took {} bytes", bytes.len());
+        assert!(
+            bytes.len() < 2048,
+            "white A4 page took {} bytes",
+            bytes.len()
+        );
         assert_eq!(
             decode_g4(&bytes, 2480, 3508).expect("decode").as_raw(),
             image.as_raw()
@@ -437,9 +441,17 @@ mod tests {
             black as f64 * 100.0 / (page.width as f64 * page.height as f64)
         );
         if let Ok(out) = std::env::var("PROBE_PDF") {
-            std::fs::write(out, crate::document::render_pdf(&[(&page, 0)]).expect("pdf")).expect("zapis");
+            std::fs::write(
+                out,
+                crate::document::render_pdf(&[(&page, 0)]).expect("pdf"),
+            )
+            .expect("zapis");
         }
-        assert!(page.bytes.len() < 150 * 1024, "strona za duża: {} B", page.bytes.len());
+        assert!(
+            page.bytes.len() < 150 * 1024,
+            "strona za duża: {} B",
+            page.bytes.len()
+        );
     }
 
     #[test]
@@ -485,13 +497,20 @@ mod tests {
                 }
             }
         }
-        assert!(kept >= 27_648 * 90 / 100, "dim page lost strokes: kept {kept}");
+        assert!(
+            kept >= 27_648 * 90 / 100,
+            "dim page lost strokes: kept {kept}"
+        );
         assert!(
             black_count(&out) <= 27_648 * 110 / 100,
             "dim page went black/noisy: {}",
             black_count(&out)
         );
-        assert_eq!(out.get_pixel(597, 400).0[0], 255, "rim survived on dim page");
+        assert_eq!(
+            out.get_pixel(597, 400).0[0],
+            255,
+            "rim survived on dim page"
+        );
     }
 
     #[test]

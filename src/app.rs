@@ -1,9 +1,8 @@
 use crate::autocapture::{AutoCapture, FeedResult};
 use crate::camera::{CameraController, CameraEvent};
 use crate::document::{
-    ColorMode, CropPoint, EncodedPage, ScannedPage, extract_pdf_pages, page_from_encoded,
-    pages_from_extracted,
-    render_pdf, rotate_rgb,
+    ColorMode, CropPoint, EncodedPage, PageEncoding, ScannedPage, extract_pdf_pages,
+    page_from_encoded, pages_from_extracted, render_pdf, rotate_rgb,
 };
 use crate::library::{
     FileActionReport, FileOperationEvent, FileOperationWorker, LibraryEvent, LibrarySnapshot,
@@ -489,7 +488,11 @@ impl DocumentScannerApp {
         if self.session_broken {
             return;
         }
-        if let Some(error) = self.session.as_ref().and_then(SessionWorker::try_recv_error) {
+        if let Some(error) = self
+            .session
+            .as_ref()
+            .and_then(SessionWorker::try_recv_error)
+        {
             self.session_broken = true;
             self.toast = Some(Toast {
                 text: format!("Kopia sesji wyłączona: {error}"),
@@ -569,8 +572,7 @@ impl DocumentScannerApp {
                 Ok(_) => self.sync_ok += 1,
                 Err(error) => {
                     self.sync_failed += 1;
-                    self.last_sync_error =
-                        Some(format!("Strona {}: {error}", outcome.page_id + 1));
+                    self.last_sync_error = Some(format!("Strona {}: {error}", outcome.page_id + 1));
                 }
             }
         }
@@ -768,8 +770,13 @@ impl DocumentScannerApp {
                         };
                         // Rotation stays metadata: the reprocessed JPEG is kept
                         // unrotated and only the strip texture is rotated.
-                        let texture =
-                            strip_texture(context, entry.id, entry.revision + 1, &page, quarter_turns);
+                        let texture = strip_texture(
+                            context,
+                            entry.id,
+                            entry.revision + 1,
+                            &page,
+                            quarter_turns,
+                        );
                         let persisted_page = page.encoded();
                         entry.revision += 1;
                         entry.slot = PageSlot::Ready(Box::new(PageData {
@@ -831,8 +838,9 @@ impl DocumentScannerApp {
                     lost_pages += 1;
                     entry.slot = PageSlot::Failed {
                         original_jpeg: Vec::new(),
-                        error: "Przetwarzanie tej strony uległo awarii. Usuń ją i zeskanuj ponownie."
-                            .to_owned(),
+                        error:
+                            "Przetwarzanie tej strony uległo awarii. Usuń ją i zeskanuj ponownie."
+                                .to_owned(),
                         quarter_turns: 0,
                     };
                 }
@@ -960,7 +968,13 @@ impl DocumentScannerApp {
         };
         entry.revision += 1;
         data.quarter_turns = (data.quarter_turns + 1) % 4;
-        data.texture = strip_texture(context, entry.id, entry.revision, &data.page, data.quarter_turns);
+        data.texture = strip_texture(
+            context,
+            entry.id,
+            entry.revision,
+            &data.page,
+            data.quarter_turns,
+        );
         if self.editing_target.is_some() {
             self.edit_dirty = true;
         }
@@ -1341,16 +1355,21 @@ impl DocumentScannerApp {
         let Some(editor) = self.editor.take() else {
             return;
         };
-        let mode = self.color_mode();
+        let fallback_mode = self.color_mode();
         let Some(entry) = self.slots.get_mut(editor.slot_index) else {
             return;
         };
         let Some(pipeline) = &self.pipeline else {
             return;
         };
-        let quarter_turns = match &entry.slot {
-            PageSlot::Ready(data) => data.quarter_turns,
-            PageSlot::Failed { quarter_turns, .. } => *quarter_turns,
+        // Re-cropping must preserve the page's original colour mode. The
+        // global setting only applies to future captures, as the UI promises.
+        let (quarter_turns, mode) = match &entry.slot {
+            PageSlot::Ready(data) => (
+                data.quarter_turns,
+                color_mode_for_encoding(data.page.encoding),
+            ),
+            PageSlot::Failed { quarter_turns, .. } => (*quarter_turns, fallback_mode),
             _ => return,
         };
         if pipeline.submit_reprocess(entry.id, Arc::new(editor.original), editor.corners, mode) {
@@ -3393,7 +3412,11 @@ impl DocumentScannerApp {
 }
 
 fn none_if_blank(value: String) -> Option<String> {
-    if value.trim().is_empty() { None } else { Some(value) }
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 impl eframe::App for DocumentScannerApp {
@@ -3612,6 +3635,13 @@ fn rgb_to_color_image(image: &RgbImage) -> ColorImage {
     )
 }
 
+fn color_mode_for_encoding(encoding: PageEncoding) -> ColorMode {
+    match encoding {
+        PageEncoding::Jpeg => ColorMode::Color,
+        PageEncoding::G4 => ColorMode::BlackWhite,
+    }
+}
+
 /// Film-strip texture for a page, rotated for display by its quarter turns.
 fn color_mode_label(mode: ColorMode) -> &'static str {
     match mode {
@@ -3778,7 +3808,11 @@ fn has_active_workflow_state(
 
 #[cfg(test)]
 mod navigation_tests {
-    use super::{Screen, can_leave_scan_without_confirmation, has_active_workflow_state};
+    use super::{
+        Screen, can_leave_scan_without_confirmation, color_mode_for_encoding,
+        has_active_workflow_state,
+    };
+    use crate::document::{ColorMode, PageEncoding};
 
     #[test]
     fn empty_scan_can_return_to_folder() {
@@ -3831,5 +3865,17 @@ mod navigation_tests {
             true,
             false,
         ));
+    }
+
+    #[test]
+    fn reprocessing_preserves_the_page_encoding_instead_of_the_current_setting() {
+        assert_eq!(
+            color_mode_for_encoding(PageEncoding::G4),
+            ColorMode::BlackWhite
+        );
+        assert_eq!(
+            color_mode_for_encoding(PageEncoding::Jpeg),
+            ColorMode::Color
+        );
     }
 }
