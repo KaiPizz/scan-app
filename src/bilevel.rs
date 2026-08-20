@@ -81,9 +81,16 @@ const SAUVOLA_WINDOW: u32 = 41; // px at 300 dpi
 const SAUVOLA_K: f64 = 0.30;
 /// Sauvola hollows out solid dark areas wider than its window (a filled table
 /// header, a stamp, a thick signature stroke): inside them mean ≈ pixel and
-/// the threshold drops below the pixel. `enhance_document` already puts paper
-/// at ~247, so anything this dark is ink regardless of the local statistics.
-const ABSOLUTE_INK_MAX: u8 = 100;
+/// the threshold drops below the pixel. So anything darker than this fraction
+/// of the estimated paper level is ink regardless of the local statistics
+/// (a normal enhanced page has paper ≈ 247 → cut-off ≈ 99). Relative to the paper — NOT a fixed value: an under-exposed frame (camera
+/// still ramping its exposure right after start-up) can have paper at ~60,
+/// and a fixed cut-off then blackened the whole page, which the border
+/// cleanup erased as "mat rim" → blank output (klaud, 2026-08-20 15:15).
+const ABSOLUTE_INK_FRACTION: f64 = 0.40;
+/// Paper level = this percentile of the luma histogram (paper dominates a
+/// document page; ink and the mat rim sit far below it).
+const PAPER_PERCENTILE: f64 = 0.90;
 const SAUVOLA_R: f64 = 128.0;
 /// A border-touching black component is the dark mat rim (the 1.8 % corner
 /// expansion drags it in) unless it is a thin rule: ≥ 60 % of one side long
@@ -140,6 +147,7 @@ fn sauvola_threshold(gray: &GrayImage) -> GrayImage {
             sq[(y + 1) * stride + x + 1] = sq[y * stride + x + 1] + row_sq;
         }
     }
+    let absolute_ink_max = (paper_level(raw) * ABSOLUTE_INK_FRACTION).round() as u8;
     let r = (SAUVOLA_WINDOW / 2) as isize;
     let mut out = GrayImage::from_pixel(gray.width(), gray.height(), Luma([255]));
     let out_raw = out.as_mut();
@@ -160,12 +168,33 @@ fn sauvola_threshold(gray: &GrayImage) -> GrayImage {
             let var = (s2 / n - mean * mean).max(0.0);
             let threshold = mean * (1.0 + SAUVOLA_K * (var.sqrt() / SAUVOLA_R - 1.0));
             let value = raw[y * w + x];
-            if value < ABSOLUTE_INK_MAX || (value as f64) < threshold {
+            if value < absolute_ink_max || (value as f64) < threshold {
                 out_raw[y * w + x] = 0;
             }
         }
     }
     out
+}
+
+/// Estimated paper brightness: the `PAPER_PERCENTILE` value of the luma
+/// histogram (0 for an empty image).
+fn paper_level(raw: &[u8]) -> f64 {
+    if raw.is_empty() {
+        return 0.0;
+    }
+    let mut histogram = [0_u64; 256];
+    for value in raw {
+        histogram[*value as usize] += 1;
+    }
+    let target = (raw.len() as f64 * PAPER_PERCENTILE) as u64;
+    let mut seen = 0_u64;
+    for (value, count) in histogram.iter().enumerate() {
+        seen += count;
+        if seen >= target {
+            return value as f64;
+        }
+    }
+    255.0
 }
 
 /// Drops (1) black components touching the image border that are not thin
@@ -427,6 +456,42 @@ mod tests {
         assert_eq!(out.get_pixel(200, 200).0[0], 0, "centre hollowed out");
         assert_eq!(out.get_pixel(145, 145).0[0], 0);
         assert_eq!(out.get_pixel(100, 100).0[0], 255);
+    }
+
+    #[test]
+    fn binarize_survives_an_under_exposed_page() {
+        // Same synthetic page at 30 % brightness (paper ≈ 70, ink ≈ 6): the
+        // strokes must still come out and the page must not go blank.
+        let bright = synthetic_page();
+        let dim = RgbImage::from_fn(600, 800, |x, y| {
+            let p = bright.get_pixel(x, y).0;
+            Rgb([
+                (p[0] as f32 * 0.3) as u8,
+                (p[1] as f32 * 0.3) as u8,
+                (p[2] as f32 * 0.3) as u8,
+            ])
+        });
+        let out = binarize(&dim);
+        let mut kept = 0;
+        for row in 0..8 {
+            let y0 = 60 + row * 80;
+            for x in (40..500).step_by(30) {
+                for dy in 0..12 {
+                    for dx in 0..18 {
+                        if out.get_pixel(x + dx, y0 + dy).0[0] == 0 {
+                            kept += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(kept >= 27_648 * 90 / 100, "dim page lost strokes: kept {kept}");
+        assert!(
+            black_count(&out) <= 27_648 * 110 / 100,
+            "dim page went black/noisy: {}",
+            black_count(&out)
+        );
+        assert_eq!(out.get_pixel(597, 400).0[0], 255, "rim survived on dim page");
     }
 
     #[test]
